@@ -8,7 +8,7 @@ FROM dustynv/ros:humble-ros-base-l4t-r36.4.0 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /ws
 
-# GitHub mirror for China network (override with --build-arg if needed)
+# GitHub mirror for reliable access (override with --build-arg if needed)
 ARG GITHUB_MIRROR=https://ghfast.top
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

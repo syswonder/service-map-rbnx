@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
-# GitHub mirror for China network (override with --build-arg if needed)
+# GitHub mirror for reliable access (override with --build-arg if needed)
 ARG GITHUB_MIRROR=https://ghfast.top
 
 # Sophus (header-only, required by fastlio2)

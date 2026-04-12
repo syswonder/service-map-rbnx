@@ -1,86 +1,45 @@
 #!/usr/bin/env bash
 # build.sh — Build the mapping_rbnx package.
-# Called by `rbnx build -p .`; stamps rbnx-build/.rbnx-built on success.
+# Called by `rbnx build -p .`.
 #
-# Default: Docker build (auto-detect platform: x86 or Jetson).
+# Default: Docker build (auto-detect Jetson vs x86).
 # Override with RBNX_BUILD_MODE=native for host colcon build (requires ROS2 Humble).
+#
+# Prereq: run `rbnx setup` once from the robonix source root so `rbnx codegen`
+# can resolve contracts/IDL paths.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_ROOT="${RBNX_PACKAGE_ROOT:-$(dirname "$SCRIPT_DIR")}"
 BUILD_DIR="$PKG_ROOT/rbnx-build"
-PROTO_GEN="$PKG_ROOT/proto_gen"
-
-# Locate robonix workspace root (expects sibling or configurable via env)
-ROBONIX_ROOT="${ROBONIX_ROOT:-$(cd "$PKG_ROOT/../robonix" 2>/dev/null && pwd || echo "")}"
-RUST_ROOT="$ROBONIX_ROOT/rust"
-
-# Build mode: docker (default) or native
 BUILD_MODE="${RBNX_BUILD_MODE:-docker}"
 
 echo "=== mapping_rbnx build (mode: $BUILD_MODE) ==="
 
 if [[ "${RBNX_BUILD_CLEAN:-}" == "1" ]]; then
-    rm -rf "$BUILD_DIR" "$PROTO_GEN"
+    rm -rf "$BUILD_DIR" "$PKG_ROOT/proto_gen"
 fi
 
-# ── 1. Ensure FASTLIO2_ROS2 submodule is initialized ────────────────────────
+# ── 1. Init FASTLIO2_ROS2 submodule ──────────────────────────────────────────
 FASTLIO2_DIR="$PKG_ROOT/third_party/FASTLIO2_ROS2"
 if [ ! -f "$FASTLIO2_DIR/fastlio2/CMakeLists.txt" ]; then
-    echo "[build] Initializing FASTLIO2_ROS2 submodule..."
-    cd "$PKG_ROOT"
-    git submodule update --init --recursive third_party/FASTLIO2_ROS2
+    echo "[build] initializing FASTLIO2_ROS2 submodule..."
+    (cd "$PKG_ROOT" && git submodule update --init --recursive third_party/FASTLIO2_ROS2)
 fi
 
-# ── 2. Install Python dependencies ──────────────────────────────────────────
-echo "[build] Installing Python dependencies..."
+# ── 2. Python deps ───────────────────────────────────────────────────────────
 pip install --quiet --no-cache-dir \
-    grpcio>=1.60.0 \
-    grpcio-tools>=1.60.0 \
-    protobuf>=4.25.0 \
-    numpy>=1.24.0 \
-    pyyaml>=6.0 \
+    grpcio>=1.60.0 grpcio-tools>=1.60.0 protobuf>=4.25.0 numpy>=1.24.0 pyyaml>=6.0 \
     2>/dev/null || echo "[build] pip install skipped (not in venv or already satisfied)"
 
-# ── 3. Proto codegen (robonix-codegen → grpc_tools.protoc) ───────────────────
-if [[ -d "$RUST_ROOT" ]]; then
-    INTERFACES_LIB="$RUST_ROOT/crates/robonix-interfaces/lib"
-    CONTRACTS_DIR="$RUST_ROOT/contracts"
-    INTERFACES_DIR="$RUST_ROOT/crates/robonix-interfaces/robonix_proto"
-    RUNTIME_DIR="$RUST_ROOT/proto"
-
-    if [[ -x /usr/bin/cargo ]]; then
-        CARGO_BIN=/usr/bin/cargo
-    else
-        CARGO_BIN="${CARGO:-cargo}"
-    fi
-
-    # Step 1: regenerate .proto from ROS IDL + contracts
-    echo "[build] robonix-codegen --lang proto ..."
-    "$CARGO_BIN" run -p robonix-codegen --manifest-path "$RUST_ROOT/Cargo.toml" -- \
-        --lang proto \
-        -I "$INTERFACES_LIB" \
-        --contracts "$CONTRACTS_DIR" \
-        -o "$INTERFACES_DIR"
-
-    # Step 2: generate Python pb2 / pb2_grpc stubs
-    if python3 -m grpc_tools.protoc --version >/dev/null 2>&1; then
-        echo "[build] generating proto_gen stubs..."
-        mkdir -p "$PROTO_GEN"
-        python3 -m grpc_tools.protoc \
-            -I "$RUNTIME_DIR" \
-            -I "$INTERFACES_DIR" \
-            --python_out="$PROTO_GEN" \
-            --grpc_python_out="$PROTO_GEN" \
-            "$RUNTIME_DIR"/*.proto \
-            "$INTERFACES_DIR"/*.proto 2>/dev/null || true
-        echo "[build] proto_gen: $(ls "$PROTO_GEN"/*.py 2>/dev/null | wc -l) files"
-    else
-        echo "[build] WARNING: grpcio-tools not found — skipping proto_gen"
-    fi
+# ── 3. Codegen — one call replaces ~40 lines of manual robonix-codegen + protoc ──
+if command -v rbnx >/dev/null 2>&1; then
+    FLAGS=()
+    [[ "${RBNX_BUILD_CLEAN:-}" == "1" ]] && FLAGS+=(--clean)
+    rbnx codegen -p "$PKG_ROOT" "${FLAGS[@]}"
 else
-    echo "[build] WARNING: robonix repo not found at $ROBONIX_ROOT — skipping codegen"
-    echo "[build]   set ROBONIX_ROOT env var to point to the robonix repo"
+    echo "[build] WARNING: rbnx not in PATH — skipping proto codegen"
+    echo "[build]   install robonix-cli + run \`rbnx setup\` once from the robonix source root"
 fi
 
 # ── 4. Build SLAM packages ──────────────────────────────────────────────────
@@ -95,12 +54,13 @@ if [[ "$BUILD_MODE" == "native" ]]; then
         dst="$WS_SRC/$pkg"
         if [ ! -e "$dst" ] && [ -d "$src" ]; then
             ln -sf "$src" "$dst"
-            echo "[build] Symlinked $pkg → $dst"
+            echo "[build] symlinked $pkg → $dst"
         fi
     done
 
     cd "$WS_ROOT"
     if [ -f /opt/ros/humble/setup.bash ]; then
+        # shellcheck source=/dev/null
         source /opt/ros/humble/setup.bash
     fi
     colcon build --symlink-install \
@@ -110,10 +70,10 @@ else
     echo "[build] Docker build..."
     cd "$PKG_ROOT"
     if [ -f /etc/nv_tegra_release ] 2>/dev/null; then
-        echo "[build] Jetson platform detected — using Dockerfile.jetson"
+        echo "[build] Jetson detected — Dockerfile.jetson"
         docker build -f docker/Dockerfile.jetson -t mapping_rbnx:jetson .
     else
-        echo "[build] x86 platform — using Dockerfile"
+        echo "[build] x86 — Dockerfile"
         docker build -f docker/Dockerfile -t mapping_rbnx:latest .
     fi
 fi

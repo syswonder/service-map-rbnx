@@ -24,11 +24,11 @@ Primitive consumption flow:
 
 gRPC data-plane services provided (codegen'd from robonix contracts):
   PrmBaseOdom.Stream                — stream nav_msgs/Odometry
-  SysSlamStatus.Call                — get SLAM status
-  SysSlamSaveMap.Call               — save map (via /pgo/save_maps)
-  SysSlamLoadMap.Call               — load map (via /localizer/relocalize)
-  SysSlamSwitchMode.Call            — switch mode
-  SysSlamSetInitialPose.Call        — set initial pose
+  SrvSlamStatus.Call                — get SLAM status
+  SrvSlamSaveMap.Call               — save map (via /pgo/save_maps)
+  SrvSlamLoadMap.Call               — load map (via /localizer/relocalize)
+  SrvSlamSwitchMode.Call            — switch mode
+  SrvSlamSetInitialPose.Call        — set initial pose
 
 Env vars:
   ROBONIX_ATLAS             Atlas endpoint (default: localhost:50051)
@@ -220,14 +220,14 @@ class PrmBaseOdomServicer(robonix_contracts_pb2_grpc.PrmBaseOdomServicer):
         log.info("PrmBaseOdom.Stream client disconnected")
 
 
-class SysSlamStatusServicer(robonix_contracts_pb2_grpc.SysSlamStatusServicer):
+class SrvSlamStatusServicer(robonix_contracts_pb2_grpc.SrvSlamStatusServicer):
     """Contract: robonix/srv/slam/status"""
 
     def Call(self, request, context):
         return state.get_status_proto()
 
 
-class SysSlamSaveMapServicer(robonix_contracts_pb2_grpc.SysSlamSaveMapServicer):
+class SrvSlamSaveMapServicer(robonix_contracts_pb2_grpc.SrvSlamSaveMapServicer):
     """Contract: robonix/srv/slam/save_map — calls /pgo/save_maps ROS2 service."""
 
     def Call(self, request, context):
@@ -260,7 +260,7 @@ class SysSlamSaveMapServicer(robonix_contracts_pb2_grpc.SysSlamSaveMapServicer):
         return resp
 
 
-class SysSlamLoadMapServicer(robonix_contracts_pb2_grpc.SysSlamLoadMapServicer):
+class SrvSlamLoadMapServicer(robonix_contracts_pb2_grpc.SrvSlamLoadMapServicer):
     """Contract: robonix/srv/slam/load_map — calls /localizer/relocalize ROS2 service."""
 
     def Call(self, request, context):
@@ -298,7 +298,7 @@ class SysSlamLoadMapServicer(robonix_contracts_pb2_grpc.SysSlamLoadMapServicer):
         return resp
 
 
-class SysSlamSwitchModeServicer(robonix_contracts_pb2_grpc.SysSlamSwitchModeServicer):
+class SrvSlamSwitchModeServicer(robonix_contracts_pb2_grpc.SrvSlamSwitchModeServicer):
     """Contract: robonix/srv/slam/switch_mode"""
 
     def Call(self, request, context):
@@ -319,7 +319,7 @@ class SysSlamSwitchModeServicer(robonix_contracts_pb2_grpc.SysSlamSwitchModeServ
         return resp
 
 
-class SysSlamSetInitialPoseServicer(robonix_contracts_pb2_grpc.SysSlamSetInitialPoseServicer):
+class SrvSlamSetInitialPoseServicer(robonix_contracts_pb2_grpc.SrvSlamSetInitialPoseServicer):
     """Contract: robonix/srv/slam/set_initial_pose — calls /localizer/relocalize with pose."""
 
     def Call(self, request, context):
@@ -437,13 +437,12 @@ def _discover_primitive_topic(stub, node_id: str, contract_id: str, fallback: st
             transport="ros2",
         ))
 
-        negotiated_topic = ros2_topic
-        if ch_resp.endpoint:
-            ep = ch_resp.endpoint
-            if ep.startswith("topic:"):
-                negotiated_topic = ep[len("topic:"):]
-            elif ep.startswith("/"):
-                negotiated_topic = ep
+        # Atlas NegotiateChannel returns the allocated endpoint — this is the
+        # provider's declared topic when there is no conflict, else a UUID channel.
+        # Trust Atlas's allocation (the channel endpoint is the source of truth).
+        negotiated_topic = ch_resp.endpoint if ch_resp.endpoint else ros2_topic
+        if negotiated_topic.startswith("topic:"):
+            negotiated_topic = negotiated_topic[len("topic:"):]
 
         log.info("  [%s] discovered: provider=%s topic=%s (channel=%s)",
                  contract_id, provider_node_id, negotiated_topic, ch_resp.channel_id)
@@ -456,12 +455,58 @@ def _discover_primitive_topic(stub, node_id: str, contract_id: str, fallback: st
 
 
 def _discover_all_primitives(stub, node_id: str) -> dict:
-    """Discover all consumed primitive topics via Atlas.
-    Returns dict: contract_id → resolved ROS2 topic name."""
+    """Discover consumed primitives. Prefer IMU from the same provider as lidar3d."""
     log.info("Discovering consumed primitives via Atlas...")
     resolved = {}
+
+    # Resolve lidar3d first and remember which provider_node_id won
+    lidar_cid = "robonix/prm/sensor/lidar3d"
+    preferred_provider = ""
+    try:
+        resp = stub.QueryNodes(pb.QueryNodesRequest(contract_id=lidar_cid, transport="ros2"))
+        if resp.nodes:
+            preferred_provider = resp.nodes[0].node_id
+    except Exception as e:
+        log.warning("lidar3d lookup for provider preference failed: %s", e)
+
+    def _resolve_with_pref(contract_id, fallback, pref_provider):
+        """Like _discover_primitive_topic, but prefer a specific provider if available."""
+        try:
+            resp = stub.QueryNodes(pb.QueryNodesRequest(contract_id=contract_id, transport="ros2"))
+            if not resp.nodes:
+                return fallback
+            # pick provider: same as preferred, else first
+            chosen = None
+            for n in resp.nodes:
+                if n.node_id == pref_provider:
+                    chosen = n; break
+            if chosen is None:
+                chosen = resp.nodes[0]
+            topic = fallback
+            iface_name = ""
+            for iface in chosen.interfaces:
+                if iface.contract_id == contract_id:
+                    iface_name = iface.name
+                    try:
+                        meta = json.loads(iface.metadata_json) if iface.metadata_json else {}
+                        topic = meta.get("ros2_topic", fallback)
+                    except Exception:
+                        pass
+                    break
+            try:
+                stub.NegotiateChannel(pb.NegotiateChannelRequest(
+                    consumer_id=node_id, provider_node_id=chosen.node_id,
+                    interface_name=iface_name, transport="ros2"))
+            except Exception:
+                pass
+            log.info("  [%s] provider=%s topic=%s (preferred=%s)", contract_id, chosen.node_id, topic, pref_provider or "(none)")
+            return topic
+        except Exception as e:
+            log.warning("  [%s] discovery error: %s, fallback=%s", contract_id, e, fallback)
+            return fallback
+
     for contract_id, info in _CONSUMED_PRIMITIVES.items():
-        topic = _discover_primitive_topic(stub, node_id, contract_id, info["fallback_topic"])
+        topic = _resolve_with_pref(contract_id, info["fallback_topic"], preferred_provider)
         resolved[contract_id] = topic
     return resolved
 
@@ -556,19 +601,19 @@ def _register_and_discover(grpc_port: int) -> dict:
                 "grpc_service": "PrmBaseOdom",
             }),
             ("status", ["grpc"], "robonix/srv/slam/status", {
-                "grpc_service": "SysSlamStatus",
+                "grpc_service": "SrvSlamStatus",
             }),
             ("save_map", ["grpc"], "robonix/srv/slam/save_map", {
-                "grpc_service": "SysSlamSaveMap",
+                "grpc_service": "SrvSlamSaveMap",
             }),
             ("load_map", ["grpc"], "robonix/srv/slam/load_map", {
-                "grpc_service": "SysSlamLoadMap",
+                "grpc_service": "SrvSlamLoadMap",
             }),
             ("switch_mode", ["grpc"], "robonix/srv/slam/switch_mode", {
-                "grpc_service": "SysSlamSwitchMode",
+                "grpc_service": "SrvSlamSwitchMode",
             }),
             ("set_initial_pose", ["grpc"], "robonix/srv/slam/set_initial_pose", {
-                "grpc_service": "SysSlamSetInitialPose",
+                "grpc_service": "SrvSlamSetInitialPose",
             }),
             # ── map data plane ──────────────────────────────────────────
             ("map_pointcloud", ["ros2"], "robonix/srv/common/map/pointcloud", {
@@ -627,28 +672,67 @@ def _run_grpc_server(port: int):
 
     robonix_contracts_pb2_grpc.add_PrmBaseOdomServicer_to_server(
         PrmBaseOdomServicer(), server)
-    robonix_contracts_pb2_grpc.add_SysSlamStatusServicer_to_server(
-        SysSlamStatusServicer(), server)
-    robonix_contracts_pb2_grpc.add_SysSlamSaveMapServicer_to_server(
-        SysSlamSaveMapServicer(), server)
-    robonix_contracts_pb2_grpc.add_SysSlamLoadMapServicer_to_server(
-        SysSlamLoadMapServicer(), server)
-    robonix_contracts_pb2_grpc.add_SysSlamSwitchModeServicer_to_server(
-        SysSlamSwitchModeServicer(), server)
-    robonix_contracts_pb2_grpc.add_SysSlamSetInitialPoseServicer_to_server(
-        SysSlamSetInitialPoseServicer(), server)
+    robonix_contracts_pb2_grpc.add_SrvSlamStatusServicer_to_server(
+        SrvSlamStatusServicer(), server)
+    robonix_contracts_pb2_grpc.add_SrvSlamSaveMapServicer_to_server(
+        SrvSlamSaveMapServicer(), server)
+    robonix_contracts_pb2_grpc.add_SrvSlamLoadMapServicer_to_server(
+        SrvSlamLoadMapServicer(), server)
+    robonix_contracts_pb2_grpc.add_SrvSlamSwitchModeServicer_to_server(
+        SrvSlamSwitchModeServicer(), server)
+    robonix_contracts_pb2_grpc.add_SrvSlamSetInitialPoseServicer_to_server(
+        SrvSlamSetInitialPoseServicer(), server)
 
     server.add_insecure_port(f"0.0.0.0:{port}")
     server.start()
     log.info("gRPC data-plane on 0.0.0.0:%d", port)
     log.info("  PrmBaseOdom.Stream        (robonix/prm/base/odom)")
-    log.info("  SysSlamStatus.Call        (robonix/srv/slam/status)")
-    log.info("  SysSlamSaveMap.Call       (robonix/srv/slam/save_map)")
-    log.info("  SysSlamLoadMap.Call       (robonix/srv/slam/load_map)")
-    log.info("  SysSlamSwitchMode.Call    (robonix/srv/slam/switch_mode)")
-    log.info("  SysSlamSetInitialPose.Call(robonix/srv/slam/set_initial_pose)")
+    log.info("  SrvSlamStatus.Call        (robonix/srv/slam/status)")
+    log.info("  SrvSlamSaveMap.Call       (robonix/srv/slam/save_map)")
+    log.info("  SrvSlamLoadMap.Call       (robonix/srv/slam/load_map)")
+    log.info("  SrvSlamSwitchMode.Call    (robonix/srv/slam/switch_mode)")
+    log.info("  SrvSlamSetInitialPose.Call(robonix/srv/slam/set_initial_pose)")
     return server
 
+
+
+
+def _write_resolved_lio_config(primitive_topics: dict) -> str:
+    """Patch fastlio2 config with Atlas-discovered topics. Returns path to resolved yaml.
+
+    Reads the installed lio.yaml template (from colcon install), substitutes
+    lidar_topic/imu_topic with values discovered via Atlas QueryNodes, and
+    writes to /tmp/lio_resolved.yaml for the launch file to consume.
+    """
+    lidar = primitive_topics.get("robonix/prm/sensor/lidar3d", "")
+    imu   = primitive_topics.get("robonix/prm/sensor/imu", "")
+    if not lidar or not imu:
+        log.warning("Cannot resolve lio config — missing lidar3d (%s) or imu (%s)", lidar, imu)
+        return ""
+
+    # Find template
+    candidates = [
+        os.path.expanduser("~/wheatfox/packages/mapping_rbnx_ws/install/fastlio2/share/fastlio2/config/lio.yaml"),
+        "/opt/ros/humble/share/fastlio2/config/lio.yaml",
+    ]
+    tmpl = next((p for p in candidates if os.path.exists(p)), "")
+    if not tmpl:
+        log.error("lio.yaml template not found in %s", candidates)
+        return ""
+
+    with open(tmpl) as f:
+        src = f.read()
+
+    # Simple key:value replace (YAML is flat at top level)
+    import re as _re
+    src = _re.sub(r"^lidar_topic:.*", f"lidar_topic: {lidar}", src, flags=_re.MULTILINE)
+    src = _re.sub(r"^imu_topic:.*",   f"imu_topic: {imu}",     src, flags=_re.MULTILINE)
+
+    out = "/tmp/lio_resolved.yaml"
+    with open(out, "w") as f:
+        f.write(src)
+    log.info("Wrote resolved lio config -> %s (lidar=%s imu=%s)", out, lidar, imu)
+    return out
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -657,6 +741,7 @@ def main():
 
     # Step 1: Register with Atlas + discover primitive providers
     primitive_topics = _register_and_discover(grpc_port)
+    _write_resolved_lio_config(primitive_topics)
 
     # Step 2: Start ROS2 subscriber thread (uses discovered topics)
     if _import_ros2():

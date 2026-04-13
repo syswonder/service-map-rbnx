@@ -1,12 +1,4 @@
-# mapping_rbnx — Robonix SLAM service based on FASTLIO2_ROS2.
-# Provides 3D LiDAR-Inertial SLAM with loop closure, relocalization, and map
-# optimization as a Robonix system service. Consumes LiDAR and IMU primitives;
-# produces odometry, point cloud map, and localization pose.
-#
-# Runs in Docker by default. Platform auto-detected:
-#   - Jetson (L4T detected): compose.jetson.yaml overlay (L4T base image, ARM flags)
-#   - x86: base Dockerfile (ros:humble-ros-base)
-# Pure CPU — no GPU/CUDA required.
+# mapping_rbnx — FASTLIO2 SLAM (native) + Atlas bridge (primitive discovery).
 manifestVersion: 1
 
 build:
@@ -15,79 +7,63 @@ build:
 package:
   id: com.robonix.pkg.mapping
   name: mapping_rbnx
-  version: 0.2.0
+  version: 0.3.0
   vendor: robonix
-  description: >-
-    FASTLIO2-based 3D LiDAR-Inertial SLAM service for Robonix.
-    Provides real-time odometry via tightly-coupled ESKF, incremental
-    mapping with ikd-Tree, PGO loop closure (GTSAM), and two-stage
-    ICP relocalization. Docker-first, multi-platform (x86 + Jetson).
+  description: FASTLIO2 SLAM with Atlas-discovered primitives (no hardcoded topics).
   license: MulanPSL-2.0
 
 nodes:
-  # ── Default: Docker launch (auto-detect platform) ─────────────────────
   - id: com.robonix.mapping.fastlio2
-    type: compose
+    type: shell
     start: |
-      CF=(-f docker/compose.yaml)
-      if [ -f /etc/nv_tegra_release ] 2>/dev/null; then
-        CF+=(-f docker/compose.jetson.yaml)
-        echo "[mapping_rbnx] Jetson platform detected — merging compose.jetson.yaml"
+      set -e
+      PKG="$(pwd)"
+      source /opt/ros/${ROS_DISTRO:-humble}/setup.bash
+      if [[ -f "${HOME}/wheatfox/packages/mid360_drv/install/setup.bash" ]]; then
+        source "${HOME}/wheatfox/packages/mid360_drv/install/setup.bash"
       fi
-      exec docker compose "${CF[@]}" up --build
+      if [[ -f "${HOME}/wheatfox/packages/mapping_rbnx_ws/install/setup.bash" ]]; then
+        source "${HOME}/wheatfox/packages/mapping_rbnx_ws/install/setup.bash"
+      fi
+      export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
 
-  # ── Optional: native ROS2 launch (requires ROS2 Humble on host) ──────
-  - id: com.robonix.mapping.fastlio2.native
-    type: ros2_launch
-    start: |
-      SLAM_MODE="${SLAM_MODE:-mapping}"
-      if [ "$SLAM_MODE" = "localization" ]; then
-        exec ros2 launch mapping_rbnx slam_localization.launch.py
+      # (1) atlas_bridge in background: RegisterNode + DeclareInterface + QueryNodes
+      # It writes /tmp/lio_resolved.yaml with Atlas-discovered topics.
+      rm -f /tmp/lio_resolved.yaml
+      (
+        export PYTHONPATH="$PKG/src:$PKG/proto_gen:${PYTHONPATH:-}"
+        python3 -m mapping_rbnx.atlas_bridge 2>&1 | sed "s/^/[bridge] /"
+      ) &
+      BRIDGE_PID=$!
+      echo "[mapping_rbnx] atlas_bridge PID=$BRIDGE_PID"
+      trap "kill -TERM $BRIDGE_PID 2>/dev/null || true; exit" INT TERM
+
+      # (2) Wait up to 15s for Atlas-resolved config
+      for i in $(seq 1 30); do
+        if [[ -f /tmp/lio_resolved.yaml ]]; then break; fi
+        sleep 0.5
+      done
+      if [[ -f /tmp/lio_resolved.yaml ]]; then
+        echo "[mapping_rbnx] using Atlas-resolved lio config:"
+        grep -E "^lidar_topic|^imu_topic" /tmp/lio_resolved.yaml | sed "s/^/  /"
       else
-        exec ros2 launch mapping_rbnx slam_mapping.launch.py
+        echo "[mapping_rbnx] WARN: bridge did not write /tmp/lio_resolved.yaml in 15s — using installed default"
       fi
 
-  # ── Atlas bridge ──────────────────────────────────────────────────────
-  - id: com.robonix.mapping.atlas_bridge
-    type: python
-    start: |
-      export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
-      exec python3 -m mapping_rbnx.atlas_bridge
+      # (3) SLAM launch (lio_node + pgo_node + pc2grid + cloud_accumulator)
+      exec ros2 launch "$PKG/launch/slam_mapping_native.launch.py"
 
 interfaces:
   provides:
-    # SLAM data output
     - id: robonix/prm/base/odom
-    # SLAM control RPCs
     - id: robonix/srv/slam/status
     - id: robonix/srv/slam/save_map
     - id: robonix/srv/slam/load_map
     - id: robonix/srv/slam/switch_mode
     - id: robonix/srv/slam/set_initial_pose
-    # Map data plane
     - id: robonix/srv/common/map/pointcloud
     - id: robonix/srv/common/map/occupancy_grid
     - id: robonix/srv/common/map/scan_2d
   consumes:
-    # Sensor inputs (from hardware PRM providers)
     - id: robonix/prm/sensor/lidar3d
     - id: robonix/prm/sensor/imu
-
-launchProfiles:
-  mapping:
-    nodes:
-      com.robonix.mapping.fastlio2:
-        env:
-          SLAM_MODE: mapping
-      com.robonix.mapping.atlas_bridge:
-        env:
-          SLAM_MODE: mapping
-  localization:
-    nodes:
-      com.robonix.mapping.fastlio2:
-        env:
-          SLAM_MODE: localization
-          MAP_FILE: /maps/map.pcd
-      com.robonix.mapping.atlas_bridge:
-        env:
-          SLAM_MODE: localization

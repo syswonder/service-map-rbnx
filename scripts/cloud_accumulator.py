@@ -1,54 +1,155 @@
 #!/usr/bin/env python3
-# Voxel-accumulate world_cloud into a persistent downsampled point cloud.
-# Publishes /robonix/map/cloud_accumulated at 1 Hz.
-import numpy as np, rclpy, struct
+# Voxel-accumulate world_cloud with temporal consensus + decay.
+#
+# - A voxel must be hit by >= CLOUD_ACC_MIN_HITS distinct scan frames to
+#   be published. Moving objects (people behind the cart) only get 1-2
+#   hits and are filtered out.
+# - Periodically, voxels within CLOUD_ACC_DECAY_RANGE_M of the robot that
+#   have NOT been re-hit for CLOUD_ACC_DECAY_FRAMES scans lose 1 hit.
+#   If hits drop below min_hits they fall out of the published cloud;
+#   drop to 0 and they're deleted. This handles "person stood here for
+#   a while then left" without raycasting.
+# - Voxels outside the decay range are kept as-is (we can't tell if they
+#   moved or are just out of FOV).
+import numpy as np, os, rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
 
 
 class CloudAcc(Node):
     def __init__(self):
-        super().__init__('cloud_accumulator')
-        self.voxel = 0.1          # m
-        self.frame = 'lidar'
-        self.keys = set()          # set of (i,j,k) voxel keys
-        self.points = []           # list of (x,y,z) averaged per voxel (just first-hit sample)
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                             reliability=ReliabilityPolicy.RELIABLE)
-        self.pub = self.create_publisher(PointCloud2, '/robonix/map/cloud_accumulated', latched)
-        self.create_subscription(PointCloud2, '/fastlio2/world_cloud', self.cb, 10)
+        super().__init__("cloud_accumulator")
+        self.voxel = float(os.environ.get("CLOUD_ACC_VOXEL", "0.1"))
+        self.z_min = float(os.environ.get("CLOUD_ACC_Z_MIN", "-2.0"))
+        self.z_max = float(os.environ.get("CLOUD_ACC_Z_MAX", "1.5"))
+        self.min_hits = int(os.environ.get("CLOUD_ACC_MIN_HITS", "3"))
+        self.lock_at = int(os.environ.get("CLOUD_ACC_LOCK_AT", "30"))
+        self.decay_frames = int(os.environ.get("CLOUD_ACC_DECAY_FRAMES", "50"))
+        self.decay_range_m = float(os.environ.get("CLOUD_ACC_DECAY_RANGE_M", "8.0"))
+        self.frame = "lidar"
+        # voxel_key -> [hits, x_mean, y_mean, z_mean, last_seen_scan_idx]
+        self.voxels = {}
+        self.scan_idx = 0
+        self.robot_xyz = None
+        latched = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.pub = self.create_publisher(
+            PointCloud2, "/robonix/map/cloud_accumulated", latched
+        )
+        self.create_subscription(
+            PointCloud2, "/fastlio2/world_cloud", self.cb, 10
+        )
+        self.create_subscription(
+            Odometry, "/fastlio2/lio_odom", self.odom_cb, 20
+        )
         self.create_timer(1.0, self.publish)
-        self.get_logger().info(f'CloudAcc: voxel={self.voxel}m, publish 1Hz')
+        # decay runs every CLOUD_ACC_DECAY_FRAMES/10 seconds (since scans
+        # are ~10 Hz); use a wall timer keyed off that.
+        self.create_timer(max(1.0, self.decay_frames / 10.0), self.decay)
+        self.get_logger().info(
+            f"CloudAcc: voxel={self.voxel}m z=[{self.z_min},{self.z_max}] "
+            f"min_hits={self.min_hits} decay_frames={self.decay_frames} "
+            f"decay_range={self.decay_range_m}m publish 1Hz"
+        )
+
+    def odom_cb(self, msg):
+        p = msg.pose.pose.position
+        self.robot_xyz = (float(p.x), float(p.y), float(p.z))
 
     def cb(self, msg):
         offs = {f.name: f.offset for f in msg.fields}
-        ox, oy, oz = offs['x'], offs['y'], offs['z']; ps = msg.point_step
+        if "x" not in offs:
+            return
+        ox, oy, oz = offs["x"], offs["y"], offs["z"]
+        ps = msg.point_step
         n_pts = msg.width * msg.height
-        if n_pts == 0: return
-        arr = np.frombuffer(msg.data, dtype=np.uint8)[:n_pts*ps].reshape(n_pts, ps)
-        x = arr[:, ox:ox+4].copy().view(np.float32).ravel()
-        y = arr[:, oy:oy+4].copy().view(np.float32).ravel()
-        z = arr[:, oz:oz+4].copy().view(np.float32).ravel()
-        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-        x = x[mask]; y = y[mask]; z = z[mask]
-        # voxel index
-        ix = np.floor(x / self.voxel).astype(np.int32)
-        iy = np.floor(y / self.voxel).astype(np.int32)
-        iz = np.floor(z / self.voxel).astype(np.int32)
-        for i in range(len(x)):
+        if n_pts == 0:
+            return
+        arr = np.frombuffer(msg.data, dtype=np.uint8)[: n_pts * ps].reshape(n_pts, ps)
+        x = arr[:, ox : ox + 4].copy().view(np.float32).ravel()
+        y = arr[:, oy : oy + 4].copy().view(np.float32).ravel()
+        z = arr[:, oz : oz + 4].copy().view(np.float32).ravel()
+        m = (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & np.isfinite(z)
+            & (z > self.z_min)
+            & (z < self.z_max)
+        )
+        x = x[m]; y = y[m]; z = z[m]
+        if x.size == 0:
+            return
+        ix = np.floor(x / self.voxel).astype(np.int64)
+        iy = np.floor(y / self.voxel).astype(np.int64)
+        iz = np.floor(z / self.voxel).astype(np.int64)
+        seen = set()
+        for i in range(x.size):
             k = (int(ix[i]), int(iy[i]), int(iz[i]))
-            if k in self.keys: continue
-            self.keys.add(k)
-            self.points.append((float(x[i]), float(y[i]), float(z[i])))
-        # cap at 300k voxels
-        if len(self.points) > 300000:
-            self.points = self.points[-300000:]
+            if k in seen:
+                continue
+            seen.add(k)
+            rec = self.voxels.get(k)
+            if rec is None:
+                self.voxels[k] = [1, float(x[i]), float(y[i]), float(z[i]),
+                                  self.scan_idx]
+            else:
+                if rec[0] < self.lock_at:
+                    rec[0] += 1
+                    a = 1.0 / rec[0]
+                    rec[1] = rec[1] * (1 - a) + float(x[i]) * a
+                    rec[2] = rec[2] * (1 - a) + float(y[i]) * a
+                    rec[3] = rec[3] * (1 - a) + float(z[i]) * a
+                rec[4] = self.scan_idx
+        self.scan_idx += 1
+        if len(self.voxels) > 500_000:
+            # evict lowest-hit voxels
+            items = sorted(self.voxels.items(), key=lambda kv: kv[1][0], reverse=True)
+            self.voxels = dict(items[:400_000])
+
+    def decay(self):
+        """Decrement hits for voxels we expected to see but didn't."""
+        if self.robot_xyz is None or not self.voxels:
+            return
+        rx, ry, rz = self.robot_xyz
+        r2 = self.decay_range_m ** 2
+        stale_thresh = self.scan_idx - self.decay_frames
+        remove = []
+        decayed = 0
+        for k, rec in self.voxels.items():
+            # cheap squared distance from voxel center to robot
+            dx = rec[1] - rx; dy = rec[2] - ry; dz = rec[3] - rz
+            if dx*dx + dy*dy + dz*dz > r2:
+                continue  # outside decay zone, skip
+            if rec[4] >= stale_thresh:
+                continue  # recently seen, safe
+            rec[0] -= 1
+            decayed += 1
+            if rec[0] <= 0:
+                remove.append(k)
+        for k in remove:
+            del self.voxels[k]
+        if decayed or remove:
+            self.get_logger().info(
+                f"decay: -{decayed} hits, removed {len(remove)} voxels, "
+                f"total={len(self.voxels)}"
+            )
 
     def publish(self):
-        if not self.points: return
-        pts = np.array(self.points, dtype=np.float32)
+        if not self.voxels:
+            return
+        pts = np.array(
+            [(v[1], v[2], v[3]) for v in self.voxels.values()
+             if v[0] >= self.min_hits],
+            dtype=np.float32,
+        )
+        if pts.size == 0:
+            return
         msg = PointCloud2()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -56,9 +157,9 @@ class CloudAcc(Node):
         msg.height = 1
         msg.width = pts.shape[0]
         msg.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
         ]
         msg.is_bigendian = False
         msg.point_step = 12
@@ -71,8 +172,10 @@ class CloudAcc(Node):
 def main():
     rclpy.init()
     n = CloudAcc()
-    try: rclpy.spin(n)
-    except KeyboardInterrupt: pass
+    try:
+        rclpy.spin(n)
+    except KeyboardInterrupt:
+        pass
     finally:
         try: n.destroy_node()
         except Exception: pass
@@ -80,4 +183,5 @@ def main():
         except Exception: pass
 
 
-if __name__ == '__main__': main()
+if __name__ == "__main__":
+    main()

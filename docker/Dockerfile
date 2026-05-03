@@ -1,118 +1,68 @@
-# mapping_rbnx — x86 Docker build (for development and testing)
-# For production on Jetson Orin, use native colcon build instead.
+# SPDX-License-Identifier: MulanPSL-2.0
+# mapping_rbnx — RTAB-Map SLAM service image.
 #
-# Multi-stage:
-#   builder       — compile FASTLIO2_ROS2 packages (fastlio2, pgo, localizer, hba, interface)
-#   runtime-bridge — Python-only Atlas bridge (dev/test without SLAM)
-#   runtime        — full SLAM + bridge
+# Same packaging pattern as system/scene: own image so the package can
+# pick its RMW + SLAM toolchain without polluting the sim image.
+# --network host + --ipc=host at runtime so DDS/SHM line up with
+# whatever sim/robot container is publishing the sensor topics.
+#
+# Algorithms shipped (selected via manifest config.algo):
+#   rtabmap   — default. 2D lidar + RGBD fusion. Fully apt-installable
+#               (ros-humble-rtabmap-ros), no extra colcon build.
+#   dlio      — Direct LiDAR-Inertial Odometry. Real-robot 3D Livox
+#               path; expects the dlio package mounted at /ws/install
+#               (separate slam_alt_ws colcon build), so this image
+#               stays light.
+#   fastlio2  — [BROKEN: drift] same /ws/install path as dlio.
+#
+# slam_toolbox + cartographer were dropped after rtabmap consistently
+# beat them in head-to-head tests on webots tiago (curve-motion
+# stability, RGBD fusion, loop closure).
+FROM ros:humble-ros-base
 
-# ── Build stage: FASTLIO2_ROS2 C++ ──────────────────────────────────────────
-FROM ros:humble-ros-base AS builder
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /ws
+# Runtime deps:
+#   rtabmap-ros: SLAM core + rtabmap_viz GUI for dev inspection
+#   tf2 / tf-transformations: pose lookups in atlas_bridge
+#   pointcloud_to_laserscan: depth → 2D scan adapter (used by dlio
+#     fallback paths and any future depth-only deploys)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-numpy \
+        python3-yaml \
+        ros-humble-rtabmap-ros \
+        ros-humble-tf2-ros \
+        ros-humble-tf-transformations \
+        ros-humble-pointcloud-to-laserscan \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git \
-    libeigen3-dev libpcl-dev \
-    libyaml-cpp-dev \
-    ros-humble-pcl-ros ros-humble-pcl-conversions \
-    ros-humble-tf2 ros-humble-tf2-ros ros-humble-tf2-geometry-msgs \
-    ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-message-filters \
-    ros-humble-visualization-msgs \
-    python3-pip python3-colcon-common-extensions \
-    && rm -rf /var/lib/apt/lists/*
+# Python deps for atlas_bridge (gRPC client + minor utilities).
+RUN pip install --no-cache-dir \
+        grpcio>=1.60.0 \
+        protobuf>=4.25.0 \
+        pyyaml>=6.0 \
+        numpy
 
-# GitHub mirror for reliable access (override with --build-arg if needed)
-ARG GITHUB_MIRROR=https://ghfast.top
-
-# Sophus (header-only, required by fastlio2)
-RUN git clone --depth 1 --branch 1.22.10 ${GITHUB_MIRROR}/https://github.com/strasdat/Sophus.git /tmp/Sophus \
-    && cd /tmp/Sophus && mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF \
-    && make install \
-    && rm -rf /tmp/Sophus
-
-# GTSAM (required by pgo)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libboost-all-dev libtbb-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth 1 --branch 4.2 ${GITHUB_MIRROR}/https://github.com/borglab/gtsam.git /tmp/gtsam \
-    && cd /tmp/gtsam && mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release \
-        -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
-        -DGTSAM_WITH_TBB=ON -DGTSAM_BUILD_UNSTABLE=OFF \
-        -DGTSAM_USE_SYSTEM_EIGEN=ON \
-    && make -j$(nproc) && make install \
-    && rm -rf /tmp/gtsam
-
-# Livox SDK2 (required by livox_ros_driver2 build, driver itself runs in separate package)
-RUN git clone --depth 1 ${GITHUB_MIRROR}/https://github.com/Livox-SDK/Livox-SDK2.git /tmp/livox-sdk2 \
-    && cd /tmp/livox-sdk2 && mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release \
-    && make -j$(nproc) && make install \
-    && rm -rf /tmp/livox-sdk2
-
-# Livox ROS2 driver (builds CustomMsg definitions needed by fastlio2)
-RUN git clone --depth 1 ${GITHUB_MIRROR}/https://github.com/Livox-SDK/livox_ros_driver2.git /ws/src/livox_ros_driver2 \
-    && cp /ws/src/livox_ros_driver2/package_ROS2.xml /ws/src/livox_ros_driver2/package.xml
-
-# Copy FASTLIO2_ROS2 packages into workspace
-COPY third_party/FASTLIO2_ROS2/interface /ws/src/interface
-COPY third_party/FASTLIO2_ROS2/fastlio2 /ws/src/fastlio2
-COPY third_party/FASTLIO2_ROS2/pgo      /ws/src/pgo
-COPY third_party/FASTLIO2_ROS2/localizer /ws/src/localizer
-COPY third_party/FASTLIO2_ROS2/hba      /ws/src/hba
-
-# Build all packages (livox needs -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble)
-RUN . /opt/ros/humble/setup.sh && \
-    colcon build --event-handlers console_direct+ \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble
-
-# ── Runtime bridge-only (dev/test target) ────────────────────────────────────
-FROM ros:humble-ros-base AS runtime-bridge
-
-ENV DEBIAN_FRONTEND=noninteractive
-WORKDIR /ws
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip3 install --no-cache-dir \
-    grpcio>=1.60.0 protobuf>=4.25.0 numpy>=1.24.0 pyyaml>=6.0
-
-COPY src/ /ws/src/
-COPY config/ /config/
-COPY skills/ /ws/skills/
-# proto_gen/ is created by build.sh (robonix-codegen); copy if present
-COPY proto_gen* /ws/proto_gen/
-
-ENV PYTHONPATH="/ws/src:/ws/proto_gen"
-CMD ["python3", "-m", "mapping_rbnx.atlas_bridge"]
-
-# ── Full runtime (with C++ SLAM nodes) ───────────────────────────────────────
-FROM runtime-bridge AS runtime
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpcl-io1.12 libyaml-cpp0.7 \
-    ros-humble-pcl-ros \
-    ros-humble-tf2-ros ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-message-filters ros-humble-visualization-msgs \
-    ros-humble-pointcloud-to-laserscan \
-    libboost-serialization1.74.0 libboost-filesystem1.74.0 libtbb12 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy GTSAM + Metis runtime libs
-COPY --from=builder /usr/local/lib/libgtsam* /usr/local/lib/
-COPY --from=builder /usr/local/lib/libmetis* /usr/local/lib/
-RUN ldconfig
-
-COPY --from=builder /ws/install /ws/install
-COPY launch/ /ws/launch/
-
-COPY docker/entrypoint.sh /entrypoint.sh
+WORKDIR /mapping
+COPY entrypoint.sh /entrypoint.sh
+COPY no_shm_profile.xml /etc/fastrtps_no_shm.xml
 RUN chmod +x /entrypoint.sh
+
+# Force FastRTPS to skip SHM transport — UDP-only is the only path
+# that's actually data-flowing across containers in this layout.
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fastrtps_no_shm.xml
+
+# Stick with FastRTPS (sim's default RMW). With --network host +
+# --ipc=host the SHM transport shares cleanly between sim and mapping,
+# and FastRTPS UDP multicast discovery covers the rest. We tried
+# Zenoh first but `zenoh_bridge_dds` cannot see FastRTPS-only SHM
+# publishers reliably across containers, so this is the path that
+# actually delivers sensor topics → rtabmap in webots.
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["ros2", "launch", "/ws/launch/slam_mapping.launch.py"]

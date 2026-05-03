@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Log-odds 2D OccupancyGrid from fastlio2 world_cloud + lio_odom.
 # Each observation updates p(occ) per-cell so transients recover.
-import numpy as np, rclpy
+import numpy as np, os, rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
@@ -18,12 +18,12 @@ L_FREE_THR = -0.40    # < threshold => free (0)
 class PC2Grid(Node):
     def __init__(self):
         super().__init__('pointcloud_to_grid')
-        self.res = 0.1
-        self.size_m = 40.0
+        self.res = float(os.environ.get("PC2GRID_RES", "0.1"))
+        self.size_m = float(os.environ.get("PC2GRID_SIZE_M", "200.0"))
         self.zmin = -0.2
         self.zmax = 0.8
         self.min_range = 0.3    # robot footprint / lidar blind zone only
-        self.frame = 'lidar'
+        self.frame = os.environ.get('MAPPING_OUTPUT_FRAME', 'lidar')
         self.max_range_m = self.size_m / 2.0 - self.res
         self.n = int(self.size_m / self.res)
         self.half = self.size_m / 2.0
@@ -33,8 +33,8 @@ class PC2Grid(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
         self.pub = self.create_publisher(OccupancyGrid, '/robonix/map/occupancy_grid', latched)
-        self.create_subscription(PointCloud2, '/fastlio2/world_cloud', self.cb, 10)
-        self.create_subscription(Odometry, '/fastlio2/lio_odom', self.odom_cb, 50)
+        self.create_subscription(PointCloud2, os.environ.get("MAPPING_CLOUD_TOPIC", "/fastlio2/world_cloud"), self.cb, 10)
+        self.create_subscription(Odometry, os.environ.get("MAPPING_ODOM_TOPIC", "/fastlio2/lio_odom"), self.odom_cb, 50)
         self.create_timer(0.5, self.publish)
         self.get_logger().info(
             f'PC2Grid log-odds: {self.n}x{self.n} z=[{self.zmin},{self.zmax}] '

@@ -1,34 +1,41 @@
 # SPDX-License-Identifier: MulanPSL-2.0
-"""RTAB-Map 2D — lidar + RGBD fusion with loop closure.
+"""RTAB-Map launch — sensor-agnostic, deploy-driven.
 
-Every input topic is taken as a launch argument so atlas_bridge's
-resolved.yaml drives the wiring. The launch file itself contains no
-hardcoded sensor topic names — that's the only way one mapping package
-serves both webots (`/head_front_camera/...`) and a real robot
-(`/realsense/...`) without a code change. start_engine.sh reads each
-contract from /tmp/<algo>_resolved.yaml and passes its endpoint here.
+The launch file does not assume any sensor combination. It branches on
+which input topics the deploy actually wired up via atlas_bridge's
+resolved.yaml:
 
-Launch args (with sentinels for "not provided"):
-  scan_topic       LaserScan (lidar primitive's lidar/lidar contract)
-  rgb_topic        Image — sentinel `<none>` disables RGB subscription
-  rgb_info_topic   CameraInfo — paired with rgb_topic
-  depth_topic      Image (depth) — sentinel `<none>` disables depth
-  odom_topic       Odometry (chassis odom contract)
-  use_sim_time, enable_viz: standard
+    sensors.lidar2d=true   → subscribe_scan          (LaserScan)
+    sensors.lidar3d=true   → subscribe_scan_cloud    (PointCloud2)
+    sensors.rgb + .rgbd    → subscribe_rgb + _depth  (RGBD fusion)
+    sensors.odom=true      → external odom (else rtabmap odometry node)
 
-When rgb_topic or depth_topic is `<none>` the corresponding
-subscription is turned off automatically (lidar-only mode is the
-fallback when the deploy has no RGBD camera).
+Webots tiago = lidar2d + rgbd + odom (LaserScan + Astra + diff-drive).
+Real robot  = lidar3d + rgbd + odom + imu (Mid360 + RealSense).
+
+start_engine.sh reads `/tmp/<algo>_resolved.yaml` and passes each topic
+as a launch arg. Sentinel `<none>` means "this sensor is not in the
+deploy" — the corresponding subscription is disabled.
+
+Launch args:
+    scan_topic       LaserScan      (lidar2d)         | <none> = disabled
+    scan_cloud_topic PointCloud2    (lidar3d)         | <none> = disabled
+    rgb_topic        Image          (camera/rgb)      | <none> = disabled
+    rgb_info_topic   CameraInfo     (paired w/ rgb)   | <none> = derive
+    depth_topic      Image          (camera/depth)    | <none> = disabled
+    odom_topic       Odometry       (chassis/odom)    | <none> = rtabmap
+                                                         runs its own
+                                                         odometry node
+    use_sim_time, enable_viz: standard
 
 Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
-  /map                 nav_msgs/OccupancyGrid (2D, lidar + depth proj)
-  /rtabmap/cloud_map   sensor_msgs/PointCloud2 (3D fused cloud)
-  /tf                  map→odom transform
+    /map                 nav_msgs/OccupancyGrid (2D, lidar + depth proj)
+    /rtabmap/cloud_map   sensor_msgs/PointCloud2 (3D fused cloud)
+    /tf                  map→odom transform
 """
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -37,58 +44,67 @@ _NONE = "<none>"  # sentinel for "no such topic in this deploy"
 
 
 def generate_launch_description():
-    use_sim_time = LaunchConfiguration("use_sim_time", default="true")
-    scan_topic = LaunchConfiguration("scan_topic", default="/scan")
-    odom_topic = LaunchConfiguration("odom_topic", default="/odom")
-    rgb_topic = LaunchConfiguration("rgb_topic", default=_NONE)
-    rgb_info_topic = LaunchConfiguration("rgb_info_topic", default=_NONE)
-    depth_topic = LaunchConfiguration("depth_topic", default=_NONE)
-    enable_viz = LaunchConfiguration("enable_viz", default="false")
-
-    # Resolve substitutions to plain strings so we can branch on them
-    # at launch-description build time. We have to do this lazily via
-    # OpaqueFunction because LaunchConfiguration is not a string until
-    # the launch system evaluates it.
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="true"),
-        DeclareLaunchArgument("scan_topic", default_value="/scan"),
-        DeclareLaunchArgument("odom_topic", default_value="/odom"),
+        DeclareLaunchArgument("scan_topic", default_value=_NONE),
+        DeclareLaunchArgument("scan_cloud_topic", default_value=_NONE),
+        DeclareLaunchArgument("odom_topic", default_value=_NONE),
         DeclareLaunchArgument("rgb_topic", default_value=_NONE),
         DeclareLaunchArgument("rgb_info_topic", default_value=_NONE),
         DeclareLaunchArgument("depth_topic", default_value=_NONE),
+        DeclareLaunchArgument("base_frame", default_value="base_link"),
+        DeclareLaunchArgument("odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="false"),
         OpaqueFunction(function=_make_nodes),
     ])
 
 
 def _make_nodes(context, *args, **kwargs):
-    use_sim_time = LaunchConfiguration("use_sim_time").perform(context)
+    use_sim_time_str = LaunchConfiguration("use_sim_time").perform(context)
     scan_topic = LaunchConfiguration("scan_topic").perform(context)
+    scan_cloud_topic = LaunchConfiguration("scan_cloud_topic").perform(context)
     odom_topic = LaunchConfiguration("odom_topic").perform(context)
     rgb_topic = LaunchConfiguration("rgb_topic").perform(context)
     rgb_info_topic = LaunchConfiguration("rgb_info_topic").perform(context)
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
+    base_frame = LaunchConfiguration("base_frame").perform(context)
+    odom_frame = LaunchConfiguration("odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
+    use_sim_time = use_sim_time_str.lower() == "true"
 
-    have_rgb = rgb_topic and rgb_topic != _NONE
-    have_depth = depth_topic and depth_topic != _NONE
+    have_scan = bool(scan_topic) and scan_topic != _NONE
+    have_scan_cloud = bool(scan_cloud_topic) and scan_cloud_topic != _NONE
+    have_rgb = bool(rgb_topic) and rgb_topic != _NONE
+    have_depth = bool(depth_topic) and depth_topic != _NONE
     have_rgbd = have_rgb and have_depth
+    have_odom = bool(odom_topic) and odom_topic != _NONE
+
+    if not (have_scan or have_scan_cloud or have_rgbd):
+        # rtabmap with neither lidar nor RGBD has nothing to map. Bail
+        # loudly so the operator notices (instead of rtabmap silently
+        # idling waiting for topics that will never arrive).
+        raise RuntimeError(
+            "rtabmap launch: no sensor inputs enabled. Set at least one "
+            "of sensors.lidar2d / sensors.lidar3d / sensors.rgbd in the "
+            "deploy manifest."
+        )
 
     rtabmap_params = {
-        "use_sim_time": use_sim_time.lower() == "true",
-        "frame_id": "base_link",
-        "odom_frame_id": "odom",
+        "use_sim_time": use_sim_time,
+        "frame_id": base_frame,
+        "odom_frame_id": odom_frame,
         "map_frame_id": "map",
         "publish_tf": True,
-        # Subscribe to whichever sensors the deploy actually has. RGBD
-        # fusion gives table-top occupancy that lidar alone misses;
-        # lidar-only mode still produces a valid 2D map (just no
-        # below-plane obstacles).
-        "subscribe_scan": True,
+        # Sensor subscriptions branch on what the deploy actually has.
+        # rtabmap accepts EITHER 2D scan OR 3D scan_cloud (or both); the
+        # 3D path is what real-robot Mid360 deployments use.
+        "subscribe_scan": have_scan,
+        "subscribe_scan_cloud": have_scan_cloud,
         "subscribe_rgbd": False,
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
-        "approx_sync": True,        # webots topics not perfectly synced
+        "subscribe_odom_info": False,
+        "approx_sync": True,
         "queue_size": 30,
         # webots emits image stamps slightly ahead of the dynamic TF
         # for the camera chain (head_2_link → Astra → ...), causing
@@ -101,10 +117,13 @@ def _make_nodes(context, *args, **kwargs):
         # scan misses entirely. RTAB-Map 0.21+: scan goes into grid via
         # subscribe_scan, depth via Grid/FromDepth + Grid/Sensor=1.
         "Grid/Sensor": "1",
-        "Grid/FromDepth": "true",
+        "Grid/FromDepth": "true" if have_rgbd else "false",
         "Grid/RangeMax": "8.0",
         "Grid/CellSize": "0.05",
         "Grid/RayTracing": "true",
+        # 3D pointcloud → 2D grid: when the only lidar is 3D, rtabmap
+        # projects it to the planar grid via Grid/FromObstacles using
+        # the same height clamp as the depth path.
         "Grid/3D": "false",
         "Grid/NormalsSegmentation": "false",
         "Grid/MaxObstacleHeight": "1.5",
@@ -129,20 +148,22 @@ def _make_nodes(context, *args, **kwargs):
         # motion is small enough that 20cm correspondence is generous,
         # not noisy. Default 0.1 was tuned for 1Hz.
         "Icp/MaxCorrespondenceDistance": "0.2",
-        # When scan ICP and odom disagree, prefer the scan correction
-        # over odom (default lets odom dominate when ICP is weak).
         "Icp/MaxTranslation": "0.5",
         "Icp/MaxRotation": "0.78",  # ~45°
     }
 
     rtabmap_remappings = [
-        ("scan", scan_topic),
-        ("odom", odom_topic),
         # rviz "2D Pose Estimate" → /initialpose: rtabmap defaults to
         # the node-relative ~initialpose, remap to global so the rviz
         # tool reaches us without rviz config gymnastics.
         ("initialpose", "/initialpose"),
     ]
+    if have_scan:
+        rtabmap_remappings.append(("scan", scan_topic))
+    if have_scan_cloud:
+        rtabmap_remappings.append(("scan_cloud", scan_cloud_topic))
+    if have_odom:
+        rtabmap_remappings.append(("odom", odom_topic))
     if have_rgbd:
         rtabmap_remappings += [
             ("rgb/image", rgb_topic),
@@ -163,26 +184,61 @@ def _make_nodes(context, *args, **kwargs):
 
     nodes = [rtabmap_node]
 
+    # When the deploy didn't supply external odom, run rtabmap's own
+    # ICP-odometry node off whichever lidar source we have. icp_odometry
+    # consumes either /scan (LaserScan) or /scan_cloud (PointCloud2);
+    # we pick based on what's wired up.
+    if not have_odom and (have_scan or have_scan_cloud):
+        icp_odom_remappings = []
+        if have_scan_cloud:
+            icp_odom_remappings.append(("scan_cloud", scan_cloud_topic))
+        elif have_scan:
+            icp_odom_remappings.append(("scan", scan_topic))
+        icp_odom = Node(
+            package="rtabmap_odom",
+            executable="icp_odometry",
+            name="icp_odometry",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "frame_id": base_frame,
+                "odom_frame_id": odom_frame,
+                "publish_tf": True,
+                "approx_sync": True,
+                "wait_for_transform": 1.5,
+                "deskewing": False,
+            }],
+            remappings=icp_odom_remappings,
+        )
+        nodes.append(icp_odom)
+
     if enable_viz:
-        # rtabmap_viz: GUI subscribes to scan + odom only (RGBD belongs
-        # to the main node). Spawned only when enable_viz=true.
+        viz_params = {
+            "use_sim_time": use_sim_time,
+            "frame_id": base_frame,
+            "odom_frame_id": odom_frame,
+            "subscribe_scan": have_scan,
+            "subscribe_scan_cloud": have_scan_cloud,
+            "subscribe_rgb": False,
+            "subscribe_depth": False,
+            "approx_sync": True,
+            "queue_size": 30,
+            "wait_for_transform": 1.5,
+        }
+        viz_remappings = []
+        if have_scan:
+            viz_remappings.append(("scan", scan_topic))
+        if have_scan_cloud:
+            viz_remappings.append(("scan_cloud", scan_cloud_topic))
+        if have_odom:
+            viz_remappings.append(("odom", odom_topic))
         viz = Node(
             package="rtabmap_viz",
             executable="rtabmap_viz",
             name="rtabmap_viz",
             output="screen",
-            parameters=[{
-                "use_sim_time": use_sim_time.lower() == "true",
-                "frame_id": "base_link",
-                "odom_frame_id": "odom",
-                "subscribe_scan": True,
-                "subscribe_rgb": False,
-                "subscribe_depth": False,
-                "approx_sync": True,
-                "queue_size": 30,
-                "wait_for_transform": 1.5,
-            }],
-            remappings=[("scan", scan_topic), ("odom", odom_topic)],
+            parameters=[viz_params],
+            remappings=viz_remappings,
         )
         nodes.append(viz)
 

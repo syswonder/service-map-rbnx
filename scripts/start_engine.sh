@@ -5,8 +5,10 @@
 # corresponding ros2 launch.
 #
 # Supported algos:
-#   rtabmap   — 2D lidar + RGBD fusion (default; webots and real robots
-#               with 2D scan + RGBD camera)
+#   rtabmap   — Sensor-agnostic graph SLAM. Subscribes to whatever
+#               sensors.* the deploy enabled (lidar2d / lidar3d / rgbd
+#               / odom). Webots tiago = lidar2d + rgbd; real robot
+#               (mid360) = lidar3d + rgbd.
 #   dlio      — Direct LiDAR-Inertial Odometry (3D Livox; real robot)
 #   fastlio2  — [BROKEN: drift] kept for repro/debug only
 #
@@ -28,32 +30,35 @@ read_y() {
 
 case "$ALGO" in
     rtabmap)
-        # 2D lidar + RGBD fusion. EVERY input topic comes from the
-        # atlas-resolved config; this script does not hardcode any
-        # downstream topic name. atlas_bridge writes the resolved
-        # endpoints into /tmp/<algo>_resolved.yaml — keys produced by
-        # atlas_bridge:_SENSOR_CONTRACTS:
-        #   scan_topic   ← robonix/primitive/lidar/lidar
-        #   odom_topic   ← robonix/primitive/chassis/odom
-        #   rgb_topic    ← robonix/primitive/camera/rgb (optional)
-        #   depth_topic  ← robonix/primitive/camera/depth (optional)
-        # When camera resolution fails (no rgbd in this deploy), the
-        # launch falls back to lidar-only mode automatically via the
-        # `<none>` sentinel — no code change needed for headless
-        # deploys vs full RGBD deploys.
+        # Sensor inputs are deploy-driven. Every topic comes from
+        # /tmp/<algo>_resolved.yaml, written by atlas_bridge after it
+        # resolved the contracts enabled by `sensors.*` in the deploy
+        # manifest. Keys (see atlas_bridge:_SENSOR_CONTRACTS):
+        #   scan_topic       ← robonix/primitive/lidar/lidar    (lidar2d)
+        #   lidar_topic      ← robonix/primitive/lidar/lidar3d  (lidar3d)
+        #   odom_topic       ← robonix/primitive/chassis/odom
+        #   rgb_topic        ← robonix/primitive/camera/rgb
+        #   depth_topic      ← robonix/primitive/camera/depth
+        # Webots tiago = lidar2d + rgbd + odom.
+        # Real robot   = lidar3d + rgbd + odom (+ imu, unused by rtabmap).
+        # Anything not present in resolved.yaml passes through as the
+        # `<none>` sentinel and the launch file disables that subscription.
         SCAN_TOPIC=$(read_y scan_topic)
+        SCAN_CLOUD_TOPIC=$(read_y lidar_topic)
         ODOM_TOPIC=$(read_y odom_topic)
         RGB_TOPIC=$(read_y rgb_topic)
         DEPTH_TOPIC=$(read_y depth_topic)
-        SCAN_TOPIC="${SCAN_TOPIC:-/scan}"
-        ODOM_TOPIC="${ODOM_TOPIC:-/odom}"
+        SCAN_TOPIC="${SCAN_TOPIC:-<none>}"
+        SCAN_CLOUD_TOPIC="${SCAN_CLOUD_TOPIC:-<none>}"
+        ODOM_TOPIC="${ODOM_TOPIC:-<none>}"
         RGB_TOPIC="${RGB_TOPIC:-<none>}"
         DEPTH_TOPIC="${DEPTH_TOPIC:-<none>}"
         USE_SIM_TIME="${MAPPING_USE_SIM_TIME:-true}"
         ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
-        echo "[start_engine] rtabmap scan=$SCAN_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC viz=$ENABLE_VIZ"
+        echo "[start_engine] rtabmap scan2d=$SCAN_TOPIC scan3d=$SCAN_CLOUD_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC viz=$ENABLE_VIZ"
         exec ros2 launch /mapping/launch/rtabmap_2d.launch.py \
             scan_topic:="$SCAN_TOPIC" \
+            scan_cloud_topic:="$SCAN_CLOUD_TOPIC" \
             odom_topic:="$ODOM_TOPIC" \
             rgb_topic:="$RGB_TOPIC" \
             depth_topic:="$DEPTH_TOPIC" \

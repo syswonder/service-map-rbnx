@@ -3,21 +3,30 @@
 # Algo + sensor inputs are config-driven (RBNX_CONFIG_FILE → mapping.yaml-like
 # block from the deploy manifest). One package, multiple algorithms:
 #
-#   algo: rtabmap   — DEFAULT. 2D lidar + RGBD fusion → /map +
-#                     /rtabmap/cloud_map. ROS2 native (apt-installable).
-#                     Webots and real-robot 2D scenarios.
-#   algo: dlio      — Direct LiDAR-Inertial Odometry. Real-robot 3D
-#                     Livox + IMU path. Needs slam_alt_ws colcon ws
-#                     bind-mounted at /ws/install.
+#   algo: rtabmap   — ROS2-native graph SLAM (apt-installable). Sensor
+#                     inputs are NOT hardcoded: the deploy manifest's
+#                     `sensors:` block decides which of {lidar2d,
+#                     lidar3d, rgb, rgbd, odom, imu} are wired in.
+#                     Examples:
+#                       webots tiago        — sensors.lidar2d + sensors.rgbd + odom
+#                       real robot (mid360) — sensors.lidar3d + sensors.rgbd + odom + imu
+#                     The launch file branches on what's enabled
+#                     (`subscribe_scan` for 2D LaserScan,
+#                     `subscribe_scan_cloud` for 3D PointCloud2,
+#                     `subscribe_rgb`+`subscribe_depth` for RGBD).
+#   algo: dlio      — Direct LiDAR-Inertial Odometry. Pure 3D Livox +
+#                     IMU path. Needs slam_alt_ws colcon ws bind-mounted
+#                     at /ws/install.
 #   algo: fastlio2  — [BROKEN: drift] kept reachable for repro/debug
 #                     only. Needs FASTLIO2_ROS2 colcon build.
 #
 # slam_toolbox + cartographer were dropped after rtabmap consistently
 # beat them in head-to-head testing.
 #
-# Sensor selection (which atlas contracts the bridge queries) is also
-# config-driven — `sensors.lidar2d: true` makes mapping pull
-# robonix/primitive/lidar/lidar via atlas instead of hardcoding the topic.
+# Sensor selection drives BOTH which atlas contracts atlas_bridge
+# resolves AND which subscriptions the launch file enables — there is
+# no implicit "if 2D scan exists, use it" coupling. Specify what the
+# robot has; the package wires the rest.
 #
 # Outputs (FIXED capability surface — same set declared regardless
 # of which algo is selected; consumers care about contracts, not algos):

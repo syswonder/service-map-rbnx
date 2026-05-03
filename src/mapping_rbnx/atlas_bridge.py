@@ -148,17 +148,32 @@ _SENSOR_CONTRACTS = [
 
 
 def _enabled_sensors(cfg: dict) -> dict:
-    """Read config.sensors; default by algo when not specified."""
-    sensors = (cfg.get("sensors") or {}) if isinstance(cfg.get("sensors"), dict) else {}
-    algo = cfg.get("algo", "rtabmap")
-    if not sensors:
-        if algo == "rtabmap":
-            sensors = {"lidar2d": True, "rgbd": True, "odom": True}
-        elif algo in ("fastlio2", "dlio"):
-            sensors = {"lidar3d": True, "imu": True}
+    """Read config.sensors. The deploy manifest is authoritative —
+    every robot has different sensors, so we refuse to guess.
+
+    A missing or empty `sensors:` block is a configuration error: the
+    operator forgot to declare what the robot has, and silently
+    picking "lidar2d + rgbd" would mask Mid360 deploys (where the
+    correct answer is lidar3d + rgbd) and headless deploys (where the
+    correct answer is rgbd-only). Fail loud instead.
+    """
+    sensors = cfg.get("sensors")
+    if not isinstance(sensors, dict) or not sensors:
+        raise RuntimeError(
+            "mapping config has no `sensors:` block. Declare which "
+            "sensors the robot has, e.g.:\n"
+            "  sensors: { lidar2d: true, rgbd: true, odom: true }     # webots tiago\n"
+            "  sensors: { lidar3d: true, rgbd: true, odom: true, imu: true }  # mid360 robot\n"
+            "Supported keys: " + ", ".join(k for k, _, _ in _SENSOR_CONTRACTS)
+        )
     out = {}
     for key, _contract, _yaml in _SENSOR_CONTRACTS:
         out[key] = _truthy(sensors.get(key, False))
+    if not any(out.values()):
+        raise RuntimeError(
+            "mapping config has `sensors:` block but every entry is "
+            "false/missing — at least one sensor must be enabled."
+        )
     return out
 
 

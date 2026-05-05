@@ -30,9 +30,24 @@ if [[ -n "${RBNX_CONFIG_FILE:-}" ]]; then
     EXTRA_MOUNTS+=(-v "${RBNX_CONFIG_FILE}:${RBNX_CONFIG_FILE}:ro")
 fi
 
-# X11 forwarding: when the host has a display, wire it through so
-# rtabmap_viz can render. Headless hosts skip these and the GUI is
-# suppressed at the launch level (enable_viz default false).
+# X11 forwarding for rtabmap_viz inside the mapping container. We
+# auto-detect DISPLAY when it's not in the env (the user ran
+# `rbnx boot` from a fresh shell without exporting): probe the
+# standard local Xorg slots, accept the first that responds. If
+# none does, skip X11 wiring and rtabmap_viz won't render — the
+# launch file's `enable_viz` flag still spawns it but Qt prints
+# the "could not connect to display" warning we've seen before.
+if [[ -z "${DISPLAY:-}" ]]; then
+    if command -v xset &>/dev/null; then
+        for d in :0 :1 :10; do
+            if DISPLAY="$d" xset q &>/dev/null; then
+                export DISPLAY="$d"
+                break
+            fi
+        done
+    fi
+fi
+
 declare -a X11_ARGS=()
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
     xhost +local:docker >/dev/null 2>&1 || true

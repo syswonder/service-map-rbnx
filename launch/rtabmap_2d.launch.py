@@ -35,7 +35,7 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
 """
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -241,6 +241,35 @@ def _make_nodes(context, *args, **kwargs):
             remappings=viz_remappings,
         )
         nodes.append(viz)
+
+    # tf2 → /robonix/map/pose adapter. rtabmap in mapping mode does
+    # NOT publish /localization_pose; the SLAM-corrected pose is
+    # only on the tf2 chain. The robonix `service/map/pose` contract
+    # promises a topic-out PoseWithCovarianceStamped, so we run a
+    # small adapter that polls tf2 and republishes. Without this
+    # scene's self-tracker silently fell back to chassis /odom and
+    # the web UI's robot dot drifted from rviz once SLAM corrected.
+    #
+    # ExecuteProcess (not launch_ros.Node) because the script is a
+    # standalone Python file under scripts/, not a ros2 entrypoint
+    # registered in a setup.py — there's no `package + executable`
+    # to look up.
+    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    tf_adapter = ExecuteProcess(
+        cmd=[
+            "python3",
+            os.path.join(pkg_root, "scripts", "tf_to_pose.py"),
+            "--ros-args",
+            "-p", f"use_sim_time:={'true' if use_sim_time else 'false'}",
+            "-p", "map_frame:=map",
+            "-p", f"base_frame:={base_frame}",
+            "-p", "publish_rate_hz:=10.0",
+            "-p", "topic:=/robonix/map/pose",
+        ],
+        name="tf_to_pose",
+        output="screen",
+    )
+    nodes.append(tf_adapter)
 
     return nodes
 

@@ -112,11 +112,16 @@ _ALGO_TOPIC_BINDINGS: dict[str, dict[str, str]] = {
         # occlusion layer).
         "robonix/service/map/occupancy_grid": "/map",
         "robonix/service/map/pointcloud":     "/rtabmap/cloud_map",
-        # /rtabmap/localization_pose: PoseWithCovarianceStamped in map
-        # frame. Published by rtabmap on every map update (so it's the
-        # post-loop-closure pose). When rtabmap runs in mapping mode
-        # it also publishes it after each map node.
-        "robonix/service/map/pose":           "/rtabmap/localization_pose",
+        # /robonix/map/pose: PoseWithCovarianceStamped published by our
+        # tf_to_pose adapter (scripts/tf_to_pose.py, launched alongside
+        # rtabmap in rtabmap_2d.launch.py). The adapter polls tf2 for
+        # `map → base_link` at 10 Hz and republishes — necessary
+        # because rtabmap does NOT publish /localization_pose in
+        # mapping mode (only in localization mode after a db is loaded).
+        # Earlier this contract was bound to /rtabmap/localization_pose,
+        # which silently never produced messages, and consumers
+        # (scene's self-tracker) fell back to raw chassis /odom.
+        "robonix/service/map/pose":           "/robonix/map/pose",
         # /rtabmap/odom: continuous odometry. When external odom is
         # supplied, rtabmap republishes it under this name with the
         # same map→odom correction baked in via /tf. When icp_odometry

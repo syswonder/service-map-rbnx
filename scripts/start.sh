@@ -63,7 +63,7 @@ exec docker run --rm \
     --network host \
     --ipc=host \
     -e ROBONIX_ATLAS="${ROBONIX_ATLAS:-127.0.0.1:50051}" \
-    -e ROBONIX_CAPABILITY_ID="${ROBONIX_CAPABILITY_ID:-com.robonix.service.mapping}" \
+    -e ROBONIX_CAPABILITY_ID="${ROBONIX_CAPABILITY_ID:-mapping}" \
     -e ROBONIX_PKG_HOST_DIR="$(pwd)" \
     -e RBNX_CONFIG_FILE="${RBNX_CONFIG_FILE:-}" \
     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \

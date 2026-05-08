@@ -2,7 +2,7 @@
 """mapping_rbnx atlas bridge — new robonix dev-packaging API.
 
 Responsibilities (kept tight; SLAM nodes do the actual work):
-  1. Register `com.robonix.service.mapping` as a capability with atlas.
+  1. Register `mapping` as a capability with atlas.
   2. Read the manifest config (RBNX_CONFIG_FILE) to learn:
        - algo:    rtabmap (2D lidar+RGBD, default for both webots and
                   real-robot scenarios with 2D scan + RGBD camera)
@@ -51,7 +51,7 @@ import atlas_pb2_grpc as pb_grpc  # type: ignore
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ATLAS_ENDPOINT = os.environ.get("ROBONIX_ATLAS", "127.0.0.1:50051")
-CAP_ID = os.environ.get("ROBONIX_CAPABILITY_ID", "com.robonix.service.mapping")
+CAP_ID = os.environ.get("ROBONIX_CAPABILITY_ID", "mapping")
 NAMESPACE = "robonix/service/map"
 PKG_HOST_DIR = os.environ.get("ROBONIX_PKG_HOST_DIR", "/mapping")
 RESOLVED_DIR = os.environ.get("MAPPING_RESOLVED_DIR", "/tmp")

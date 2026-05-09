@@ -262,7 +262,7 @@ def _declare_outputs(cap: Capability, algo: str) -> None:
     for contract_id in _EXPORTED_CONTRACTS:
         topic = bindings[contract_id]
         try:
-            cap.declare_ros2(contract_id, topic, qos_profile="reliable")
+            cap.declare_ros2_topic(contract_id, topic, qos="reliable")
             declared += 1
             log.info("declared %s → ROS2 topic %s", contract_id, topic)
         except Exception as e:  # noqa: BLE001

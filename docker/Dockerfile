@@ -25,21 +25,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Swap apt + pip to Tsinghua TUNA mirrors so the build works behind GFW.
-# `ros2/ubuntu` is the upstream ROS apt repo; `ubuntu-ports` is for
-# aarch64 (Jetson Orin); `ubuntu` for x86_64. Cover both.
+# ── TUNA mirrors for GFW-bound networks ─────────────────────────────
+# Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
+# --follow-symlinks because /etc/apt/sources.list.d/ros2.sources is
+# a symlink into /usr/share/ros-apt-source/ in the upstream ros image.
 RUN set -eux; \
-    if [ -f /etc/apt/sources.list.d/ros2.list ]; then \
-        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' \
-            /etc/apt/sources.list.d/ros2.list; \
-    fi; \
+    find /etc/apt/sources.list.d/ -maxdepth 1 \( -name '*.list' -o -name '*.sources' \) -print0 \
+      | xargs -0 -r sed -i --follow-symlinks \
+          -e 's|http://packages\.ros\.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' \
+          -e 's|^Types: deb deb-src$|Types: deb|'; \
     if [ -f /etc/apt/sources.list ]; then \
-        sed -i \
-            -e 's|http://archive.ubuntu.com/ubuntu/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' \
-            -e 's|http://security.ubuntu.com/ubuntu/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' \
-            -e 's|http://ports.ubuntu.com/ubuntu-ports/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/|g' \
+        sed -i --follow-symlinks \
+            -e 's|http://archive\.ubuntu\.com/ubuntu/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' \
+            -e 's|http://security\.ubuntu\.com/ubuntu/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' \
+            -e 's|http://ports\.ubuntu\.com/ubuntu-ports/\?|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/|g' \
             /etc/apt/sources.list; \
     fi
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    HF_ENDPOINT=https://hf-mirror.com
 
 # Runtime deps:
 #   rtabmap-ros: SLAM core + rtabmap_viz GUI for dev inspection
@@ -57,8 +61,6 @@ RUN apt-get update \
         ros-humble-pointcloud-to-laserscan \
  && rm -rf /var/lib/apt/lists/*
 
-# pip via TUNA mirror.
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip install --no-cache-dir \
         grpcio>=1.60.0 \
         protobuf>=4.25.0 \

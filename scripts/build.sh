@@ -39,7 +39,7 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
-DOCKER_BUILD_FLAGS=()
+DOCKER_BUILD_FLAGS=(--network=host)
 [[ "$CLEAN" == "1" ]] && DOCKER_BUILD_FLAGS+=(--no-cache)
 
 case "$VARIANT" in

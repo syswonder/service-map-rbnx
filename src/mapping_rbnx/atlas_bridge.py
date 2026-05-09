@@ -198,7 +198,7 @@ def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]
     The opened Channel is closed immediately — we just want the
     endpoint string, atlas's bookkeeping for "I'm consuming this"
     is the side benefit."""
-    recs = atlas.find(contract_id=contract_id, transport="ros2")
+    recs = atlas.find(contract_id, transport="ros2")
     if not recs:
         return None
     rec = recs[0]

@@ -334,7 +334,7 @@ def init(cfg: dict):
 
     # Discover sensors → resolved.yaml. Raises if `sensors:` block missing.
     try:
-        resolved = _retry_resolve(cap, cfg)
+        resolved = _retry_resolve(mapping, cfg)
     except RuntimeError as e:
         return Err(str(e))
     # TF / time-source overrides from cfg. Real-robot bring-ups without
@@ -346,7 +346,7 @@ def init(cfg: dict):
     _write_resolved_yaml(algo, resolved)
 
     # Declare outputs (after resolved.yaml so launch can start in parallel).
-    _declare_outputs(cap, algo)
+    _declare_outputs(mapping, algo)
     return Ok()
 
 

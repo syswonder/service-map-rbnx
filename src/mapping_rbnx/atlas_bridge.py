@@ -205,7 +205,7 @@ def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]
     try:
         ch = mapping.connect_capability(rec, contract_id=contract_id, transport="ros2")
     except Exception as e:  # noqa: BLE001
-        log.warning("connect %s/%s failed: %s", rec.owner_id, contract_id, e)
+        log.warning("connect %s/%s failed: %s", rec.provider_id, contract_id, e)
         return None
     endpoint = (ch.endpoint or "").strip()
     ch.close()

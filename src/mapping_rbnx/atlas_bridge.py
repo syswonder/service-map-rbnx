@@ -43,7 +43,7 @@ import grpc  # noqa: E402
 import atlas_pb2 as pb  # type: ignore
 import atlas_pb2_grpc as pb_grpc  # type: ignore
 
-from robonix_api import Capability, Ok, Err, Deferred, atlas  # noqa: E402
+from robonix_api import Service, Ok, Err, Deferred, ATLAS  # noqa: E402
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -198,14 +198,14 @@ def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]
     The opened Channel is closed immediately — we just want the
     endpoint string, atlas's bookkeeping for "I'm consuming this"
     is the side benefit."""
-    recs = atlas.find(contract_id, transport="ros2")
+    recs = ATLAS.find_capability(contract_id=contract_id, transport="ros2")
     if not recs:
         return None
     rec = recs[0]
     try:
-        ch = cap.connect(provider=rec, contract_id=contract_id, transport="ros2")
+        ch = cap.connect_capability(rec, contract_id=contract_id, transport="ros2")
     except Exception as e:  # noqa: BLE001
-        log.warning("connect %s/%s failed: %s", rec.capability_id, contract_id, e)
+        log.warning("connect %s/%s failed: %s", rec.owner_id, contract_id, e)
         return None
     endpoint = (ch.endpoint or "").strip()
     ch.close()
@@ -296,7 +296,7 @@ def _write_resolved_yaml(algo: str, resolved: dict[str, str]) -> str:
 
 
 # ── Capability + lifecycle ────────────────────────────────────────────────────
-cap = Capability(id=CAP_ID, namespace=NAMESPACE, atlas_endpoint=ATLAS_ENDPOINT)
+cap = Service(id=CAP_ID, namespace=NAMESPACE)
 
 
 @cap.on_init

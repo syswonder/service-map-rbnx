@@ -193,7 +193,7 @@ def _enabled_sensors(cfg: dict) -> dict:
 
 # ── Atlas helpers (use Capability's wrapped stub) ────────────────────────────
 def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]:
-    """atlas.find + cap.connect for one ROS2 contract. Returns the topic
+    """ATLAS.find_capability + connect_capability for one ROS2 contract. Returns the topic
     string atlas resolved, or None when no provider is online yet.
     The opened Channel is closed immediately — we just want the
     endpoint string, atlas's bookkeeping for "I'm consuming this"
@@ -203,7 +203,7 @@ def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]
         return None
     rec = recs[0]
     try:
-        ch = cap.connect_capability(rec, contract_id=contract_id, transport="ros2")
+        ch = mapping.connect_capability(rec, contract_id=contract_id, transport="ros2")
     except Exception as e:  # noqa: BLE001
         log.warning("connect %s/%s failed: %s", rec.owner_id, contract_id, e)
         return None
@@ -262,7 +262,7 @@ def _declare_outputs(cap: Capability, algo: str) -> None:
     for contract_id in _EXPORTED_CONTRACTS:
         topic = bindings[contract_id]
         try:
-            cap.declare_ros2_topic(contract_id, topic, qos="reliable")
+            mapping.declare_ros2_topic(contract_id, topic, qos="reliable")
             declared += 1
             log.info("declared %s → ROS2 topic %s", contract_id, topic)
         except Exception as e:  # noqa: BLE001
@@ -296,10 +296,10 @@ def _write_resolved_yaml(algo: str, resolved: dict[str, str]) -> str:
 
 
 # ── Capability + lifecycle ────────────────────────────────────────────────────
-cap = Service(id=CAP_ID, namespace=NAMESPACE)
+mapping = Service(id=CAP_ID, namespace=NAMESPACE)
 
 
-@cap.on_init
+@mapping.on_init
 def init(cfg: dict):
     """REGISTERED → INITIALIZED. Receives the config dict from
     rbnx via Driver(CMD_INIT, config_json). The mapping cap NEVER reads
@@ -351,7 +351,7 @@ def init(cfg: dict):
 
 
 def main() -> int:
-    cap.run()
+    mapping.run()
     return 0
 
 

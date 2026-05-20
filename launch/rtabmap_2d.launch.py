@@ -52,6 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument("rgb_topic", default_value=_NONE),
         DeclareLaunchArgument("rgb_info_topic", default_value=_NONE),
         DeclareLaunchArgument("depth_topic", default_value=_NONE),
+        DeclareLaunchArgument("imu_topic", default_value=_NONE),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="false"),
@@ -67,6 +68,7 @@ def _make_nodes(context, *args, **kwargs):
     rgb_topic = LaunchConfiguration("rgb_topic").perform(context)
     rgb_info_topic = LaunchConfiguration("rgb_info_topic").perform(context)
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
+    imu_topic = LaunchConfiguration("imu_topic").perform(context)
     base_frame = LaunchConfiguration("base_frame").perform(context)
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
@@ -78,6 +80,7 @@ def _make_nodes(context, *args, **kwargs):
     have_depth = bool(depth_topic) and depth_topic != _NONE
     have_rgbd = have_rgb and have_depth
     have_odom = bool(odom_topic) and odom_topic != _NONE
+    have_imu = bool(imu_topic) and imu_topic != _NONE
 
     if not (have_scan or have_scan_cloud or have_rgbd):
         # rtabmap with neither lidar nor RGBD has nothing to map. Bail
@@ -194,20 +197,47 @@ def _make_nodes(context, *args, **kwargs):
             icp_odom_remappings.append(("scan_cloud", scan_cloud_topic))
         elif have_scan:
             icp_odom_remappings.append(("scan", scan_topic))
+        # IMU aiding: a 3D spinning lidar (Mid360) drifts badly on
+        # rotation with pure point-to-point ICP — corridors/corners are
+        # geometrically ambiguous so ICP slides along walls. The IMU
+        # gives a rotation prior (and gravity for deskewing) that locks
+        # rotation. `imu` topic resolved from atlas
+        # (robonix/primitive/imu/imu) and passed via imu_topic launch
+        # arg; never hardcode the vendor topic.
+        icp_odom_params = {
+            "use_sim_time": use_sim_time,
+            "frame_id": base_frame,
+            "odom_frame_id": odom_frame,
+            "publish_tf": True,
+            "approx_sync": True,
+            "wait_for_transform": 1.5,
+            # Deskew the spinning-lidar cloud using the IMU motion model;
+            # only safe to enable when an IMU is actually wired.
+            "deskewing": have_imu,
+            # Ground robot: lock pitch/roll/z so ICP can't drift out of
+            # plane (a big source of "walls duplicate" when 6-DoF ICP
+            # tilts the map).
+            "Reg/Force3DoF": "true",
+            # MID-360 is dense; voxelize before ICP for speed + stability.
+            "Icp/VoxelSize": "0.1",
+            "Icp/PointToPlane": "true",
+            "Icp/MaxCorrespondenceDistance": "1.0",
+            # Only keyframe when the robot actually moved — reduces drift
+            # accumulation while stationary / slow.
+            "Odom/ScanKeyFrameThr": "0.4",
+        }
+        if have_imu:
+            icp_odom_remappings.append(("imu", imu_topic))
+            # Block until the first IMU msg so the gravity vector is
+            # initialised before odometry starts (else the first frames
+            # drift before IMU lock).
+            icp_odom_params["wait_imu_to_init"] = True
         icp_odom = Node(
             package="rtabmap_odom",
             executable="icp_odometry",
             name="icp_odometry",
             output="screen",
-            parameters=[{
-                "use_sim_time": use_sim_time,
-                "frame_id": base_frame,
-                "odom_frame_id": odom_frame,
-                "publish_tf": True,
-                "approx_sync": True,
-                "wait_for_transform": 1.5,
-                "deskewing": False,
-            }],
+            parameters=[icp_odom_params],
             remappings=icp_odom_remappings,
         )
         nodes.append(icp_odom)

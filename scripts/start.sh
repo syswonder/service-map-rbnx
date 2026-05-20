@@ -1,15 +1,51 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MulanPSL-2.0
-# mapping_rbnx start phase — docker-run wrapper. Same pattern as
-# system/scene/scripts/start.sh.
+# mapping_rbnx start phase. Two execution shapes (same pattern as
+# system/scene/scripts/start.sh):
 #
-# Container shape: --network host + --ipc=host + FastRTPS UDP-only so
-# the in-container rtabmap can subscribe to whatever sim/robot
-# container is publishing scan + RGBD + odom on the host DDS bus.
+#   1. native  (jetson_orin, or any host with ROS 2 Humble + rtabmap_*
+#       installed natively) — runs scripts/start_native.sh: atlas_bridge
+#       + rtabmap launch as host processes, no docker. Preferred on the
+#       car (avoids the nvidia-container-runtime + DDS-namespace hops).
+#   2. docker  (default fallback) — docker run against `robonix-mapping`.
 #
-# Trap discipline: when boot SIGTERMs our PGID, this trap stops the
-# container so SLAM doesn't outlive the deploy.
-set -euo pipefail
+# Selection (operator-set env in the shell that runs rbnx boot/start;
+# the cap config arrives via Driver(CMD_INIT) so it can't be read here):
+#   ROBONIX_MAPPING_FORCE=native|docker     # explicit hard pin
+#   ROBONIX_MAPPING_PLATFORM=<platform>     # match NATIVE_PLATFORMS
+#   default → docker
+set -eo pipefail
+
+PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+cd "$PKG"
+
+NATIVE_PLATFORMS=("jetson_orin")
+is_native_platform() {
+    local p="$1"
+    for w in "${NATIVE_PLATFORMS[@]}"; do
+        [[ "$p" == "$w" ]] && return 0
+    done
+    return 1
+}
+
+MODE=""
+case "${ROBONIX_MAPPING_FORCE:-}" in
+    native) MODE=native ;;
+    docker) MODE=docker ;;
+    "") ;;
+    *) echo "[mapping/start] ROBONIX_MAPPING_FORCE=${ROBONIX_MAPPING_FORCE} not in {native,docker}" >&2; exit 2 ;;
+esac
+if [[ -z "$MODE" ]]; then
+    if is_native_platform "${ROBONIX_MAPPING_PLATFORM:-}"; then MODE=native; else MODE=docker; fi
+fi
+echo "[mapping/start] mode=${MODE} (FORCE=${ROBONIX_MAPPING_FORCE:-} PLATFORM=${ROBONIX_MAPPING_PLATFORM:-})"
+
+if [[ "$MODE" == "native" ]]; then
+    exec bash "${PKG}/scripts/start_native.sh"
+fi
+
+# ── Docker path (original behaviour) ───────────────────────────────────
+set -u
 
 CT="${ROBONIX_MAPPING_CONTAINER:-robonix_mapping}"
 IMG="${ROBONIX_MAPPING_IMAGE:-robonix-mapping}"
@@ -20,43 +56,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Drop a stopped container from a previous run.
 docker rm -f "$CT" >/dev/null 2>&1 || true
-
 mkdir -p rbnx-build/data
 
 declare -a EXTRA_MOUNTS=()
-# NOTE: RBNX_CONFIG_FILE intentionally NOT mounted/forwarded. Per v0.1
-# layering, the cap receives its config exclusively through
-# Driver(CMD_INIT, config_json), driven by rbnx boot/start over gRPC.
-# The cap process must never see the config file path.
+# NOTE: RBNX_CONFIG_FILE intentionally NOT mounted — config arrives via
+# Driver(CMD_INIT, config_json) over gRPC, never a file.
 
-# X11 forwarding for rtabmap_viz inside the mapping container. We
-# auto-detect DISPLAY when it's not in the env (the user ran
-# `rbnx boot` from a fresh shell without exporting): probe the
-# standard local Xorg slots, accept the first that responds. If
-# none does, skip X11 wiring and rtabmap_viz won't render — the
-# launch file's `enable_viz` flag still spawns it but Qt prints
-# the "could not connect to display" warning we've seen before.
+# X11 for rtabmap_viz inside the container (auto-detect DISPLAY).
 if [[ -z "${DISPLAY:-}" ]]; then
     if command -v xset &>/dev/null; then
         for d in :0 :1 :10; do
-            if DISPLAY="$d" xset q &>/dev/null; then
-                export DISPLAY="$d"
-                break
-            fi
+            if DISPLAY="$d" xset q &>/dev/null; then export DISPLAY="$d"; break; fi
         done
     fi
 fi
-
 declare -a X11_ARGS=()
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
     xhost +local:docker >/dev/null 2>&1 || true
-    X11_ARGS=(
-        -e DISPLAY="$DISPLAY"
-        -e QT_X11_NO_MITSHM=1
-        -v /tmp/.X11-unix:/tmp/.X11-unix:rw
-    )
+    X11_ARGS=(-e DISPLAY="$DISPLAY" -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix:rw)
 fi
 
 exec docker run --rm \

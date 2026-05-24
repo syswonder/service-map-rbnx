@@ -67,7 +67,13 @@ case "$ALGO" in
         USE_SIM_TIME="${USE_SIM_TIME_R:-${MAPPING_USE_SIM_TIME:-true}}"
         ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
         echo "[start_engine] rtabmap scan2d=$SCAN_TOPIC scan3d=$SCAN_CLOUD_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC imu=$IMU_TOPIC base=$BASE_FRAME odomf=$ODOM_FRAME use_sim_time=$USE_SIM_TIME viz=$ENABLE_VIZ"
-        exec ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/rtabmap_2d.launch.py" \
+        # Run launch in the background so a sidecar can scrape
+        # rtabmap_slam's actual --params-file path (the temp file ros2
+        # launch generated, e.g. /tmp/launch_params_xxxxxx) plus its
+        # contents and log them into mapping.log. Without this the only
+        # way to find that file is `ps -ef | grep rtabmap`, which is
+        # hostile to debugging parameter resolution.
+        ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/rtabmap_2d.launch.py" \
             scan_topic:="$SCAN_TOPIC" \
             scan_cloud_topic:="$SCAN_CLOUD_TOPIC" \
             odom_topic:="$ODOM_TOPIC" \
@@ -77,7 +83,55 @@ case "$ALGO" in
             base_frame:="$BASE_FRAME" \
             odom_frame:="$ODOM_FRAME" \
             use_sim_time:="$USE_SIM_TIME" \
-            enable_viz:="$ENABLE_VIZ"
+            enable_viz:="$ENABLE_VIZ" &
+        LAUNCH_PID=$!
+        (
+            python3 - <<'PYEOF'
+import time, subprocess
+deadline = time.time() + 10
+seen = set()
+while time.time() < deadline:
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "rtabmap_slam/rtabmap"], text=True)
+    except subprocess.CalledProcessError:
+        time.sleep(0.4); continue
+    for ln in out.splitlines():
+        if not ln:
+            continue
+        pid = ln.split()[0]
+        if pid in seen:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\x00")
+        except FileNotFoundError:
+            continue
+        seen.add(pid)
+        params = None
+        for i, a in enumerate(argv):
+            if a == b"--params-file" and i + 1 < len(argv):
+                params = argv[i + 1].decode("utf-8", "replace")
+                break
+        if params:
+            print(f"[start_engine] >>> rtabmap pid={pid} params-file={params}", flush=True)
+            print(f"[start_engine] >>> ----- begin {params} -----", flush=True)
+            try:
+                with open(params) as f:
+                    for line in f.read().splitlines():
+                        print(f"[start_engine]    {line}", flush=True)
+            except OSError as e:
+                print(f"[start_engine] >>> ERR reading {params}: {e}", flush=True)
+            print(f"[start_engine] >>> ----- end {params} -----", flush=True)
+        else:
+            print(f"[start_engine] >>> rtabmap pid={pid} has no --params-file in argv", flush=True)
+    if seen:
+        break
+    time.sleep(0.4)
+else:
+    print("[start_engine] >>> WARN: no rtabmap_slam process found within 10s", flush=True)
+PYEOF
+        ) &
+        wait $LAUNCH_PID
         ;;
 
     dlio)

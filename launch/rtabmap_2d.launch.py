@@ -120,7 +120,7 @@ def _make_nodes(context, *args, **kwargs):
         #   Grid/Sensor=2 → BOTH (preferred when both modalities are alive)
         # On the real robot we have mid360 3D cloud + RealSense depth, so
         # Grid/Sensor=2 fuses them for occupancy.
-        "Grid/Sensor": "0",
+        "Grid/Sensor": "2",
         "Grid/FromDepth": "true" if have_rgbd else "false",
         "Grid/RangeMax": "6.0",
         "Grid/CellSize": "0.05",

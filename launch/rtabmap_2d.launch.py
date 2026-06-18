@@ -89,6 +89,19 @@ def _make_nodes(context, *args, **kwargs):
             "deploy manifest."
         )
 
+    # Occupancy-grid source must auto-adapt to the sensors the deploy
+    # actually wired up (via atlas_bridge's resolved.yaml), the same way
+    # the subscriptions below do. Grid/Sensor: 0=laser scan(s) only,
+    # 1=depth only, 2=both. A hardcoded "2" assumed a depth camera was
+    # always present; on a lidar-only deploy (no RGBD) the depth half has
+    # no input, so the projected grid stays empty (/map never populates).
+    if have_rgbd and (have_scan or have_scan_cloud):
+        grid_sensor = "2"
+    elif have_rgbd:
+        grid_sensor = "1"
+    else:
+        grid_sensor = "0"
+
     rtabmap_params = {
         "use_sim_time": use_sim_time,
         "frame_id": base_frame,
@@ -112,16 +125,19 @@ def _make_nodes(context, *args, **kwargs):
         # not set" errors when wait_for_transform is short. 1.5s gives
         # the TF buffer plenty of room to catch up.
         "wait_for_transform": 1.5,
-        # Build occupancy grid from BOTH scan and depth — depth fills in
-        # obstacles below the lidar plane (tables, chairs) that the 2D
-        # scan misses entirely. RTAB-Map 0.21+:
-        #   Grid/Sensor=0 → laser scan only
-        #   Grid/Sensor=1 → depth only
-        #   Grid/Sensor=2 → BOTH (preferred when both modalities are alive)
-        # On the real robot we have mid360 3D cloud + RealSense depth, so
-        # Grid/Sensor=2 fuses them for occupancy.
-        "Grid/Sensor": "2",
+        # Build the occupancy grid from whatever the deploy has. RTAB-Map
+        # 0.21+ Grid/Sensor: 0=laser scan only, 1=depth only, 2=both.
+        # `grid_sensor` (derived above from the present sensors) picks the
+        # value automatically: a lidar-only robot projects its 3D cloud
+        # (0), and a camera+lidar robot fuses both (2) so depth fills the
+        # obstacles below the lidar plane (tables, chairs) the scan misses.
+        "Grid/Sensor": grid_sensor,
         "Grid/FromDepth": "true" if have_rgbd else "false",
+        # Persist a per-node occupancy grid at insertion time. Without it
+        # rtabmap leaves nodes grid-less and only regenerates on demand,
+        # which on the lidar-only path left /map empty (and emitted the
+        # "Make sure parameter RGBD/CreateOccupancyGrid is true" warning).
+        "RGBD/CreateOccupancyGrid": "true",
         "Grid/RangeMax": "6.0",
         "Grid/CellSize": "0.05",
         "Grid/RayTracing": "true",

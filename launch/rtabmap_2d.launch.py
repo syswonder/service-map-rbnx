@@ -55,6 +55,17 @@ def generate_launch_description():
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="false"),
+        # Map persistence (set by atlas_bridge from the deploy's map_id /
+        # map_mode config; empty database_path = ephemeral, the legacy
+        # behaviour).
+        #   map_mode=mapping       build/extend a map at database_path.
+        #   map_mode=localization  load database_path read-only; the map
+        #                          frame re-anchors to the saved map so it
+        #                          is STABLE across restarts (what scene's
+        #                          per-map_id semantic store needs).
+        DeclareLaunchArgument("database_path", default_value=""),
+        DeclareLaunchArgument("map_mode", default_value="mapping"),
+        DeclareLaunchArgument("reset_map", default_value="false"),
         OpaqueFunction(function=_make_nodes),
     ])
 
@@ -71,6 +82,10 @@ def _make_nodes(context, *args, **kwargs):
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
     use_sim_time = use_sim_time_str.lower() == "true"
+    database_path = LaunchConfiguration("database_path").perform(context).strip()
+    map_mode = LaunchConfiguration("map_mode").perform(context).strip().lower()
+    reset_map = LaunchConfiguration("reset_map").perform(context).lower() == "true"
+    localization = bool(database_path) and map_mode == "localization"
 
     have_scan = bool(scan_topic) and scan_topic != _NONE
     have_scan_cloud = bool(scan_cloud_topic) and scan_cloud_topic != _NONE
@@ -157,8 +172,13 @@ def _make_nodes(context, *args, **kwargs):
         # shelves. Raise both bounds.
         "Grid/MaxObstacleHeight": "1.0",
         "Grid/MaxGroundHeight": "0.1",
-        "Mem/IncrementalMemory": "true",
-        "Mem/InitWMWithAllNodes": "false",
+        # Memory mode follows map_mode. Mapping: incremental (add nodes,
+        # grow the graph). Localization: frozen graph (IncrementalMemory
+        # off) initialised with all saved nodes, so rtabmap relocalises
+        # against the loaded map and re-publishes the SAME map frame each
+        # boot — the stable-origin property scene's per-map_id store needs.
+        "Mem/IncrementalMemory": "false" if localization else "true",
+        "Mem/InitWMWithAllNodes": "true" if localization else "false",
         "Reg/Strategy": "1",        # 0=Visual, 1=ICP, 2=Visual+ICP
         "Reg/Force3DoF": "true",
         "Optimizer/Strategy": "1",  # g2o
@@ -201,13 +221,31 @@ def _make_nodes(context, *args, **kwargs):
             ("depth/image", depth_topic),
         ]
 
+    # Persist the graph at the deploy-chosen path when a named map is used;
+    # otherwise rtabmap falls back to its default ~/.ros/rtabmap.db (the
+    # legacy ephemeral path).
+    if database_path:
+        rtabmap_params["database_path"] = database_path
+
+    # --delete_db_on_start wipes the db. Ephemeral (no named map) always
+    # wipes — legacy temp-db behaviour. With a named map, wipe ONLY for an
+    # explicit fresh start (mapping + reset_map); a normal mapping run
+    # extends the existing db, and localization must never wipe.
+    if not database_path or (map_mode == "mapping" and reset_map):
+        rtabmap_args = ["--delete_db_on_start"]
+    else:
+        rtabmap_args = []
+    print(f"[rtabmap.launch] map_mode={map_mode or 'ephemeral'} "
+          f"db={database_path or '(default temp)'} "
+          f"localization={localization} delete_db={bool(rtabmap_args)}")
+
     rtabmap_node = Node(
         package="rtabmap_slam",
         executable="rtabmap",
         name="rtabmap",
         output="screen",
         parameters=[rtabmap_params],
-        arguments=["--delete_db_on_start"],
+        arguments=rtabmap_args,
         remappings=rtabmap_remappings,
     )
 

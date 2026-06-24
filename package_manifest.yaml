@@ -49,8 +49,30 @@ package:
   description: SLAM mapping service. Algo + sensor inputs config-driven.
   license: MulanPSL-2.0
 
+# Deployment target: x86_64 + docker (ROS2 in image). This is the default
+# manifest. Sibling manifests select other targets via the deploy entry's
+# `manifest:` field (rbnx loads that file instead of this one):
+#   package_manifest.jetson-docker.yaml   arm64 Jetson + docker (L4T base)
+#   package_manifest.jetson-native.yaml   arm64 Jetson + host ROS2 (no docker)
+# All three share this package's code + capabilities; only build/start differ.
 build: bash scripts/build.sh
 start: bash scripts/start.sh
+
+# ── config (deploy `config:` block → Driver(CMD_INIT)) ──────────────────────
+# Required:
+#   algo:    rtabmap | dlio | fastlio2[broken]      (rtabmap recommended)
+#   sensors: { lidar2d|lidar3d|rgb|rgbd|imu|odom: bool }   what the robot has
+# Frames / time (optional; defaults = webots tiago):
+#   base_frame, odom_frame, map_frame, use_sim_time
+# Map persistence (optional; rtabmap only):
+#   map_id:    stable id for this map. Bind the SAME id in the scene service
+#              so its per-map_id semantic store anchors to this spatial map.
+#              Omit → ephemeral (db wiped each boot — the legacy behaviour).
+#   map_mode:  mapping (default; build/extend) | localization (load read-only,
+#              stable map frame across restarts — needs a saved map_id first).
+#   reset_map: true to start a named map fresh (mapping mode only).
+# Saved maps live under {MAPPING_MAPS_DIR}/{map_id}/ as rtabmap.db +
+# occupancy.pgm/.yaml/.png + cloud.pcd + meta.yaml (offline-previewable).
 
 # Only list what we actually declare on atlas at runtime. Aspirational
 # entries (status / save_map / load_map / switch_mode / set_initial_pose)

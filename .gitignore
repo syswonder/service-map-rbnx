@@ -32,3 +32,6 @@ maps/*.pgm
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime map store (per-map_id: rtabmap.db + occupancy.* + cloud.pcd)
+/maps/

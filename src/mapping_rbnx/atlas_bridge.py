@@ -54,9 +54,76 @@ PKG_HOST_DIR = os.environ.get("ROBONIX_PKG_HOST_DIR", "/mapping")
 RESOLVED_DIR = os.environ.get("MAPPING_RESOLVED_DIR", "/tmp")
 HEARTBEAT_PERIOD_S = 10.0
 
+# Persistent map store. Each named map lives under {MAPS_DIR}/{map_id}/ and
+# survives container restarts ONLY when the deploy bind-mounts a host dir
+# here (docker/compose.yaml mounts it; see CAPABILITY.md "persistence").
+# Without map_id the package stays ephemeral — exactly the pre-persistence
+# behaviour (temp db, wiped each boot).
+MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
+
 
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ── Map persistence (map_id / mapping vs localization) ────────────────────────
+import re  # noqa: E402
+
+_VALID_MODES = ("mapping", "localization")
+
+
+def _sanitize_map_id(map_id: str) -> str:
+    """Map ids become a directory name, so restrict to a filesystem-safe
+    charset. Mirrors scene's ObjectStore sanitiser so a given map_id keys
+    the SAME spatial map (mapping) and semantic map (scene) consistently."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", map_id.strip()) or "default"
+
+
+def _resolve_persistence(cfg: dict) -> dict[str, str]:
+    """Turn the map_id / map_mode / reset_map config into the concrete
+    keys the launch needs: database_path, map_mode, reset_map.
+
+    Binding contract: the operator sets the SAME `map_id` here and in the
+    scene service's config; mapping owns the spatial map (rtabmap db +
+    map frame), scene keys its semantic objects to that id. A stable
+    map frame across restarts requires map_mode=localization against a
+    previously-saved db.
+
+    Returns {} when no map_id is configured (ephemeral mode — keeps the
+    legacy delete-db-on-start behaviour). Raises on an invalid combo so a
+    misconfigured deploy fails loud instead of silently mapping into a
+    throwaway db.
+    """
+    raw_id = cfg.get("map_id")
+    if not raw_id:
+        return {}  # ephemeral — no persistence
+    map_id = _sanitize_map_id(str(raw_id))
+    mode = str(cfg.get("map_mode", "mapping")).strip().lower()
+    if mode not in _VALID_MODES:
+        raise RuntimeError(
+            f"map_mode={mode!r} invalid — must be one of {list(_VALID_MODES)}"
+        )
+    reset = _truthy(cfg.get("reset_map", False))
+    map_dir = os.path.join(MAPS_DIR, map_id)
+    db_path = os.path.join(map_dir, "rtabmap.db")
+    if mode == "localization":
+        if not os.path.isfile(db_path):
+            raise RuntimeError(
+                f"map_mode=localization but no saved map at {db_path!r}. "
+                f"Run a mapping session with map_id={map_id!r} first "
+                f"(map_mode=mapping), or check MAPPING_MAPS_DIR is mounted."
+            )
+        if reset:
+            raise RuntimeError("reset_map=true is meaningless in localization mode")
+    os.makedirs(map_dir, exist_ok=True)
+    log.info("persistence: map_id=%s mode=%s db=%s reset=%s",
+             map_id, mode, db_path, reset)
+    return {
+        "map_id": map_id,
+        "map_mode": mode,
+        "database_path": db_path,
+        "reset_map": "true" if reset else "false",
+    }
 
 
 # ── Per-algo output endpoint map ──────────────────────────────────────────────
@@ -192,7 +259,7 @@ def _enabled_sensors(cfg: dict) -> dict:
 
 
 # ── Atlas helpers (use Capability's wrapped stub) ────────────────────────────
-def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]:
+def _resolve_sensor_endpoint(cap: Service, contract_id: str) -> Optional[str]:
     """ATLAS.find_capability + connect_capability for one ROS2 contract. Returns the topic
     string atlas resolved, or None when no provider is online yet.
     The opened Channel is closed immediately — we just want the
@@ -212,7 +279,7 @@ def _resolve_sensor_endpoint(cap: Capability, contract_id: str) -> Optional[str]
     return endpoint or None
 
 
-def _resolve_sensors(cap: Capability, cfg: dict) -> dict[str, str]:
+def _resolve_sensors(cap: Service, cfg: dict) -> dict[str, str]:
     """For each enabled sensor, ask atlas for the topic. Empty when
     the primitive isn't online yet (resolved.yaml still useful — the
     launch picks a sane default)."""
@@ -230,7 +297,7 @@ def _resolve_sensors(cap: Capability, cfg: dict) -> dict[str, str]:
     return resolved
 
 
-def _retry_resolve(cap: Capability, cfg: dict, deadline_s: float = 30.0,
+def _retry_resolve(cap: Service, cfg: dict, deadline_s: float = 30.0,
                    settle_s: float = 8.0) -> dict[str, str]:
     """Wait until at least one sensor lands, then absorb late arrivals
     for `settle_s` so all enabled inputs end up in resolved.yaml."""
@@ -254,7 +321,7 @@ def _retry_resolve(cap: Capability, cfg: dict, deadline_s: float = 30.0,
     return resolved
 
 
-def _declare_outputs(cap: Capability, algo: str) -> None:
+def _declare_outputs(cap: Service, algo: str) -> None:
     """DeclareInterface(transport=ROS2) for every exported contract.
     All algos publish the same contract surface — only the topic differs."""
     bindings = _ALGO_TOPIC_BINDINGS[algo]
@@ -343,11 +410,67 @@ def init(cfg: dict):
     for key in ("base_frame", "odom_frame", "map_frame", "use_sim_time"):
         if key in cfg:
             resolved[key] = str(cfg[key]).lower() if key == "use_sim_time" else str(cfg[key])
+
+    # Map persistence (map_id / mapping vs localization). Adds map_mode +
+    # database_path + reset_map to resolved.yaml; start_engine.sh / the
+    # launch read them. Empty when no map_id (ephemeral — legacy behaviour).
+    try:
+        persist = _resolve_persistence(cfg)
+    except RuntimeError as e:
+        return Err(str(e))
+    resolved.update(persist)
+    # Remember the active map_id so on_shutdown (and the save_map helper)
+    # know where to dump the human-previewable map. Only rtabmap persists
+    # today; other algos ignore this.
+    _ACTIVE.update({"algo": algo, "map_id": persist.get("map_id", ""),
+                    "map_dir": os.path.dirname(persist["database_path"])
+                    if persist else ""})
+
     _write_resolved_yaml(algo, resolved)
 
     # Declare outputs (after resolved.yaml so launch can start in parallel).
     _declare_outputs(mapping, algo)
     return Ok()
+
+
+# Active-session scratch — set by init, read by on_shutdown / save helpers.
+_ACTIVE: dict[str, str] = {}
+
+
+@mapping.on_shutdown
+def shutdown():
+    """Best-effort: when a named map (map_id) was being built, dump a
+    human-previewable snapshot (occupancy .pgm/.yaml/.png + cloud .pcd +
+    meta) next to the rtabmap db before the SLAM nodes are torn down, so
+    the map is usable offline without rtabmap's database viewer. The db
+    itself is already persistent (rtabmap writes it live at database_path);
+    this only adds the portable artifacts. Never fail shutdown on a save
+    error — the db is the source of truth."""
+    map_dir = _ACTIVE.get("map_dir")
+    map_id = _ACTIVE.get("map_id")
+    if not map_dir or not map_id or _ACTIVE.get("algo") != "rtabmap":
+        return Ok()
+    try:
+        _export_map_snapshot(map_dir)
+    except Exception as e:  # noqa: BLE001
+        log.warning("map snapshot export failed (db still saved): %s", e)
+    return Ok()
+
+
+def _export_map_snapshot(map_dir: str) -> None:
+    """Run scripts/save_map.py to snapshot the live occupancy grid + cloud
+    into map_dir (pgm/yaml/png/pcd/meta). Bounded so a stuck topic can't
+    hang shutdown."""
+    import subprocess
+    script = os.path.join(PKG_HOST_DIR, "scripts", "save_map.py")
+    if not os.path.isfile(script):
+        log.warning("save_map.py not found at %s — skipping snapshot", script)
+        return
+    log.info("exporting map snapshot → %s", map_dir)
+    subprocess.run(
+        ["python3", script, "--out-dir", map_dir, "--timeout", "10"],
+        check=False, timeout=30,
+    )
 
 
 def main() -> int:

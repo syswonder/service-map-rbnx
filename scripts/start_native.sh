@@ -59,6 +59,10 @@ export MAPPING_RESOLVED_DIR="${MAPPING_RESOLVED_DIR:-/tmp}"
 # start_engine.sh reads the launch from here (container used /mapping/launch).
 export MAPPING_LAUNCH_DIR="$PKG/launch"
 export MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
+# Persistent map store. Container default is /mapping/maps (bind-mounted);
+# natively there is no /mapping, so anchor it under the package dir so
+# saved maps survive restarts. Override with MAPPING_MAPS_DIR.
+export MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-$PKG/maps}"
 
 PYBIN="${MAPPING_NATIVE_PYTHON:-python3}"
 

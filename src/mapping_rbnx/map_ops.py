@@ -176,11 +176,9 @@ def load_map_impl(map_id: str, mode: str = "localization",
             return {"ok": False, "detail": f"{res} — fall back to restart (strategy A)"}
 
         # 2. mode switch
-        from std_srvs.srv import Empty
-        mode_srv = "set_mode_localization" if mode == "localization" else "set_mode_mapping"
-        ok2, res2 = _call_service(node, Empty, f"{RTABMAP_NS}/{mode_srv}", Empty.Request(), timeout_s=5.0)
+        ok2, info2 = _set_mode(node, mode)
         if not ok2:
-            return {"ok": False, "detail": f"loaded db but {mode_srv} failed: {res2}"}
+            return {"ok": False, "detail": f"loaded db but mode switch failed: {info2}"}
 
         # 3. optional pose seed for fast convergence
         seeded = ""
@@ -190,6 +188,35 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": True, "detail": f"loaded {map_id} in {mode} mode{seeded}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
+        return {"ok": False, "detail": str(e)}
+
+
+# ── switch_mode ───────────────────────────────────────────────────────────────
+def _set_mode(node, mode: str) -> tuple[bool, str]:
+    """Call rtabmap's set_mode_localization|set_mode_mapping (std_srvs/Empty)."""
+    from std_srvs.srv import Empty
+    srv = "set_mode_localization" if mode == "localization" else "set_mode_mapping"
+    ok, res = _call_service(node, Empty, f"{RTABMAP_NS}/{srv}", Empty.Request(), timeout_s=5.0)
+    return (ok, srv if ok else str(res))
+
+
+def switch_mode_impl(mode: str) -> dict:
+    """Flip the running rtabmap between mapping and localization on the CURRENT
+    map — no map load, no restart. Returns {ok, detail}."""
+    mode = (mode or "").strip().lower()
+    if mode not in ("localization", "mapping"):
+        return {"ok": False, "detail": f"mode={mode!r} invalid (localization|mapping)"}
+    node = _get_node()
+    if node is None:
+        return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
+    try:
+        ok, info = _set_mode(node, mode)
+        if not ok:
+            return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
+                                           "(fall back to restart with config map_mode)"}
+        return {"ok": True, "detail": f"switched to {mode} mode"}
+    except Exception as e:  # noqa: BLE001
+        log.exception("switch_mode failed")
         return {"ok": False, "detail": str(e)}
 
 

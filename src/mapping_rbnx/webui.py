@@ -175,6 +175,11 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <input id=saveid placeholder="map_id e.g. lab_3f" style="flex:1">
    <button onclick="doSave()">Save</button>
   </div>
+  <h3 style="margin:16px 0 10px">Mode</h3>
+  <div style="display:flex;gap:8px">
+   <button onclick="doSwitch('mapping')">Mapping (build)</button>
+   <button class=alt onclick="doSwitch('localization')">Localization</button>
+  </div>
   <h3 style="margin:16px 0 10px">Library</h3>
   <div id=lib class=lib></div>
  </div>
@@ -203,6 +208,9 @@ async function doSave(){let id=document.getElementById('saveid').value.trim();
 async function doLoad(id){if(!confirm('Load map '+id+' (localization)?'))return;setStatus('loading '+id+'…');
  let r=await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json();
  setStatus(r.detail||'loaded')}
+async function doSwitch(mode){setStatus('switching to '+mode+'…');
+ let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
+ setStatus(r.detail||('mode '+mode))}
 document.getElementById('mapimg').addEventListener('click',async ev=>{
  let img=ev.target,rect=img.getBoundingClientRect();
  let fx=(ev.clientX-rect.left)/rect.width, fy=(ev.clientY-rect.top)/rect.height;
@@ -292,6 +300,9 @@ class _Handler(BaseHTTPRequestHandler):
                 out = map_ops.pose_estimate_impl(
                     float(body.get("x", 0.0)), float(body.get("y", 0.0)),
                     float(body.get("theta", 0.0)))
+                return self._json(out)
+            if p == "/api/switch_mode":
+                out = map_ops.switch_mode_impl(body.get("mode", ""))
                 return self._json(out)
             return self._send(404, "text/plain", b"not found")
         except Exception as e:  # noqa: BLE001

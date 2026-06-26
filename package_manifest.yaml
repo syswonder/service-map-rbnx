@@ -89,3 +89,4 @@ capabilities:
   - name: robonix/service/map/save_map
   - name: robonix/service/map/load_map
   - name: robonix/service/map/pose_estimate
+  - name: robonix/service/map/switch_mode

@@ -56,6 +56,8 @@ from map_mcp import (  # type: ignore  # noqa: E402
     LoadMap_Response as McpLoadMapResp,
     PoseEstimate_Request as McpPoseReq,
     PoseEstimate_Response as McpPoseResp,
+    SwitchMode_Request as McpSwitchReq,
+    SwitchMode_Response as McpSwitchResp,
 )
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
@@ -526,6 +528,12 @@ class _PoseEstimateServicer(contracts_grpc.RobonixServiceMapPoseEstimateServicer
         return map_pb2.PoseEstimate_Response(**out)
 
 
+class _SwitchModeServicer(contracts_grpc.RobonixServiceMapSwitchModeServicer):
+    def SwitchMode(self, request, context):
+        out = map_ops.switch_mode_impl(request.mode)
+        return map_pb2.SwitchMode_Response(**out)
+
+
 @mapping.mcp("robonix/service/map/save_map")
 def save_map(req: McpSaveMapReq) -> McpSaveMapResp:
     """Snapshot the current SLAM map to disk under a stable map_id so it can be
@@ -562,9 +570,21 @@ def pose_estimate(req: McpPoseReq) -> McpPoseResp:
     return McpPoseResp(**out)
 
 
+@mapping.mcp("robonix/service/map/switch_mode")
+def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
+    """Flip SLAM between 'mapping' (build/extend the current map) and
+    'localization' (relocalize read-only against it) at runtime — no map load,
+    no restart. The config's map_mode is only the startup default."""
+    out = map_ops.switch_mode_impl(req.mode)
+    if not out["ok"]:
+        raise RuntimeError(out["detail"])
+    return McpSwitchResp(**out)
+
+
 mapping.attach_grpc_servicer("robonix/service/map/save_map", _SaveMapServicer())
 mapping.attach_grpc_servicer("robonix/service/map/load_map", _LoadMapServicer())
 mapping.attach_grpc_servicer("robonix/service/map/pose_estimate", _PoseEstimateServicer())
+mapping.attach_grpc_servicer("robonix/service/map/switch_mode", _SwitchModeServicer())
 
 
 def main() -> int:

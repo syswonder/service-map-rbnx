@@ -17,6 +17,9 @@ which engine runs — they only bind the `robonix/service/map/*` contracts.
 | `robonix/service/map/pointcloud` | ros2 topic | `sensor_msgs/PointCloud2` | 3D fused cloud |
 | `robonix/service/map/pose` | ros2 topic | `geometry_msgs/PoseWithCovarianceStamped` | SLAM-corrected, map frame; can jump on loop closure |
 | `robonix/service/map/odom` | ros2 topic | `nav_msgs/Odometry` | SLAM-corrected, odom frame; continuous between closures |
+| `robonix/service/map/save_map` | grpc + mcp | `map_id, note → ok, database_path` | snapshot the live map under a stable id |
+| `robonix/service/map/load_map` | grpc + mcp | `map_id, mode, [x,y,theta] → ok` | switch onto a saved map (localization / mapping) |
+| `robonix/service/map/pose_estimate` | grpc + mcp | `x, y, theta → ok` | seed a pose so localization re-converges |
 
 Every `algo` backs this **same** surface (an adapter node is spawned when an
 engine can't natively publish a contract), so `scene` / `nav` are
@@ -86,6 +89,30 @@ sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }  # Mid
 
 `sensors:` is required and must list at least one sensor — the package
 refuses to guess.
+
+## Map operations (`save_map` / `load_map` / `pose_estimate`)
+
+Runtime RPC+MCP controls for managing maps without re-deploying. All three are
+callable any time after init, by gRPC (scene / programmatic) or MCP (pilot /
+LLM). Maps live under `{MAPPING_MAPS_DIR}/<map_id>/` (rtabmap.db + occupancy
+pgm/png + cloud pcd + meta), one directory per `map_id` — the same id scene
+keys its semantic objects to.
+
+- **save_map** `(map_id, note)` → `(ok, database_path, detail)`. Roam to build
+  coverage, then checkpoint the live map under `map_id`. The rtabmap db is
+  written live; this adds the portable preview artifacts (and copies the db in
+  if the live session was ephemeral). Non-destructive — mapping continues.
+- **load_map** `(map_id, mode, [x,y,theta])` → `(ok, detail)`. Switch onto a
+  saved map. `mode=localization` relocalizes against it (stable map frame
+  across runs); `mode=mapping` resumes extending it. Implementation tries
+  rtabmap's runtime services first (`/rtabmap/load_database` +
+  `set_mode_localization`); if a build lacks them, restart the service with
+  `config.map_id`/`map_mode` instead (see persistence below). Pass
+  `has_initial_pose` + `x,y,theta` to seed convergence.
+- **pose_estimate** `(x, y, theta)` → `(ok, detail)`. Publish a pose guess
+  (map frame) to `/initialpose` so rtabmap's localization re-converges — global
+  relocalization, kidnapped-robot recovery, or refining a rough operator guess.
+  rtabmap snaps the guess to the true pose via scan matching.
 
 ## Map persistence (`map_id`)
 

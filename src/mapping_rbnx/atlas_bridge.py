@@ -58,6 +58,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
     PoseEstimate_Response as McpPoseResp,
 )
 from mapping_rbnx import map_ops  # noqa: E402
+from mapping_rbnx import webui  # noqa: E402
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -444,6 +445,12 @@ def init(cfg: dict):
 
     # Declare outputs (after resolved.yaml so launch can start in parallel).
     _declare_outputs(mapping, algo)
+
+    # Optional map web UI (live preview + save/load/pose buttons). No-op unless
+    # MAPPING_WEBUI_PORT is set. Started here so the SLAM topics it previews
+    # exist by the time an operator opens the page.
+    webui.set_active_db_hint(_active_db)
+    webui.maybe_start()
     return Ok()
 
 

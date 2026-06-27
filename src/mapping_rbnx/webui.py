@@ -345,7 +345,7 @@ async function doLoad(id){if(!confirm('Load map '+id+' (localization)?'))return;
 async function doSwitch(mode){setStatus('switching to '+mode+'…');
  let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
  if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}
-async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch?\n\nThe new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
+async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch? The new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
  setStatus('resetting map…');
  let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
  setStatus(r.detail||'reset')}

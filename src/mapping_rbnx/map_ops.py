@@ -185,10 +185,34 @@ def load_map_impl(map_id: str, mode: str = "localization",
         if has_initial_pose:
             ps = pose_estimate_impl(x, y, theta)
             seeded = f"; {ps['detail']}"
+        set_current_mode(mode)
         return {"ok": True, "detail": f"loaded {map_id} in {mode} mode{seeded}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
         return {"ok": False, "detail": str(e)}
+
+
+# ── mode tracking (get_mode) ──────────────────────────────────────────────────
+# Single source of truth for "which SLAM mode is in effect right now", updated
+# by init (startup map_mode), switch_mode and load_map — so get_mode reflects
+# the real runtime mode regardless of how it changed (config, MCP, or webui).
+_current_mode: str = ""
+
+
+def set_current_mode(mode: str) -> None:
+    """Record the SLAM mode now in effect. Called by atlas_bridge.init with the
+    startup map_mode and by switch_mode_impl / load_map_impl on success."""
+    global _current_mode
+    if mode:
+        _current_mode = mode.strip().lower()
+
+
+def get_mode_impl() -> dict:
+    """Return the SLAM mode currently in effect (read-only). Returns
+    {ok, mode, detail}; mode is "" with ok=False before init has run."""
+    if not _current_mode:
+        return {"ok": False, "mode": "", "detail": "mode not initialized yet"}
+    return {"ok": True, "mode": _current_mode, "detail": ""}
 
 
 # ── switch_mode ───────────────────────────────────────────────────────────────
@@ -214,6 +238,7 @@ def switch_mode_impl(mode: str) -> dict:
         if not ok:
             return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
                                            "(fall back to restart with config map_mode)"}
+        set_current_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode"}
     except Exception as e:  # noqa: BLE001
         log.exception("switch_mode failed")

@@ -58,6 +58,12 @@ from map_mcp import (  # type: ignore  # noqa: E402
     PoseEstimate_Response as McpPoseResp,
     SwitchMode_Request as McpSwitchReq,
     SwitchMode_Response as McpSwitchResp,
+    GetMode_Request as McpGetModeReq,
+    GetMode_Response as McpGetModeResp,
+    DeleteMap_Request as McpDeleteReq,
+    DeleteMap_Response as McpDeleteResp,
+    ResetMap_Request as McpResetReq,
+    ResetMap_Response as McpResetResp,
 )
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
@@ -453,6 +459,8 @@ def init(cfg: dict):
     # Set the env here rather than relying on an external export that gets
     # lost across reboots, so the UI comes up on every boot. Started here so
     # the SLAM topics it previews exist when an operator opens the page.
+    # Seed the runtime mode tracker (get_mode) with the startup map_mode.
+    map_ops.set_current_mode(persist.get("map_mode") or str(cfg.get("map_mode", "mapping")))
     _webui_port = str(cfg.get("webui_port", 8091)).strip()
     if _webui_port and _webui_port != "0":
         os.environ["MAPPING_WEBUI_PORT"] = _webui_port
@@ -586,10 +594,58 @@ def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     return McpSwitchResp(**out)
 
 
+@mapping.mcp("robonix/service/map/get_mode")
+def get_mode(req: McpGetModeReq) -> McpGetModeResp:
+    """Read the SLAM mode currently in effect: 'mapping' (building/extending the
+    map) or 'localization' (relocalizing read-only). Complements switch_mode —
+    use it to report or branch on the real runtime mode rather than guessing."""
+    return McpGetModeResp(**map_ops.get_mode_impl())
+
+
+@mapping.mcp("robonix/service/map/delete_map")
+def delete_map(req: McpDeleteReq) -> McpDeleteResp:
+    """Permanently delete a saved map by id (its rtabmap.db + preview files on
+    disk). Irreversible; does not touch the live running map. Use save_map to
+    checkpoint first if unsure."""
+    out = map_ops.delete_map_impl(req.map_id)
+    if not out["ok"]:
+        raise RuntimeError(out["detail"])
+    return McpDeleteResp(**out)
+
+
+@mapping.mcp("robonix/service/map/reset_map")
+def reset_map(req: McpResetReq) -> McpResetResp:
+    """Clear the LIVE SLAM map and rebuild from the robot's current pose (the
+    map-frame origin moves). Does NOT delete saved maps on disk — use this when
+    the running map has diverged and you want a clean restart without redeploy."""
+    out = map_ops.reset_map_impl()
+    if not out["ok"]:
+        raise RuntimeError(out["detail"])
+    return McpResetResp(**out)
+
+
+class _GetModeServicer(contracts_grpc.RobonixServiceMapGetModeServicer):
+    def GetMode(self, request, context):
+        return map_pb2.GetMode_Response(**map_ops.get_mode_impl())
+
+
+class _DeleteMapServicer(contracts_grpc.RobonixServiceMapDeleteMapServicer):
+    def DeleteMap(self, request, context):
+        return map_pb2.DeleteMap_Response(**map_ops.delete_map_impl(request.map_id))
+
+
+class _ResetMapServicer(contracts_grpc.RobonixServiceMapResetMapServicer):
+    def ResetMap(self, request, context):
+        return map_pb2.ResetMap_Response(**map_ops.reset_map_impl())
+
+
 mapping.attach_grpc_servicer("robonix/service/map/save_map", _SaveMapServicer())
 mapping.attach_grpc_servicer("robonix/service/map/load_map", _LoadMapServicer())
 mapping.attach_grpc_servicer("robonix/service/map/pose_estimate", _PoseEstimateServicer())
 mapping.attach_grpc_servicer("robonix/service/map/switch_mode", _SwitchModeServicer())
+mapping.attach_grpc_servicer("robonix/service/map/get_mode", _GetModeServicer())
+mapping.attach_grpc_servicer("robonix/service/map/delete_map", _DeleteMapServicer())
+mapping.attach_grpc_servicer("robonix/service/map/reset_map", _ResetMapServicer())
 
 
 def main() -> int:

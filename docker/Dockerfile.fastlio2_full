@@ -101,7 +101,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
-    grpcio>=1.60.0 protobuf>=4.25.0 numpy>=1.24.0 pyyaml>=6.0
+    grpcio>=1.60.0 protobuf>=4.25.0 numpy>=1.24.0 pyyaml>=6.0 mcp>=1.28.1
 
 COPY src/ /ws/src/
 COPY config/ /config/

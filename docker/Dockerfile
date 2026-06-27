@@ -65,7 +65,8 @@ RUN pip install --no-cache-dir \
         grpcio>=1.60.0 \
         protobuf>=4.25.0 \
         pyyaml>=6.0 \
-        numpy
+        numpy \
+        mcp>=1.28.1
 
 WORKDIR /mapping
 COPY entrypoint.sh /entrypoint.sh

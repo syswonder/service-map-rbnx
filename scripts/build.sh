@@ -30,9 +30,13 @@ if [[ "$CLEAN" == "1" ]]; then
 fi
 mkdir -p "$BUILD/data"
 
-# ── 1. Codegen (proto stubs for atlas + IDL types) — every target ───────────
+# ── 1. Codegen (proto stubs for atlas + IDL types + MCP types) — every target ─
+# --mcp is REQUIRED: atlas_bridge.py imports `map_mcp` (SaveMap/LoadMap/
+# PoseEstimate/SwitchMode request/response dataclasses for the MCP tools).
+# Without it codegen emits only proto stubs, `map_mcp` is missing, and the
+# bridge dies at import with ModuleNotFoundError → the service never registers.
 if command -v rbnx >/dev/null 2>&1; then
-    FLAGS=()
+    FLAGS=(--mcp)
     [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
     echo "[build] rbnx codegen ${FLAGS[*]}"
     rbnx codegen -p "$PKG" "${FLAGS[@]}"

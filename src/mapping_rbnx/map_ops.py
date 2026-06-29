@@ -358,8 +358,17 @@ def save_map_impl(map_id: str, note: str = "",
             shutil.copy2(live_db, db_path)
 
         # Portable preview (pgm/png/pcd/meta) from the live /map + cloud topics.
+        # Locate save_map.py RELATIVE TO THIS MODULE, not via PKG_HOST_DIR:
+        # PKG_HOST_DIR is the *host* path (for atlas advertising) and does not
+        # exist inside the docker container where this code runs, so using it
+        # made the file check fail and the preview (occupancy.png) was silently
+        # skipped — the saved map then showed a broken image in the UI library.
+        # __file__ is <pkg>/src/mapping_rbnx/map_ops.py in both host and
+        # container, so ../../scripts/save_map.py resolves correctly either way.
         import subprocess
-        script = os.path.join(PKG_HOST_DIR, "scripts", "save_map.py")
+        script = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "save_map.py")
+        )
         if os.path.isfile(script):
             subprocess.run(
                 ["python3", script, "--out-dir", map_dir, "--timeout", "10"],

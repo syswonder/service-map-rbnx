@@ -128,8 +128,12 @@ def _ensure_subscriptions() -> None:
             from geometry_msgs.msg import PoseWithCovarianceStamped
             from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 
+            # The bridge process initialises rclpy lazily (map_ops._get_node on
+            # the first map op). The UI may be hit before any map op, so init
+            # the context here if needed — mirrors map_ops' own guard. Without
+            # this the UI returned before ever subscribing and stayed blank.
             if not rclpy.ok():
-                return  # context not initialised yet; retry next request
+                rclpy.init(args=None)
 
             # Match rtabmap's /map publisher (RELIABLE + TRANSIENT_LOCAL) so the
             # last latched grid is delivered immediately on subscribe.

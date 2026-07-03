@@ -2,25 +2,43 @@
 # SPDX-License-Identifier: MulanPSL-2.0
 # mapping_rbnx container entrypoint.
 #
-# Four processes run in this container, in order:
-#   1. rmw_zenohd                 — Zenoh router; rmw_zenoh_cpp ROS2
-#                                   nodes connect to it as transport.
-#   2. zenoh-bridge-dds           — mirrors the sim container's
-#                                   FastRTPS topics into Zenoh so our
-#                                   rmw_zenoh-side subscribers see
-#                                   /scanner / /odom / etc.
-#   3. atlas_bridge               — Python: registers cap with atlas,
+# Two processes run in this container:
+#   1. atlas_bridge               — Python: registers cap with atlas,
 #                                   queries sensor primitives, writes
 #                                   resolved.yaml, declares own outputs.
-#   4. SLAM engine                — rtabmap (default) / dlio / fastlio2
+#   2. SLAM engine                — rtabmap (default) / dlio / fastlio2
 #                                   (selected by config.algo via
 #                                   /mapping/scripts/start_engine.sh).
-#
-# All four are siblings; we trap on EXIT so SIGTERM tears the lot down.
+# Both are siblings; we trap on EXIT so SIGTERM tears the lot down.
 
 set -eo pipefail
 
 source /opt/ros/humble/setup.bash
+
+configure_zenoh_session() {
+    if [ "${RMW_IMPLEMENTATION:-}" != "rmw_zenoh_cpp" ] || [ -z "${ROBONIX_ZENOH_ROUTER:-}" ]; then
+        return 0
+    fi
+    local src="/opt/ros/${ROS_DISTRO:-humble}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5"
+    local dst="/tmp/robonix_zenoh_session.json5"
+    if [ ! -f "$src" ]; then
+        echo "[entrypoint] missing Zenoh session config: $src" >&2
+        return 1
+    fi
+    local mode="${ROBONIX_ZENOH_MODE:-client}"
+    sed \
+        -e "s#mode: \"peer\"#mode: \"${mode}\"#" \
+        -e "s#\"tcp/localhost:7447\"#\"${ROBONIX_ZENOH_ROUTER}\"#g" \
+        "$src" > "$dst"
+    if [ -n "${ROBONIX_ZENOH_LISTEN:-}" ]; then
+        sed -i "s#\"tcp/localhost:0\"#\"${ROBONIX_ZENOH_LISTEN}\"#g" "$dst"
+    fi
+    export ZENOH_SESSION_CONFIG_URI="$dst"
+    export ZENOH_ROUTER_CHECK_ATTEMPTS="${ZENOH_ROUTER_CHECK_ATTEMPTS:-20}"
+    echo "[entrypoint] rmw_zenoh_cpp mode=${mode} router=${ROBONIX_ZENOH_ROUTER} listen=${ROBONIX_ZENOH_LISTEN:-<default>}"
+}
+
+configure_zenoh_session
 
 cd /mapping
 
@@ -35,10 +53,6 @@ fi
 
 mkdir -p /mapping/rbnx-build/data
 
-# Direct-DDS path: same RMW (FastRTPS) as sim, --network host shares
-# the IP namespace so UDP multicast discovery works, and --ipc=host
-# shares /dev/shm so SHM data transfer lines up. No Zenoh router or
-# bridge needed in this layout.
 ZENOHD_PID=
 BRIDGE_PID=
 

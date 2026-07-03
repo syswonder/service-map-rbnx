@@ -59,6 +59,17 @@ trap cleanup EXIT INT TERM
 docker rm -f "$CT" >/dev/null 2>&1 || true
 mkdir -p rbnx-build/data
 
+declare -a ZENOH_ARGS=()
+if [[ -n "${ROBONIX_ZENOH_ROUTER:-}" ]]; then
+    ZENOH_ARGS=(-e "ROBONIX_ZENOH_ROUTER=${ROBONIX_ZENOH_ROUTER}")
+fi
+if [[ -n "${ROBONIX_ZENOH_MODE:-}" ]]; then
+    ZENOH_ARGS+=(-e "ROBONIX_ZENOH_MODE=${ROBONIX_ZENOH_MODE}")
+fi
+if [[ -n "${ROBONIX_ZENOH_LISTEN:-}" ]]; then
+    ZENOH_ARGS+=(-e "ROBONIX_ZENOH_LISTEN=${ROBONIX_ZENOH_LISTEN}")
+fi
+
 declare -a EXTRA_MOUNTS=()
 # NOTE: RBNX_CONFIG_FILE intentionally NOT mounted — config arrives via
 # Driver(CMD_INIT, config_json) over gRPC, never a file.
@@ -85,6 +96,8 @@ exec docker run --rm \
     -e ROBONIX_CAPABILITY_ID="${ROBONIX_CAPABILITY_ID:-mapping}" \
     -e ROBONIX_PKG_HOST_DIR="$(pwd)" \
     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
+    -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}" \
+    "${ZENOH_ARGS[@]}" \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
     -e MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-true}" \
     "${X11_ARGS[@]}" \

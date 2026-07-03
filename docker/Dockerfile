@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ── TUNA mirrors for domestic (CN) networks ─────────────────────────────
+# ── TUNA mirrors ───────────────────────────────────────────────────
 # Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
 # --follow-symlinks because /etc/apt/sources.list.d/ros2.sources is
 # a symlink into /usr/share/ros-apt-source/ in the upstream ros image.
@@ -59,6 +59,7 @@ RUN apt-get update \
         ros-humble-tf2-ros \
         ros-humble-tf-transformations \
         ros-humble-pointcloud-to-laserscan \
+        ros-humble-rmw-zenoh-cpp \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -74,16 +75,9 @@ COPY entrypoint.sh /entrypoint.sh
 COPY no_shm_profile.xml /etc/fastrtps_no_shm.xml
 RUN chmod +x /entrypoint.sh
 
-# Force FastRTPS to skip SHM transport — UDP-only is the only path
-# that's actually data-flowing across containers in this layout.
+# Left for operators who explicitly override RMW back to FastRTPS.
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fastrtps_no_shm.xml
 
-# Stick with FastRTPS (sim's default RMW). With --network host +
-# --ipc=host the SHM transport shares cleanly between sim and mapping,
-# and FastRTPS UDP multicast discovery covers the rest. We tried
-# Zenoh first but `zenoh_bridge_dds` cannot see FastRTPS-only SHM
-# publishers reliably across containers, so this is the path that
-# actually delivers sensor topics → rtabmap in webots.
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
 ENTRYPOINT ["/entrypoint.sh"]

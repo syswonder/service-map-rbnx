@@ -3,7 +3,8 @@
 # Pure CPU — no CUDA required, but L4T base ensures driver/kernel compat.
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-FROM dustynv/ros:humble-ros-base-l4t-r36.4.0 AS builder
+ARG JETSON_ROS_BASE_IMAGE=dustynv/ros:humble-ros-base-l4t-r36.4.0
+FROM ${JETSON_ROS_BASE_IMAGE} AS builder
 
 # ── TUNA mirrors for domestic (CN) networks ─────────────────────────────
 # Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
@@ -84,7 +85,7 @@ RUN . /opt/ros/humble/setup.sh && \
         -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-FROM dustynv/ros:humble-ros-base-l4t-r36.4.0 AS runtime
+FROM ${JETSON_ROS_BASE_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /ws

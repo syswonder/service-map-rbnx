@@ -18,7 +18,8 @@
 # slam_toolbox + cartographer were dropped after rtabmap consistently
 # beat them in head-to-head tests on webots tiago (curve-motion
 # stability, RGBD fusion, loop closure).
-FROM ros:humble-ros-base
+ARG ROS_BASE_IMAGE=robonix-ros:humble-ros-base
+FROM ${ROS_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

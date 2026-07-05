@@ -7,7 +7,8 @@
 #   runtime        — full SLAM + bridge
 
 # ── Build stage: FASTLIO2_ROS2 C++ ──────────────────────────────────────────
-FROM ros:humble-ros-base AS builder
+ARG ROS_BASE_IMAGE=robonix-ros:humble-ros-base
+FROM ${ROS_BASE_IMAGE} AS builder
 
 # ── TUNA mirrors for domestic (CN) networks ─────────────────────────────
 # Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
@@ -91,7 +92,7 @@ RUN . /opt/ros/humble/setup.sh && \
     --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble
 
 # ── Runtime bridge-only (dev/test target) ────────────────────────────────────
-FROM ros:humble-ros-base AS runtime-bridge
+FROM ${ROS_BASE_IMAGE} AS runtime-bridge
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /ws

@@ -16,6 +16,8 @@
 set -euo pipefail
 
 PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# shellcheck disable=SC1091
+source "$PKG/scripts/docker_base_image.sh"
 cd "$PKG"
 
 BUILD="rbnx-build"
@@ -23,6 +25,9 @@ CLEAN="${RBNX_BUILD_CLEAN:-}"
 VARIANT="${RBNX_BUILD_VARIANT:-light}"
 IMG="${ROBONIX_MAPPING_IMAGE:-robonix-mapping}"
 TARGET="${RBNX_BUILD_TARGET:-x86-docker}"
+ROS_BASE_IMAGE="${ROBONIX_MAPPING_ROS_BASE_IMAGE:-robonix-ros:humble-ros-base}"
+UPSTREAM_ROS_BASE_IMAGE="ros:humble-ros-base"
+JETSON_ROS_BASE_IMAGE="${ROBONIX_MAPPING_JETSON_ROS_BASE_IMAGE:-dustynv/ros:humble-ros-base-l4t-r36.4.0}"
 
 if [[ "$CLEAN" == "1" ]]; then
     echo "[build] clean: removing $BUILD"
@@ -54,11 +59,14 @@ case "$TARGET" in
             echo "[build] error: target $TARGET needs docker on PATH" >&2
             exit 1
         fi
-        DOCKER_BUILD_FLAGS=(--network=host)
+        DOCKER_BUILD_FLAGS=(--network=host --pull=false)
         [[ "$CLEAN" == "1" ]] && DOCKER_BUILD_FLAGS+=(--no-cache)
         if [[ "$TARGET" == "jetson-docker" ]]; then
             DF=docker/Dockerfile.jetson
+            DOCKER_BUILD_FLAGS+=(--build-arg "JETSON_ROS_BASE_IMAGE=${JETSON_ROS_BASE_IMAGE}")
         else
+            robonix_ensure_local_base_image "$ROS_BASE_IMAGE" "$UPSTREAM_ROS_BASE_IMAGE"
+            DOCKER_BUILD_FLAGS+=(--build-arg "ROS_BASE_IMAGE=${ROS_BASE_IMAGE}")
             case "$VARIANT" in
                 light)         DF=docker/Dockerfile ;;
                 fastlio2_full) DF=docker/Dockerfile.fastlio2_full ;;

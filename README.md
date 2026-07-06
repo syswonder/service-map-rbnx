@@ -36,7 +36,7 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
    ```yaml
    service:
      - name: mapping
-       url: https://github.com/enkerewpo/mapping_rbnx
+       url: https://github.com/syswonder/service-map-rbnx
        # manifest: package_manifest.jetson-native.yaml   # x86+docker is default
        config:
          algo: rtabmap

@@ -9,7 +9,7 @@
 # Select this file from a deploy manifest entry:
 #   service:
 #     - name: mapping
-#       url: https://github.com/enkerewpo/mapping_rbnx
+#       url: https://github.com/syswonder/service-map-rbnx
 #       manifest: package_manifest.jetson-docker.yaml
 #       config: { algo: rtabmap, sensors: {...}, map_id: lab_3f }
 manifestVersion: 1

@@ -45,7 +45,6 @@ manifestVersion: 1
 package:
   name: robonix.service.mapping
   version: 0.4.0
-  vendor: robonix
   description: SLAM mapping service. Algo + sensor inputs config-driven.
   tags: [service, mapping, slam, rtabmap, ros2]
   maintainers: [wheatfox <wheatfox17@icloud.com>]

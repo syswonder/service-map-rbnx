@@ -48,7 +48,7 @@ package:
   vendor: robonix
   description: SLAM mapping service. Algo + sensor inputs config-driven.
   tags: [service, mapping, slam, rtabmap, ros2]
-  maintainers: [syswonder]
+  maintainers: [wheatfox <wheatfox17@icloud.com>]
   license: MulanPSL-2.0
 
 # Deployment target: x86_64 + docker (ROS2 in image). This is the default

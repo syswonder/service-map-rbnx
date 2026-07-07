@@ -38,13 +38,19 @@
 #   robonix/service/map/odom           → nav_msgs/Odometry
 #                                        (SLAM-corrected, odom frame,
 #                                         continuous between closures)
+#   robonix/service/map/lifecycle      → map/msg/MapLifecycle
+#                                        ({map_id, mode, generation},
+#                                         latched; bridge-owned + algo-
+#                                         independent — published by
+#                                         atlas_bridge itself, not the
+#                                         SLAM engine)
 # Algos that don't natively publish a contract spawn an adapter node
 # in their launch file so the topic still exists at the bound name.
 manifestVersion: 1
 
 package:
   name: robonix.service.mapping
-  version: 0.4.0
+  version: 0.5.0
   description: SLAM mapping service. Algo + sensor inputs config-driven.
   tags: [service, mapping, slam, rtabmap, ros2]
   maintainers: [wheatfox <wheatfox17@icloud.com>]
@@ -87,6 +93,7 @@ capabilities:
   - name: robonix/service/map/pointcloud
   - name: robonix/service/map/pose
   - name: robonix/service/map/odom
+  - name: robonix/service/map/lifecycle
   - name: robonix/service/map/save_map
   - name: robonix/service/map/load_map
   - name: robonix/service/map/pose_estimate

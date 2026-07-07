@@ -41,7 +41,11 @@ mkdir -p "$BUILD/data"
 # Without it codegen emits only proto stubs, `map_mcp` is missing, and the
 # bridge dies at import with ModuleNotFoundError → the service never registers.
 if command -v rbnx >/dev/null 2>&1; then
-    FLAGS=(--mcp)
+    # --ros2 also emits rbnx-build/codegen/ros2_idl (canonical ROS 2
+    # interface overlay). The bridge publishes map/msg/MapLifecycle on
+    # robonix/service/map/lifecycle from that overlay; it is colcon-built
+    # after the image exists (below) and sourced by docker/entrypoint.sh.
+    FLAGS=(--mcp --ros2)
     [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
     echo "[build] rbnx codegen ${FLAGS[*]}"
     rbnx codegen -p "$PKG" "${FLAGS[@]}"
@@ -78,6 +82,28 @@ case "$TARGET" in
         fi
         echo "[build] docker build -f $DF -t $IMG"
         docker build "${DOCKER_BUILD_FLAGS[@]}" -f "$DF" -t "$IMG" docker/
+
+        # colcon-build the ros2_idl overlay (map interface package for the
+        # lifecycle broadcast) inside the image we just built, so the
+        # install tree lands on the host bind mount at the SAME path the
+        # runtime container sees (/mapping/rbnx-build/...). Skipped when
+        # codegen was skipped (no rbnx on PATH) — the bridge then runs
+        # with the lifecycle broadcast disabled.
+        IDL="$PKG/rbnx-build/codegen/ros2_idl"
+        if [[ -d "$IDL/src/map" ]]; then
+            echo "[build] colcon build ros2_idl (map interface pkg) in $IMG"
+            # --user: build/ install/ land on the HOST bind mount — as root
+            # they would survive a later non-root cleanup (RBNX_BUILD_CLEAN,
+            # rbnx clean --cache). HOME=/tmp gives colcon a writable home
+            # for its metadata as that uid.
+            docker run --rm --entrypoint bash --user "$(id -u):$(id -g)" -e HOME=/tmp \
+                -v "$PKG":/mapping "$IMG" -lc \
+                "source /opt/ros/\${ROS_DISTRO:-humble}/setup.bash && \
+                 cd /mapping/rbnx-build/codegen/ros2_idl && \
+                 colcon build --packages-up-to map"
+        else
+            echo "[build] WARNING: ros2_idl/src/map missing — lifecycle broadcast will be disabled"
+        fi
         ;;
 
     jetson-native)

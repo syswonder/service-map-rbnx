@@ -21,6 +21,7 @@ which engine runs — they only bind the `robonix/service/map/*` contracts.
 | `robonix/service/map/pointcloud` | ros2 topic | `sensor_msgs/PointCloud2` | 3D fused cloud |
 | `robonix/service/map/pose` | ros2 topic | `geometry_msgs/PoseWithCovarianceStamped` | SLAM-corrected, map frame; can jump on loop closure |
 | `robonix/service/map/odom` | ros2 topic | `nav_msgs/Odometry` | SLAM-corrected, odom frame; continuous between closures |
+| `robonix/service/map/lifecycle` | ros2 topic | `map/msg/MapLifecycle` | `{map_id, mode, generation}`, latched (transient_local): current map identity for consumers keying state by map (scene). Re-published on init / load / reset / mode switch; `generation` bumps whenever the map origin may have changed (mapping-mode session start, reset) and is persisted per named map, so a localization round-trip keeps the same value. Bridge-owned + algo-independent. |
 | `robonix/service/map/save_map` | grpc + mcp | `map_id, note → ok, database_path` | snapshot the live map under a stable id |
 | `robonix/service/map/load_map` | grpc + mcp | `map_id, mode, [x,y,theta] → ok` | switch onto a saved map (localization / mapping) |
 | `robonix/service/map/pose_estimate` | grpc + mcp | `x, y, theta → ok` | seed a pose so localization re-converges |

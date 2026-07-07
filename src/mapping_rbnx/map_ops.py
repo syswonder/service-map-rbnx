@@ -26,6 +26,8 @@ from typing import Optional
 
 import logging
 
+from mapping_rbnx import lifecycle
+
 log = logging.getLogger("mapping_rbnx.map_ops")
 
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
@@ -189,6 +191,9 @@ def load_map_impl(map_id: str, mode: str = "localization",
             ps = pose_estimate_impl(x, y, theta)
             seeded = f"; {ps['detail']}"
         set_current_mode(mode)
+        # Broadcast the new identity: a localization load keeps the saved
+        # map's frame epoch; a mapping load re-derives it (see lifecycle.py).
+        lifecycle.set_state(map_id, mode, bump=(mode == "mapping"))
         return {"ok": True, "detail": f"loaded {map_id} in {mode} mode{seeded}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
@@ -288,6 +293,8 @@ def switch_mode_impl(mode: str) -> dict:
             return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
                                            "(fall back to restart with config map_mode)"}
         set_current_mode(mode)
+        # Mode flip only — the live frame does not move, so no generation bump.
+        lifecycle.set_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode"}
     except Exception as e:  # noqa: BLE001
         log.exception("switch_mode failed")
@@ -314,6 +321,9 @@ def reset_map_impl() -> dict:
         if not ok:
             return {"ok": False, "detail": f"{res} — rtabmap /reset unavailable "
                                            "(fall back to restart with config)"}
+        # Same map_id, new origin: bump the frame epoch so consumers know
+        # their stored map-frame coordinates just went stale.
+        lifecycle.mark_reset()
         return {"ok": True, "detail": "map cleared — rebuilding from current pose "
                                       "(origin reset; new frame won't match the old map)"}
     except Exception as e:  # noqa: BLE001

@@ -70,6 +70,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
     GetPose_Request as McpGetPoseReq,
     GetPose_Response as McpGetPoseResp,
 )
+from mapping_rbnx import lifecycle  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
@@ -559,12 +560,31 @@ def init(cfg: dict):
     # Declare outputs (after resolved.yaml so launch can start in parallel).
     _declare_outputs(mapping, algo, resolved)
 
+    # Map identity / lifecycle broadcast (robonix/service/map/lifecycle).
+    # Bridge-owned, algo-independent — the bridge itself publishes it
+    # (latched) from its rclpy node, so it is NOT part of the per-algo
+    # _ALGO_TOPIC_BINDINGS engine surface. Bump rules live in lifecycle.py:
+    # a mapping-mode session re-derives the map origin, so it opens a new
+    # (map_id, generation) epoch; a localization load keeps the saved one.
+    lifecycle.set_state(persist.get("map_id", ""), active_mode,
+                        bump=(active_mode == "mapping"))
+    try:
+        mapping.declare_ros2_topic("robonix/service/map/lifecycle",
+                                   lifecycle.LIFECYCLE_TOPIC,
+                                   qos="transient_local")
+        log.info("declared robonix/service/map/lifecycle → ROS2 topic %s",
+                 lifecycle.LIFECYCLE_TOPIC)
+    except Exception as e:  # noqa: BLE001
+        log.warning("declare lifecycle failed: %s", e)
+
     # Map web UI (live preview + save/load/pose buttons). On by default at
     # port 8091; override via config `webui_port` (set 0 / "" to disable).
     # Set the env here rather than relying on an external export that gets
     # lost across reboots, so the UI comes up on every boot. Started here so
     # the SLAM topics it previews exist when an operator opens the page.
-    # Seed the runtime mode tracker (get_mode) with the startup map_mode.
+    # Seed the runtime mode tracker (get_mode) with the same startup mode
+    # the lifecycle broadcast above carries — one `active_mode` source so
+    # the two views of "current mode" cannot drift apart under a later edit.
     map_ops.set_current_mode(active_mode)
     _webui_port = str(cfg.get("webui_port", 8091)).strip()
     if _webui_port and _webui_port != "0":

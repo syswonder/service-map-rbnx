@@ -31,6 +31,8 @@ from typing import Optional
 
 import logging
 
+from mapping_rbnx import lifecycle
+
 log = logging.getLogger("mapping_rbnx.map_ops")
 
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
@@ -519,6 +521,10 @@ def load_map_impl(map_id: str, mode: str = "localization",
             ps = pose_estimate_impl(x, y, theta)
             seeded = f"; {ps['detail']}"
         note = "" if requested_mode == "localization" else f"; requested {requested_mode} coerced to localization"
+        # Broadcast the new identity. Load always lands in localization
+        # (coerced above), which keeps the saved map's frame epoch — no
+        # generation bump (see lifecycle.py).
+        lifecycle.set_state(map_id, mode, bump=(mode == "mapping"))
         return {"ok": True,
                 "runtime_db_path": runtime_db,
                 "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}; "
@@ -622,6 +628,8 @@ def switch_mode_impl(mode: str) -> dict:
             return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
                                            "(fall back to restart with config map_mode)"}
         set_current_mode(mode)
+        # Mode flip only — the live frame does not move, so no generation bump.
+        lifecycle.set_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode"}
     except Exception as e:  # noqa: BLE001
         log.exception("switch_mode failed")
@@ -652,6 +660,10 @@ def reset_map_impl() -> dict:
         if not mode_ok:
             return {"ok": False, "detail": f"map reset, but failed to switch back to mapping mode: {mode_detail}"}
         set_current_mode("mapping")
+        # Same map_id, new origin: bump the frame epoch so consumers know
+        # their stored map-frame coordinates just went stale. Reset resumes
+        # in mapping mode — broadcast that too.
+        lifecycle.mark_reset(mode="mapping")
         return {"ok": True, "detail": "map cleared — rebuilding from current pose "
                                       "(origin reset; new frame won't match the old map); switched to mapping mode"}
     except Exception as e:  # noqa: BLE001

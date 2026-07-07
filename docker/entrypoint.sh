@@ -18,6 +18,16 @@ if [[ -f /mapping/rbnx-build/codegen/ros2_idl/install/setup.bash ]]; then
     source /mapping/rbnx-build/codegen/ros2_idl/install/setup.bash
 fi
 
+# Robonix ros2_idl overlay (map interface package — the bridge's
+# lifecycle broadcast publishes map/msg/MapLifecycle). Built by
+# scripts/build.sh onto the bind-mounted rbnx-build/; when absent the
+# bridge logs loudly and runs with the broadcast disabled.
+ROS2_IDL_SETUP=/mapping/rbnx-build/codegen/ros2_idl/install/setup.bash
+if [ -f "$ROS2_IDL_SETUP" ]; then
+    # shellcheck disable=SC1090
+    source "$ROS2_IDL_SETUP"
+fi
+
 configure_zenoh_session() {
     if [ "${RMW_IMPLEMENTATION:-}" != "rmw_zenoh_cpp" ] || [ -z "${ROBONIX_ZENOH_ROUTER:-}" ]; then
         return 0

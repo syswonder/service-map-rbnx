@@ -81,6 +81,8 @@ start: bash scripts/start.sh
 # them, so manifest claims and runtime behaviour drifted apart. The
 # moment any of those gRPC services is implemented, add it back AND
 # wire the DeclareInterface call in atlas_bridge.
+stop: docker rm -f robonix_mapping
+
 capabilities:
   - name: robonix/service/map/driver
   - name: robonix/service/map/occupancy_grid

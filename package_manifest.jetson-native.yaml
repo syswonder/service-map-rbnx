@@ -25,6 +25,8 @@ package:
 build: RBNX_BUILD_TARGET=jetson-native bash scripts/build.sh
 start: ROBONIX_MAPPING_FORCE=native bash scripts/start.sh
 
+stop: docker rm -f robonix_mapping
+
 capabilities:
   - name: robonix/service/map/driver
   - name: robonix/service/map/occupancy_grid

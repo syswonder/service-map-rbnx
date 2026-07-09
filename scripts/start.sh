@@ -73,6 +73,12 @@ fi
 declare -a EXTRA_MOUNTS=()
 # NOTE: RBNX_CONFIG_FILE intentionally NOT mounted — config arrives via
 # Driver(CMD_INIT, config_json) over gRPC, never a file.
+# If set, keep saved maps in an explicit runtime directory instead of the
+# provider cache checkout. CI uses this to keep runs isolated.
+if [[ -n "${MAPPING_MAPS_DIR:-}" ]]; then
+    mkdir -p "$MAPPING_MAPS_DIR"
+    EXTRA_MOUNTS+=(-v "${MAPPING_MAPS_DIR}:${MAPPING_MAPS_DIR}")
+fi
 
 # X11 for rtabmap_viz inside the container (auto-detect DISPLAY).
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -100,6 +106,7 @@ exec docker run --rm \
     "${ZENOH_ARGS[@]}" \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
     -e MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-true}" \
+    -e MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-/mapping/maps}" \
     "${X11_ARGS[@]}" \
     -v "$(pwd)":/mapping \
     -v "$(rbnx path robonix-api)":/robonix-api:ro \

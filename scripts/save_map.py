@@ -97,27 +97,32 @@ def cloud_to_xyz(m):
     return np.stack([x, y, z], axis=1)
 
 
-def collect(occ_topics, cloud_topics, timeout_s):
+def collect(occ_topics, cloud_topics, timeout_s, settle_s):
     rclpy.init()
     node = rclpy.create_node("map_snapshotter")
     latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                          reliability=ReliabilityPolicy.RELIABLE)
     got = {"cloud": None, "grid": None}
+    first_complete_at = None
+
+    def on_grid(m):
+        got["grid"] = m
+
+    def on_cloud(m):
+        got["cloud"] = m
+
     for t in occ_topics:
-        node.create_subscription(
-            OccupancyGrid, t,
-            lambda m: got.__setitem__("grid", m) if got["grid"] is None else None,
-            latched)
+        node.create_subscription(OccupancyGrid, t, on_grid, latched)
     for t in cloud_topics:
-        node.create_subscription(
-            PointCloud2, t,
-            lambda m: got.__setitem__("cloud", m) if got["cloud"] is None else None,
-            latched)
+        node.create_subscription(PointCloud2, t, on_cloud, latched)
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         rclpy.spin_once(node, timeout_sec=0.1)
         if got["cloud"] is not None and got["grid"] is not None:
-            break
+            if first_complete_at is None:
+                first_complete_at = time.time()
+            if time.time() - first_complete_at >= settle_s:
+                break
     node.destroy_node()
     try:
         rclpy.shutdown()
@@ -138,6 +143,8 @@ def main():
                     help="override occupancy topic(s) (repeatable)")
     ap.add_argument("--cloud-topic", action="append",
                     help="override cloud topic(s) (repeatable)")
+    ap.add_argument("--settle", type=float, default=1.2,
+                    help="after the first complete snapshot, keep spinning this long so a fresh /map publish can replace the latched old sample")
     args = ap.parse_args()
 
     if not args.out_dir and not args.prefix:
@@ -161,7 +168,7 @@ def main():
 
     occ_topics = args.occ_topic or OCC_TOPICS
     cloud_topics = args.cloud_topic or CLOUD_TOPICS
-    got = collect(occ_topics, cloud_topics, args.timeout)
+    got = collect(occ_topics, cloud_topics, args.timeout, args.settle)
 
     rc = 0
     cloud_n, grid_info = 0, None
@@ -174,9 +181,9 @@ def main():
             print(f"[save_map] wrote {pcd_path} ({cloud_n} pts, "
                   f"frame={got['cloud'].header.frame_id})")
         else:
-            print("[save_map] cloud empty"); rc = 1
+            print("[save_map] cloud empty; continuing with occupancy preview only")
     else:
-        print(f"[save_map] no cloud on {cloud_topics}"); rc = 1
+        print(f"[save_map] no cloud on {cloud_topics}; continuing with occupancy preview only")
 
     if got["grid"] is not None:
         write_grid(pgm_path, yaml_path, png_path, got["grid"])
@@ -193,7 +200,7 @@ def main():
         with open(meta_path, "w") as f:
             f.write(f"map_id: {map_id}\n")
             f.write(f"saved_at: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
-            f.write(f"database: {'rtabmap.db' if os.path.isfile(db) else 'none'}\n")
+            f.write(f"spatial_artifact: {'rtabmap.db' if os.path.isfile(db) else 'none'}\n")
             f.write(f"cloud_points: {cloud_n}\n")
             if grid_info is not None:
                 f.write(f"frame_id: {got['grid'].header.frame_id}\n")

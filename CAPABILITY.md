@@ -21,7 +21,8 @@ which engine runs — they only bind the `robonix/service/map/*` contracts.
 | `robonix/service/map/pointcloud` | ros2 topic | `sensor_msgs/PointCloud2` | 3D fused cloud |
 | `robonix/service/map/pose` | ros2 topic | `geometry_msgs/PoseWithCovarianceStamped` | SLAM-corrected, map frame; can jump on loop closure |
 | `robonix/service/map/odom` | ros2 topic | `nav_msgs/Odometry` | SLAM-corrected, odom frame; continuous between closures |
-| `robonix/service/map/save_map` | grpc + mcp | `map_id, note → ok, database_path` | snapshot the live map under a stable id |
+| `robonix/service/map/save_map` | grpc + mcp | `map_id, note → ok, map_id, detail` | snapshot the live map under a stable id |
+| `robonix/service/map/list_maps` | grpc + mcp | `→ ok, detail, maps_json` | list saved map metadata by map id; artifacts remain opaque |
 | `robonix/service/map/load_map` | grpc + mcp | `map_id, mode, [x,y,theta] → ok` | switch onto a saved map (localization / mapping) |
 | `robonix/service/map/pose_estimate` | grpc + mcp | `x, y, theta → ok` | seed a pose so localization re-converges |
 
@@ -102,10 +103,10 @@ LLM). Maps live under `{MAPPING_MAPS_DIR}/<map_id>/` (rtabmap.db + occupancy
 pgm/png + cloud pcd + meta), one directory per `map_id` — the same id scene
 keys its semantic objects to.
 
-- **save_map** `(map_id, note)` → `(ok, database_path, detail)`. Roam to build
-  coverage, then checkpoint the live map under `map_id`. The rtabmap db is
-  written live; this adds the portable preview artifacts (and copies the db in
-  if the live session was ephemeral). Non-destructive — mapping continues.
+- **save_map** `(map_id, note)` → `(ok, map_id, detail)`. Roam to build
+  coverage, then checkpoint the live spatial artifact under `map_id`. The
+  provider may use RTAB-Map internally, but callers treat the artifact as opaque.
+  Non-destructive — mapping continues.
 - **load_map** `(map_id, mode, [x,y,theta])` → `(ok, detail)`. Switch onto a
   saved map. `mode=localization` relocalizes against it (stable map frame
   across runs); `mode=mapping` resumes extending it. Implementation tries
@@ -133,7 +134,7 @@ maps/lab_3f/
 ```
 
 - **`map_mode: mapping`** builds/extends the map. The db is written live at
-  `database_path`; on shutdown the previewable artifacts (pgm/png/pcd/meta)
+  runtime database path; on shutdown the previewable artifacts (pgm/png/pcd/meta)
   are exported next to it.
 - **`map_mode: localization`** loads the saved db read-only and re-localizes
   against it, so the **map frame origin is stable across restarts** — the

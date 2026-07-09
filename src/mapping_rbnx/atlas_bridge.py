@@ -23,6 +23,7 @@ for the cost of one extra dependency.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -52,6 +53,8 @@ import robonix_contracts_pb2_grpc as contracts_grpc  # type: ignore  # noqa: E40
 from map_mcp import (  # type: ignore  # noqa: E402
     SaveMap_Request as McpSaveMapReq,
     SaveMap_Response as McpSaveMapResp,
+    ListMaps_Request as McpListMapsReq,
+    ListMaps_Response as McpListMapsResp,
     LoadMap_Request as McpLoadMapReq,
     LoadMap_Response as McpLoadMapResp,
     PoseEstimate_Request as McpPoseReq,
@@ -447,9 +450,16 @@ def init(cfg: dict):
     # Remember the active map_id so on_shutdown (and the save_map helper)
     # know where to dump the human-previewable map. Only rtabmap persists
     # today; other algos ignore this.
-    _ACTIVE.update({"algo": algo, "map_id": persist.get("map_id", ""),
-                    "map_dir": os.path.dirname(persist["database_path"])
-                    if persist else ""})
+    active_mode = persist.get("map_mode") or str(cfg.get("map_mode", "mapping"))
+    active_db = persist.get("database_path", "") if persist else ""
+    _ACTIVE.update({
+        "algo": algo,
+        "map_id": persist.get("map_id", ""),
+        "map_dir": os.path.dirname(active_db) if active_db else "",
+        "active_db": active_db,
+        "map_mode": active_mode,
+        "finalized": "false",
+    })
 
     _write_resolved_yaml(algo, resolved)
 
@@ -462,7 +472,7 @@ def init(cfg: dict):
     # lost across reboots, so the UI comes up on every boot. Started here so
     # the SLAM topics it previews exist when an operator opens the page.
     # Seed the runtime mode tracker (get_mode) with the startup map_mode.
-    map_ops.set_current_mode(persist.get("map_mode") or str(cfg.get("map_mode", "mapping")))
+    map_ops.set_current_mode(active_mode)
     _webui_port = str(cfg.get("webui_port", 8091)).strip()
     if _webui_port and _webui_port != "0":
         os.environ["MAPPING_WEBUI_PORT"] = _webui_port
@@ -486,7 +496,18 @@ def shutdown():
     error — the db is the source of truth."""
     map_dir = _ACTIVE.get("map_dir")
     map_id = _ACTIVE.get("map_id")
+    active_db = _active_db()
+    expected_db = os.path.join(map_dir or "", "rtabmap.db") if map_dir else ""
     if not map_dir or not map_id or _ACTIVE.get("algo") != "rtabmap":
+        return Ok()
+    if _ACTIVE.get("map_mode") != "mapping":
+        log.info("skip map snapshot on shutdown: mode=%s", _ACTIVE.get("map_mode"))
+        return Ok()
+    if _ACTIVE.get("finalized") == "true":
+        log.info("skip map snapshot on shutdown: map %s already finalized", map_id)
+        return Ok()
+    if os.path.abspath(active_db or "") != os.path.abspath(expected_db):
+        log.info("skip map snapshot on shutdown: active_db=%s is not saved map db=%s", active_db, expected_db)
         return Ok()
     try:
         _export_map_snapshot(map_dir)
@@ -512,28 +533,122 @@ def _export_map_snapshot(map_dir: str) -> None:
 
 
 # ── Map-management ops: save_map / load_map / pose_estimate ────────────────────
+
+def _save_map_contract_response(out: dict) -> dict:
+    return {
+        "ok": bool(out.get("ok")),
+        "map_id": str(out.get("map_id") or ""),
+        "detail": str(out.get("detail") or ""),
+    }
+
+def _load_map_contract_response(out: dict) -> dict:
+    return {
+        "ok": bool(out.get("ok")),
+        "detail": str(out.get("detail") or ""),
+    }
+
+_PUBLIC_MAP_LIST_KEYS = (
+    "map_id",
+    "has_spatial_artifact",
+    "spatial_ok",
+    "artifact_detail",
+    "artifact_size",
+    "has_preview",
+    "updated",
+    "meta",
+)
+
+
+def _list_maps_contract_response(out: dict) -> dict:
+    if not out.get("ok"):
+        return {
+            "ok": False,
+            "detail": str(out.get("detail") or ""),
+            "maps_json": "[]",
+        }
+    try:
+        rows = json.loads(str(out.get("maps_json") or "[]"))
+        if not isinstance(rows, list):
+            raise ValueError("maps_json is not a list")
+        filtered = []
+        for row in rows:
+            if isinstance(row, dict):
+                filtered.append({k: row[k] for k in _PUBLIC_MAP_LIST_KEYS if k in row})
+        return {
+            "ok": True,
+            "detail": str(out.get("detail") or ""),
+            "maps_json": json.dumps(filtered, ensure_ascii=False),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"invalid maps_json from provider: {exc}",
+            "maps_json": "[]",
+        }
+
 # Exposed as BOTH gRPC (servicer) and MCP (decorated handler), mirroring nav2.
 # Shared impls live in map_ops; these are thin adapters. save_map reads the
 # active session's live db from _ACTIVE so an ephemeral run can still be
 # snapshotted under a name.
 
 def _active_db() -> str:
+    active = _ACTIVE.get("active_db") or ""
+    if active:
+        return active
     md = _ACTIVE.get("map_dir") or ""
     return os.path.join(md, "rtabmap.db") if md else ""
+
+
+def _saved_map_dir(map_id: str) -> str:
+    return os.path.join(MAPS_DIR, _sanitize_map_id(map_id))
+
+
+def _record_save_result(map_id: str, out: dict) -> None:
+    if not out.get("ok"):
+        return
+    saved_db = os.path.abspath(str(out.get("artifact_path") or ""))
+    current_db = os.path.abspath(_active_db() or "")
+    if saved_db and current_db and saved_db == current_db:
+        _ACTIVE.update({
+            "map_id": _sanitize_map_id(map_id),
+            "map_dir": os.path.dirname(saved_db),
+            "active_db": saved_db,
+            "map_mode": "mapping",
+            "finalized": "true",
+        })
+
+
+def _record_load_result(map_id: str, out: dict) -> None:
+    if not out.get("ok"):
+        return
+    runtime_db = str(out.get("runtime_db_path") or "")
+    _ACTIVE.update({
+        "map_id": _sanitize_map_id(map_id),
+        "map_dir": _saved_map_dir(map_id),
+        "active_db": runtime_db,
+        "map_mode": "localization",
+        "finalized": "true",
+    })
 
 
 class _SaveMapServicer(contracts_grpc.RobonixServiceMapSaveMapServicer):
     def SaveMap(self, request, context):
         out = map_ops.save_map_impl(request.map_id, request.note, active_db=_active_db())
-        return map_pb2.SaveMap_Response(**out)
+        _record_save_result(request.map_id, out)
+        return map_pb2.SaveMap_Response(**_save_map_contract_response(out))
 
+
+class _ListMapsServicer(contracts_grpc.RobonixServiceMapListMapsServicer):
+    def ListMaps(self, request, context):
+        return map_pb2.ListMaps_Response(**_list_maps_contract_response(map_ops.list_maps_impl()))
 
 class _LoadMapServicer(contracts_grpc.RobonixServiceMapLoadMapServicer):
     def LoadMap(self, request, context):
         out = map_ops.load_map_impl(request.map_id, request.mode,
                                     request.has_initial_pose,
                                     request.x, request.y, request.theta)
-        return map_pb2.LoadMap_Response(**out)
+        _record_load_result(request.map_id, out)
+        return map_pb2.LoadMap_Response(**_load_map_contract_response(out))
 
 
 class _PoseEstimateServicer(contracts_grpc.RobonixServiceMapPoseEstimateServicer):
@@ -546,6 +661,8 @@ class _PoseEstimateServicer(contracts_grpc.RobonixServiceMapPoseEstimateServicer
 class _SwitchModeServicer(contracts_grpc.RobonixServiceMapSwitchModeServicer):
     def SwitchMode(self, request, context):
         out = map_ops.switch_mode_impl(request.mode)
+        if out.get("ok"):
+            _ACTIVE["map_mode"] = str(request.mode).strip().lower()
         return map_pb2.SwitchMode_Response(**out)
 
 
@@ -557,7 +674,17 @@ def save_map(req: McpSaveMapReq) -> McpSaveMapResp:
     out = map_ops.save_map_impl(req.map_id, req.note, active_db=_active_db())
     if not out["ok"]:
         raise RuntimeError(out["detail"])
-    return McpSaveMapResp(**out)
+    _record_save_result(req.map_id, out)
+    return McpSaveMapResp(**_save_map_contract_response(out))
+
+
+@mapping.mcp("robonix/service/map/list_maps")
+def list_maps(req: McpListMapsReq) -> McpListMapsResp:
+    # Public metadata only; provider artifact paths remain private to mapping.
+    out = map_ops.list_maps_impl()
+    if not out["ok"]:
+        raise RuntimeError(out["detail"])
+    return McpListMapsResp(**_list_maps_contract_response(out))
 
 
 @mapping.mcp("robonix/service/map/load_map")
@@ -570,7 +697,8 @@ def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
                                 req.x, req.y, req.theta)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
-    return McpLoadMapResp(**out)
+    _record_load_result(req.map_id, out)
+    return McpLoadMapResp(**_load_map_contract_response(out))
 
 
 @mapping.mcp("robonix/service/map/pose_estimate")
@@ -593,6 +721,7 @@ def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     out = map_ops.switch_mode_impl(req.mode)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
+    _ACTIVE["map_mode"] = str(req.mode).strip().lower()
     return McpSwitchResp(**out)
 
 
@@ -656,6 +785,7 @@ class _ResetMapServicer(contracts_grpc.RobonixServiceMapResetMapServicer):
 
 
 mapping.attach_grpc_servicer("robonix/service/map/save_map", _SaveMapServicer())
+mapping.attach_grpc_servicer("robonix/service/map/list_maps", _ListMapsServicer())
 mapping.attach_grpc_servicer("robonix/service/map/load_map", _LoadMapServicer())
 mapping.attach_grpc_servicer("robonix/service/map/pose_estimate", _PoseEstimateServicer())
 mapping.attach_grpc_servicer("robonix/service/map/switch_mode", _SwitchModeServicer())

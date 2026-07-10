@@ -71,6 +71,7 @@ case "$ALGO" in
         DATABASE_PATH=$(read_y database_path)
         MAP_MODE=$(read_y map_mode)
         RESET_MAP=$(read_y reset_map)
+        RTABMAP_OVERRIDES_FILE=$(read_y rtabmap_overrides_file)
         MAP_MODE="${MAP_MODE:-mapping}"
         RESET_MAP="${RESET_MAP:-false}"
         echo "[start_engine] rtabmap persistence: db=${DATABASE_PATH:-<ephemeral>} mode=$MAP_MODE reset=$RESET_MAP"
@@ -80,6 +81,8 @@ case "$ALGO" in
         # let the launch file's default ("" → temp db) take over.
         DB_ARG=()
         [ -n "$DATABASE_PATH" ] && DB_ARG=(database_path:="$DATABASE_PATH")
+        OVERRIDES_ARG=()
+        [ -n "$RTABMAP_OVERRIDES_FILE" ] && OVERRIDES_ARG=(rtabmap_overrides_file:="$RTABMAP_OVERRIDES_FILE")
         echo "[start_engine] rtabmap scan2d=$SCAN_TOPIC scan3d=$SCAN_CLOUD_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC imu=$IMU_TOPIC base=$BASE_FRAME odomf=$ODOM_FRAME use_sim_time=$USE_SIM_TIME viz=$ENABLE_VIZ"
         # Run launch in the background so a sidecar can scrape
         # rtabmap_slam's actual --params-file path (the temp file ros2
@@ -100,6 +103,7 @@ case "$ALGO" in
             enable_viz:="$ENABLE_VIZ" \
             map_mode:="$MAP_MODE" \
             reset_map:="$RESET_MAP" \
+            "${OVERRIDES_ARG[@]}" \
             "${DB_ARG[@]}" &
         LAUNCH_PID=$!
         (

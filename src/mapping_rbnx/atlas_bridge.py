@@ -154,6 +154,33 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
     }
 
 
+def _write_rtabmap_overrides(cfg: dict) -> str:
+    """Persist deploy-selected RTAB-Map parameter overrides for the launch.
+
+    The bridge is the only sanctioned configuration ingress.  The launcher
+    receives a file path instead of a JSON blob so parameter names such as
+    ``RGBD/LinearUpdate`` do not need shell escaping.
+    """
+    raw = cfg.get("rtabmap_params")
+    if raw is None:
+        return ""
+    if not isinstance(raw, dict):
+        raise RuntimeError("rtabmap_params must be a mapping of parameter names to scalar values")
+
+    normalized: dict[str, object] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise RuntimeError("rtabmap_params keys must be non-empty strings")
+        if isinstance(value, (dict, list, tuple)) or value is None:
+            raise RuntimeError(f"rtabmap_params[{key!r}] must be a scalar value")
+        normalized[key] = value
+
+    path = Path(RESOLVED_DIR) / "rtabmap_overrides.json"
+    path.write_text(json.dumps(normalized, sort_keys=True), encoding="utf-8")
+    log.info("wrote %d RTAB-Map override(s) → %s", len(normalized), path)
+    return str(path)
+
+
 # ── Per-algo output endpoint map ──────────────────────────────────────────────
 # Each algo publishes its outputs on different topic names; the bridge
 # collapses them onto the SAME contract surface so consumers don't need
@@ -287,14 +314,20 @@ def _enabled_sensors(cfg: dict) -> dict:
 
 
 # ── Atlas helpers (use Capability's wrapped stub) ────────────────────────────
-def _resolve_sensor_endpoint(cap: Service, contract_id: str) -> Optional[str]:
+def _resolve_sensor_endpoint(cap: Service, contract_id: str, provider_id: str = "") -> Optional[str]:
     """ATLAS.find_capability + connect_capability for one ROS2 contract. Returns the topic
     string atlas resolved, or None when no provider is online yet.
     The opened Channel is closed immediately — we just want the
     endpoint string, atlas's bookkeeping for "I'm consuming this"
     is the side benefit."""
-    recs = ATLAS.find_capability(contract_id=contract_id, transport="ros2")
+    recs = ATLAS.find_capability(
+        contract_id=contract_id,
+        transport="ros2",
+        provider_id=provider_id,
+    )
     if not recs:
+        if provider_id:
+            log.warning("sensor provider %s has no %s on atlas", provider_id, contract_id)
         return None
     rec = recs[0]
     try:
@@ -307,6 +340,13 @@ def _resolve_sensor_endpoint(cap: Service, contract_id: str) -> Optional[str]:
     return endpoint or None
 
 
+def _sensor_provider(cfg: dict, sensor_key: str) -> str:
+    providers = cfg.get("sensor_providers") or {}
+    if not isinstance(providers, dict):
+        return ""
+    return str(providers.get(sensor_key) or "").strip()
+
+
 def _resolve_sensors(cap: Service, cfg: dict) -> dict[str, str]:
     """For each enabled sensor, ask atlas for the topic. Empty when
     the primitive isn't online yet (resolved.yaml still useful — the
@@ -316,12 +356,17 @@ def _resolve_sensors(cap: Service, cfg: dict) -> dict[str, str]:
     for cfg_key, contract_id, yaml_key in _SENSOR_CONTRACTS:
         if not enabled.get(cfg_key):
             continue
-        ep = _resolve_sensor_endpoint(cap, contract_id)
+        provider_id = _sensor_provider(cfg, cfg_key)
+        ep = _resolve_sensor_endpoint(cap, contract_id, provider_id=provider_id)
         if ep:
             resolved[yaml_key] = ep
-            log.info("resolved %s → %s = %s", contract_id, yaml_key, ep)
+            if provider_id:
+                log.info("resolved %s from %s → %s = %s", contract_id, provider_id, yaml_key, ep)
+            else:
+                log.info("resolved %s → %s = %s", contract_id, yaml_key, ep)
         else:
-            log.info("sensor %s (%s) not available on atlas yet", cfg_key, contract_id)
+            suffix = f" from provider {provider_id}" if provider_id else ""
+            log.info("sensor %s (%s%s) not available on atlas yet", cfg_key, contract_id, suffix)
     return resolved
 
 
@@ -447,6 +492,13 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     resolved.update(persist)
+    if algo == "rtabmap":
+        try:
+            overrides_path = _write_rtabmap_overrides(cfg)
+        except RuntimeError as e:
+            return Err(str(e))
+        if overrides_path:
+            resolved["rtabmap_overrides_file"] = overrides_path
     # Remember the active map_id so on_shutdown (and the save_map helper)
     # know where to dump the human-previewable map. Only rtabmap persists
     # today; other algos ignore this.

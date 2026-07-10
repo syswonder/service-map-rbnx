@@ -33,6 +33,7 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
     /rtabmap/cloud_map   sensor_msgs/PointCloud2 (3D fused cloud)
     /tf                  map→odom transform
 """
+import json
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
@@ -66,6 +67,7 @@ def generate_launch_description():
         DeclareLaunchArgument("database_path", default_value=""),
         DeclareLaunchArgument("map_mode", default_value="mapping"),
         DeclareLaunchArgument("reset_map", default_value="false"),
+        DeclareLaunchArgument("rtabmap_overrides_file", default_value=""),
         OpaqueFunction(function=_make_nodes),
     ])
 
@@ -85,6 +87,7 @@ def _make_nodes(context, *args, **kwargs):
     database_path = LaunchConfiguration("database_path").perform(context).strip()
     map_mode = LaunchConfiguration("map_mode").perform(context).strip().lower()
     reset_map = LaunchConfiguration("reset_map").perform(context).lower() == "true"
+    overrides_file = LaunchConfiguration("rtabmap_overrides_file").perform(context).strip()
     localization = bool(database_path) and map_mode == "localization"
 
     have_scan = bool(scan_topic) and scan_topic != _NONE
@@ -180,22 +183,36 @@ def _make_nodes(context, *args, **kwargs):
         "Optimizer/Strategy": "1",  # g2o
         "RGBD/NeighborLinkRefining": "true",
         "RGBD/ProximityBySpace": "true",
-        "RGBD/AngularUpdate": "0.05",
-        "RGBD/LinearUpdate": "0.05",
+        # Conservative defaults work for physical robots. Fast simulators may
+        # opt into a denser profile through config.rtabmap_params.
+        "RGBD/AngularUpdate": "0.1",
+        "RGBD/LinearUpdate": "0.1",
         "Vis/MinInliers": "12",
-        # Default DetectionRate is 1Hz — WAY too slow for tiago at
-        # 0.4m/s. Between updates the robot drifts ~40cm uncorrected on
-        # webots wheel odom (which has small but accumulating slip).
-        # 5Hz cuts inter-frame drift to ~8cm, well within ICP capture
-        # range, so scan-matching keeps the map locked.
-        "Rtabmap/DetectionRate": "5.0",
-        # Loosen scan-matching tolerance: with 5Hz frames the relative
-        # motion is small enough that 20cm correspondence is generous,
-        # not noisy. Default 0.1 was tuned for 1Hz.
+        "Rtabmap/DetectionRate": "1.0",
         "Icp/MaxCorrespondenceDistance": "0.2",
         "Icp/MaxTranslation": "0.5",
         "Icp/MaxRotation": "0.78",  # ~45°
     }
+
+    if overrides_file:
+        try:
+            with open(overrides_file, encoding="utf-8") as f:
+                overrides = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read rtabmap_overrides_file={overrides_file!r}: {exc}") from exc
+        if not isinstance(overrides, dict) or any(
+            not isinstance(key, str) or not key or isinstance(value, (dict, list)) or value is None
+            for key, value in overrides.items()
+        ):
+            raise RuntimeError("rtabmap_overrides_file must contain a JSON object of scalar parameters")
+        # The ROS wrapper forwards RTAB-Map's slash-named parameters as
+        # strings. Preserve that established type boundary even though JSON
+        # decoded booleans/numbers have native Python types.
+        rtabmap_params.update({
+            key: str(value).lower() if isinstance(value, bool) else str(value)
+            for key, value in overrides.items()
+        })
+        print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
 
     rtabmap_remappings = [
         # rviz "2D Pose Estimate" → /initialpose: rtabmap defaults to

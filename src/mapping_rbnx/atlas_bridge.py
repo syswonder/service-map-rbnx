@@ -88,6 +88,7 @@ HEARTBEAT_PERIOD_S = 10.0
 # Without map_id the package stays ephemeral — exactly the pre-persistence
 # behaviour (temp db, wiped each boot).
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
+RUNTIME_DB_DIR = os.environ.get("MAPPING_RUNTIME_DB_DIR", "/tmp/robonix-mapping-runtime")
 
 
 def _truthy(s: str) -> bool:
@@ -108,49 +109,57 @@ def _sanitize_map_id(map_id: str) -> str:
 
 
 def _resolve_persistence(cfg: dict) -> dict[str, str]:
-    """Turn the map_id / map_mode / reset_map config into the concrete
-    keys the launch needs: database_path, map_mode, reset_map.
+    """Resolve a private runtime DB, and only read saved maps in localization.
 
-    Binding contract: the operator sets the SAME `map_id` here and in the
-    scene service's config; mapping owns the spatial map (rtabmap db +
-    map frame), scene keys its semantic objects to that id. A stable
-    map frame across restarts requires map_mode=localization against a
-    previously-saved db.
-
-    Returns {} when no map_id is configured (ephemeral mode — keeps the
-    legacy delete-db-on-start behaviour). Raises on an invalid combo so a
-    misconfigured deploy fails loud instead of silently mapping into a
-    throwaway db.
+    ``maps/<map_id>/rtabmap.db`` is an immutable published artifact. RTAB-Map
+    must never use it as its active writer database. A mapping session always
+    receives a fresh runtime DB; ``save_map`` snapshots that DB atomically into
+    a stable map id. Localization first copies the saved artifact to a runtime
+    DB, so even RTAB-Map bookkeeping cannot mutate the saved copy.
     """
     raw_id = cfg.get("map_id")
-    if not raw_id:
-        return {}  # ephemeral — no persistence
-    map_id = _sanitize_map_id(str(raw_id))
+    map_id = _sanitize_map_id(str(raw_id)) if raw_id else ""
     mode = str(cfg.get("map_mode", "mapping")).strip().lower()
     if mode not in _VALID_MODES:
         raise RuntimeError(
             f"map_mode={mode!r} invalid — must be one of {list(_VALID_MODES)}"
         )
     reset = _truthy(cfg.get("reset_map", False))
-    map_dir = os.path.join(MAPS_DIR, map_id)
-    db_path = os.path.join(map_dir, "rtabmap.db")
     if mode == "localization":
-        if not os.path.isfile(db_path):
+        if not map_id:
+            raise RuntimeError("map_mode=localization requires a saved map_id")
+        map_dir = os.path.join(MAPS_DIR, map_id)
+        saved_db = os.path.join(map_dir, "rtabmap.db")
+        if not os.path.isfile(saved_db):
             raise RuntimeError(
-                f"map_mode=localization but no saved map at {db_path!r}. "
-                f"Run a mapping session with map_id={map_id!r} first "
-                f"(map_mode=mapping), or check MAPPING_MAPS_DIR is mounted."
+                f"map_mode=localization but no saved map at {saved_db!r}. "
+                "Save a mapping session first, or check MAPPING_MAPS_DIR."
             )
         if reset:
             raise RuntimeError("reset_map=true is meaningless in localization mode")
-    os.makedirs(map_dir, exist_ok=True)
-    log.info("persistence: map_id=%s mode=%s db=%s reset=%s",
-             map_id, mode, db_path, reset)
+        runtime_db = map_ops._runtime_db_copy(saved_db, map_id)
+        log.info("persistence: localization map_id=%s saved_db=%s runtime_db=%s",
+                 map_id, saved_db, runtime_db)
+        return {
+            "map_id": map_id,
+            "map_mode": "localization",
+            "database_path": runtime_db,
+            "reset_map": "false",
+        }
+
+    # Mapping is always a new mutable session. Keep a supplied map_id out of
+    # the runtime binding: it identifies a saved artifact, not a live session.
+    os.makedirs(RUNTIME_DB_DIR, exist_ok=True)
+    runtime_db = os.path.join(
+        RUNTIME_DB_DIR,
+        f"mapping-{os.getpid()}-{int(time.time() * 1000)}.db",
+    )
+    log.info("persistence: fresh mapping session runtime_db=%s requested_map_id=%s",
+             runtime_db, map_id or "<none>")
     return {
-        "map_id": map_id,
-        "map_mode": mode,
-        "database_path": db_path,
-        "reset_map": "true" if reset else "false",
+        "map_mode": "mapping",
+        "database_path": runtime_db,
+        "reset_map": "true",
     }
 
 

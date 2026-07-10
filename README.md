@@ -43,8 +43,7 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
          sensors: { lidar3d: true, rgbd: true, odom: true, imu: true }
          base_frame: base_link
          use_sim_time: false
-         map_id: lab_3f          # optional; enables persistence
-         map_mode: mapping       # or: localization
+         map_mode: mapping       # fresh runtime session; or localization
    ```
 3. `rbnx build -f robonix_manifest.yaml` then `rbnx boot -f robonix_manifest.yaml`.
 4. Consume the map: subscribe to `robonix/service/map/occupancy_grid` /
@@ -69,22 +68,22 @@ in `scripts/build.sh` — the rest of the package is unchanged.
 
 ## Saving & re-using a map
 
-Set `map_id` to persist. A named map lives under `{MAPPING_MAPS_DIR}/{map_id}/`
+Mapping starts with a fresh runtime database. Call `save_map(map_id)` after
+coverage is complete; the named map lives under `{MAPPING_MAPS_DIR}/{map_id}/`
 (default: the package's `maps/` dir, which survives container restarts):
 
 ```
 maps/lab_3f/rtabmap.db  occupancy.pgm  occupancy.yaml  occupancy.png  cloud.pcd  meta.yaml
 ```
 
-- **Build a map:** `map_mode: mapping`. Drive the robot around; the db is
-  written live, and on shutdown the offline-previewable artifacts
-  (pgm/png/pcd/meta) are exported. Open `occupancy.png` to eyeball it without
-  rtabmap's database viewer.
-- **Re-use a map:** `map_mode: localization`. mapping loads the saved db and
-  re-localizes against it; the **map frame is stable across restarts**, so a
-  `scene` configured with the same `map_id` re-anchors its semantic objects
-  correctly. (`scene`'s object store keys on `map_id` — set it consistently.)
-- **Start fresh:** `map_mode: mapping` + `reset_map: true`.
+- **Build a map:** `map_mode: mapping`. Drive the robot around, then call
+  `save_map(map_id)` to publish an immutable database and previews.
+- **Re-use a map:** set `map_id` plus `map_mode: localization`. Mapping copies
+  the saved db to a private runtime path and re-localizes against it; the
+  **map frame is stable across restarts**, so Scene can load semantic state for
+  the same id.
+- **Start fresh:** `map_mode: mapping` (the default). It never writes an
+  existing saved map.
 
 > Localization-mode persistence only re-anchors correctly because the map
 > frame is loaded from the saved db. Without `map_mode: localization` the

@@ -63,9 +63,8 @@ config:
   map_frame: map
   use_sim_time: true
   # map persistence (optional; rtabmap only — see "Map persistence" below)
-  map_id: lab_3f                      # stable id; bind the SAME id in scene
+  # Mapping is a fresh runtime session; save_map publishes it under an id.
   map_mode: mapping                   # mapping | localization
-  reset_map: false                    # true = start a named map fresh
 ```
 
 ### `sensors:` keys
@@ -108,11 +107,8 @@ keys its semantic objects to.
   provider may use RTAB-Map internally, but callers treat the artifact as opaque.
   Non-destructive — mapping continues.
 - **load_map** `(map_id, mode, [x,y,theta])` → `(ok, detail)`. Switch onto a
-  saved map. `mode=localization` relocalizes against it (stable map frame
-  across runs); `mode=mapping` resumes extending it. Implementation tries
-  rtabmap's runtime services first (`/rtabmap/load_database` +
-  `set_mode_localization`); if a build lacks them, restart the service with
-  `config.map_id`/`map_mode` instead (see persistence below). Pass
+  saved map in localization mode through a private runtime copy, keeping the
+  published artifact immutable and its map frame stable across runs. Pass
   `has_initial_pose` + `x,y,theta` to seed convergence.
 - **pose_estimate** `(x, y, theta)` → `(ok, detail)`. Publish a pose guess
   (map frame) to `/initialpose` so rtabmap's localization re-converges — global
@@ -133,17 +129,16 @@ maps/lab_3f/
   meta.yaml        map_id, saved_at, frame_id, resolution, size, origin
 ```
 
-- **`map_mode: mapping`** builds/extends the map. The db is written live at
-  runtime database path; on shutdown the previewable artifacts (pgm/png/pcd/meta)
-  are exported next to it.
-- **`map_mode: localization`** loads the saved db read-only and re-localizes
-  against it, so the **map frame origin is stable across restarts** — the
-  property `scene`'s per-`map_id` semantic store needs to re-anchor objects.
-- Omit `map_id` → ephemeral (db wiped each boot; legacy behaviour).
+- **`map_mode: mapping`** always builds a fresh private runtime database.
+  Call `save_map(map_id)` to atomically publish an immutable spatial artifact.
+- **`map_mode: localization`** requires `map_id`; mapping copies the saved db
+  to a private runtime DB, then re-localizes against that copy. The saved
+  artifact and its map-frame origin remain unchanged across restarts.
+- Omit `map_id` for normal fresh mapping. Set it only when intentionally
+  booting directly into localization of a previously saved map.
 
-**Binding contract:** set the SAME `map_id` here and in the `scene` service.
-mapping owns the spatial map (db + map frame); scene keys its semantic
-objects to that id.
+**Binding contract:** after `load_map(map_id)`, scene binds its semantic
+objects to the same id. During fresh mapping there is no saved map identity.
 
 ## Deployment targets
 

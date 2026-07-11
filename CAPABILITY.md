@@ -62,10 +62,19 @@ config:
   odom_frame: odom
   map_frame: map
   use_sim_time: true
+  # Optional field-validated hardware tuning. Raw rtabmap_params below may
+  # override individual values from the selected profile.
+  rtabmap_profile: ranger_mini_v3
+  rtabmap_params: {}
   # map persistence (optional; rtabmap only — see "Map persistence" below)
   # Mapping is a fresh runtime session; save_map publishes it under an id.
   map_mode: mapping                   # mapping | localization
 ```
+
+`rtabmap_profile: ranger_mini_v3` restores the lidar-only occupancy source and
+node insertion cadence stored in the known-good v0.1 `315` and `ranger_3f`
+databases. It does not use the Nav2 pointcloud-to-laserscan adapter; Mapping
+continues to consume the original PointCloud2 stream directly.
 
 ### `sensors:` keys
 

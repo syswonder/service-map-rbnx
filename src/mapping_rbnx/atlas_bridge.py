@@ -72,6 +72,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
 )
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
+from mapping_rbnx.profiles import resolve_rtabmap_overrides  # noqa: E402
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -170,23 +171,18 @@ def _write_rtabmap_overrides(cfg: dict) -> str:
     receives a file path instead of a JSON blob so parameter names such as
     ``RGBD/LinearUpdate`` do not need shell escaping.
     """
+    profile_name = str(cfg.get("rtabmap_profile") or "").strip()
     raw = cfg.get("rtabmap_params")
-    if raw is None:
+    if raw is None and not profile_name:
         return ""
-    if not isinstance(raw, dict):
-        raise RuntimeError("rtabmap_params must be a mapping of parameter names to scalar values")
-
-    normalized: dict[str, object] = {}
-    for key, value in raw.items():
-        if not isinstance(key, str) or not key.strip():
-            raise RuntimeError("rtabmap_params keys must be non-empty strings")
-        if isinstance(value, (dict, list, tuple)) or value is None:
-            raise RuntimeError(f"rtabmap_params[{key!r}] must be a scalar value")
-        normalized[key] = value
+    normalized = resolve_rtabmap_overrides(profile_name, raw)
 
     path = Path(RESOLVED_DIR) / "rtabmap_overrides.json"
     path.write_text(json.dumps(normalized, sort_keys=True), encoding="utf-8")
-    log.info("wrote %d RTAB-Map override(s) → %s", len(normalized), path)
+    log.info(
+        "wrote %d RTAB-Map override(s) profile=%s → %s",
+        len(normalized), profile_name or "<none>", path,
+    )
     return str(path)
 
 

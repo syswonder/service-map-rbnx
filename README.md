@@ -43,11 +43,18 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
          sensors: { lidar3d: true, rgbd: true, odom: true, imu: true }
          base_frame: base_link
          use_sim_time: false
+         rtabmap_profile: ranger_mini_v3
          map_mode: mapping       # fresh runtime session; or localization
    ```
 3. `rbnx build -f robonix_manifest.yaml` then `rbnx boot -f robonix_manifest.yaml`.
 4. Consume the map: subscribe to `robonix/service/map/occupancy_grid` /
    `.../pointcloud` / `.../pose` (resolve them via atlas).
+
+For Ranger Mini v3, use the named profile instead of copying six slash-named
+parameters into every deploy. The profile matches the two known-good v0.1 map
+databases: lidar-only occupancy (`Grid/Sensor=0`), 5 Hz detection, 0.05 m/rad
+node thresholds, and retained unlinked nodes. `rtabmap_params` remains an
+explicit per-parameter override and wins over the profile when both are set.
 
 There is no robot-specific code to edit — sensors come from atlas, frames and
 SLAM mode come from config.

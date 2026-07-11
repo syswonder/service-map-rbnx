@@ -73,6 +73,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
+    choose_provider_record,
     resolve_occupancy_sources,
     resolve_rtabmap_overrides,
     select_rtabmap_inputs,
@@ -348,11 +349,11 @@ def _resolve_sensor_endpoint(cap: Service, contract_id: str, provider_id: str = 
         transport="ros2",
         provider_id=provider_id,
     )
-    if not recs:
+    rec = choose_provider_record(recs, provider_id, contract_id)
+    if rec is None:
         if provider_id:
             log.warning("sensor provider %s has no %s on atlas", provider_id, contract_id)
         return None
-    rec = recs[0]
     try:
         ch = mapping.connect_capability(rec, contract_id=contract_id, transport="ros2")
     except Exception as e:  # noqa: BLE001

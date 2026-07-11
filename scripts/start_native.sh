@@ -66,6 +66,13 @@ export MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
 # natively there is no /mapping, so anchor it under the package dir so
 # saved maps survive restarts. Override with MAPPING_MAPS_DIR.
 export MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-$PKG/maps}"
+# Runtime databases can grow by gigabytes during a full-floor scan. Keep them
+# on the package filesystem (the Jetson SSD), never rootfs /tmp, and remove
+# prior ephemeral sessions before starting the single supported map engine.
+export MAPPING_RUNTIME_DB_DIR="${MAPPING_RUNTIME_DB_DIR:-$PKG/rbnx-build/runtime}"
+mkdir -p "$MAPPING_RUNTIME_DB_DIR"
+find "$MAPPING_RUNTIME_DB_DIR" -maxdepth 1 -type f \
+    \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) -delete
 
 PYBIN="${MAPPING_NATIVE_PYTHON:-python3}"
 

@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,6 +17,22 @@ def load_profiles():
 
 
 class RtabmapProfileTest(unittest.TestCase):
+    def test_single_provider_can_be_selected_implicitly(self):
+        profiles = load_profiles()
+        record = SimpleNamespace(provider_id="mid360_lidar")
+        self.assertIs(
+            profiles.choose_provider_record([record], "", "lidar3d"), record
+        )
+
+    def test_multiple_providers_require_explicit_id(self):
+        profiles = load_profiles()
+        records = [
+            SimpleNamespace(provider_id="front_lidar"),
+            SimpleNamespace(provider_id="rear_lidar"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "multiple Atlas providers"):
+            profiles.choose_provider_record(records, "", "lidar3d")
+
     def test_ranger_profile_matches_v01_database_parameters(self):
         profiles = load_profiles()
         values = profiles.resolve_rtabmap_overrides("ranger_mini_v3", None)

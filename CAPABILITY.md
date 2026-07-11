@@ -57,6 +57,11 @@ config:
   # what the robot actually has — see the sensor table below. Required;
   # the package refuses to guess (an empty/missing `sensors:` errors out).
   sensors: { lidar2d: true, odom: true, rgb: true, depth: true }
+  sensor_providers:
+    lidar2d: front_lidar
+    rgb: front_camera
+    depth: front_camera
+    odom: chassis
   # Which discovered streams RTAB-Map actually subscribes to. Ranger's known
   # good databases contain scans only, so do not add RGB-D synchronization.
   rtabmap_inputs: [lidar, odom]
@@ -109,6 +114,10 @@ sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }  # Mid
 
 `sensors:` is required and must list at least one sensor — the package
 refuses to guess.
+
+`sensor_providers` pins each enabled sensor key to an Atlas provider ID. It is
+optional only while exactly one provider exposes that contract; multiple
+candidates without a pin are rejected instead of selecting the first result.
 
 `occupancy_sources` is a separate policy. It accepts `lidar`, `depth`, or both,
 and fails initialization if Atlas did not resolve a requested source. Omitting

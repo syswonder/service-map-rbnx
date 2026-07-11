@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 # These values were read back from both known-good v0.1 databases (`315` and
 # `ranger_3f`) with rtabmap-info. They are not generic RTAB-Map defaults.
@@ -14,6 +16,21 @@ RTABMAP_PROFILES: dict[str, dict[str, object]] = {
         "Mem/NotLinkedNodesKept": True,
     },
 }
+
+
+def choose_provider_record(
+    records: list[Any], provider_id: str, contract_id: str
+) -> Any | None:
+    """Select one Atlas record without depending on response ordering."""
+    if not records:
+        return None
+    if not provider_id and len(records) > 1:
+        candidates = sorted({str(record.provider_id) for record in records})
+        raise RuntimeError(
+            f"multiple Atlas providers expose {contract_id}: {candidates}; "
+            "set config.sensor_providers for this sensor"
+        )
+    return records[0]
 
 
 def resolve_occupancy_sources(

@@ -77,11 +77,23 @@ class RtabmapProfileTest(unittest.TestCase):
             "rgb_topic": "/camera/color",
             "depth_topic": "/camera/depth",
             "odom_topic": "/odom",
+            "imu_topic": "/imu",
         }
         selected = profiles.select_rtabmap_inputs(["lidar", "odom"], resolved)
         self.assertEqual(
             selected,
             {"lidar_topic": "/scanner/cloud", "odom_topic": "/odom"},
+        )
+
+    def test_explicit_imu_input_is_preserved(self):
+        profiles = load_profiles()
+        selected = profiles.select_rtabmap_inputs(
+            ["lidar", "imu"],
+            {"lidar_topic": "/scanner/cloud", "imu_topic": "/livox/imu"},
+        )
+        self.assertEqual(
+            selected,
+            {"lidar_topic": "/scanner/cloud", "imu_topic": "/livox/imu"},
         )
 
     def test_requested_rtabmap_input_must_resolve(self):

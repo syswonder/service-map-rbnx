@@ -78,10 +78,10 @@ def select_rtabmap_inputs(
         return dict(resolved)
     if not isinstance(raw_inputs, (list, tuple)) or not raw_inputs:
         raise RuntimeError(
-            "rtabmap_inputs must be a non-empty list containing lidar, rgbd and/or odom"
+            "rtabmap_inputs must be a non-empty list containing lidar, rgbd, imu and/or odom"
         )
     inputs = {str(value).strip().lower() for value in raw_inputs}
-    supported = {"lidar", "rgbd", "odom"}
+    supported = {"lidar", "rgbd", "imu", "odom"}
     unknown = inputs - supported
     if unknown:
         raise RuntimeError(
@@ -104,6 +104,10 @@ def select_rtabmap_inputs(
         if not resolved.get("odom_topic"):
             raise RuntimeError("RTAB-Map odom input was requested but not resolved from Atlas")
         selected["odom_topic"] = resolved["odom_topic"]
+    if "imu" in inputs:
+        if not resolved.get("imu_topic"):
+            raise RuntimeError("RTAB-Map imu input was requested but not resolved from Atlas")
+        selected["imu_topic"] = resolved["imu_topic"]
     return selected
 
 

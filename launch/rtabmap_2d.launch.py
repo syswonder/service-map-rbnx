@@ -53,6 +53,8 @@ def generate_launch_description():
         DeclareLaunchArgument("rgb_topic", default_value=_NONE),
         DeclareLaunchArgument("rgb_info_topic", default_value=_NONE),
         DeclareLaunchArgument("depth_topic", default_value=_NONE),
+        DeclareLaunchArgument("imu_topic", default_value=_NONE),
+        DeclareLaunchArgument("deskew_lidar", default_value="false"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="false"),
@@ -80,6 +82,8 @@ def _make_nodes(context, *args, **kwargs):
     rgb_topic = LaunchConfiguration("rgb_topic").perform(context)
     rgb_info_topic = LaunchConfiguration("rgb_info_topic").perform(context)
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
+    imu_topic = LaunchConfiguration("imu_topic").perform(context)
+    deskew_lidar = LaunchConfiguration("deskew_lidar").perform(context).lower() == "true"
     base_frame = LaunchConfiguration("base_frame").perform(context)
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
@@ -96,6 +100,10 @@ def _make_nodes(context, *args, **kwargs):
     have_depth = bool(depth_topic) and depth_topic != _NONE
     have_rgbd = have_rgb and have_depth
     have_odom = bool(odom_topic) and odom_topic != _NONE
+    have_imu = bool(imu_topic) and imu_topic != _NONE
+
+    if deskew_lidar and not have_scan_cloud:
+        raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
 
     if not (have_scan or have_scan_cloud or have_rgbd):
         # rtabmap with neither lidar nor RGBD has nothing to map. Bail
@@ -135,6 +143,7 @@ def _make_nodes(context, *args, **kwargs):
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
         "subscribe_odom_info": False,
+        "odom_sensor_sync": have_odom,
         "approx_sync": True,
         "queue_size": 30,
         # webots emits image stamps slightly ahead of the dynamic TF
@@ -222,10 +231,15 @@ def _make_nodes(context, *args, **kwargs):
     ]
     if have_scan:
         rtabmap_remappings.append(("scan", scan_topic))
+    deskewed_cloud_topic = "/rtabmap/scan_cloud_deskewed"
     if have_scan_cloud:
-        rtabmap_remappings.append(("scan_cloud", scan_cloud_topic))
+        rtabmap_remappings.append((
+            "scan_cloud", deskewed_cloud_topic if deskew_lidar and have_odom else scan_cloud_topic
+        ))
     if have_odom:
         rtabmap_remappings.append(("odom", odom_topic))
+    elif have_scan or have_scan_cloud:
+        rtabmap_remappings.append(("odom", "/rtabmap/odom"))
     if have_rgbd:
         rtabmap_remappings += [
             ("rgb/image", rgb_topic),
@@ -262,32 +276,67 @@ def _make_nodes(context, *args, **kwargs):
         remappings=rtabmap_remappings,
     )
 
-    nodes = [rtabmap_node]
+    nodes = []
+
+    # A 100 ms Mid360 frame is visibly distorted while a skid-steer robot
+    # rotates. With external odometry, compensate every point against the
+    # odom TF before SLAM consumes the cloud. This requires a timestamp field
+    # (Livox xfer_format=0); it is opt-in so generic PointXYZI providers fail
+    # neither silently nor unexpectedly.
+    if deskew_lidar and have_odom:
+        nodes.append(Node(
+            package="rtabmap_util",
+            executable="lidar_deskewing",
+            name="mapping_lidar_deskewing",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "fixed_frame_id": odom_frame,
+                "wait_for_transform": 0.2,
+                "slerp": True,
+            }],
+            remappings=[
+                ("input_cloud", scan_cloud_topic),
+                (f"{scan_cloud_topic}/deskewed", deskewed_cloud_topic),
+            ],
+        ))
+
+    nodes.append(rtabmap_node)
 
     # When the deploy didn't supply external odom, run rtabmap's own
     # ICP-odometry node off whichever lidar source we have. icp_odometry
     # consumes either /scan (LaserScan) or /scan_cloud (PointCloud2);
     # we pick based on what's wired up.
     if not have_odom and (have_scan or have_scan_cloud):
-        icp_odom_remappings = []
+        icp_odom_remappings = [("odom", "/rtabmap/odom")]
         if have_scan_cloud:
             icp_odom_remappings.append(("scan_cloud", scan_cloud_topic))
         elif have_scan:
             icp_odom_remappings.append(("scan", scan_topic))
+        icp_odom_params = {
+            "use_sim_time": use_sim_time,
+            "frame_id": base_frame,
+            "odom_frame_id": odom_frame,
+            "publish_tf": True,
+            "approx_sync": True,
+            "wait_for_transform": 1.5,
+            "deskewing": deskew_lidar,
+            "deskewing_slerp": True,
+            "Reg/Force3DoF": "true",
+            "Icp/VoxelSize": "0.1",
+            "Icp/PointToPlane": "true",
+            "Icp/MaxCorrespondenceDistance": "1.0",
+            "Odom/ScanKeyFrameThr": "0.4",
+        }
+        if have_imu:
+            icp_odom_remappings.append(("imu", imu_topic))
+            icp_odom_params["wait_imu_to_init"] = True
         icp_odom = Node(
             package="rtabmap_odom",
             executable="icp_odometry",
             name="icp_odometry",
             output="screen",
-            parameters=[{
-                "use_sim_time": use_sim_time,
-                "frame_id": base_frame,
-                "odom_frame_id": odom_frame,
-                "publish_tf": True,
-                "approx_sync": True,
-                "wait_for_transform": 1.5,
-                "deskewing": False,
-            }],
+            parameters=[icp_odom_params],
             remappings=icp_odom_remappings,
         )
         nodes.append(icp_odom)

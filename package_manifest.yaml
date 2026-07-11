@@ -65,9 +65,11 @@ start: bash scripts/start.sh
 #   sensors: { lidar2d|lidar3d|rgb|depth|imu|odom: bool }  what the robot has
 #   sensor_providers: {sensor_key: provider_id}  required when a contract has
 #                                                 more than one provider
-#   rtabmap_inputs: [lidar|rgbd|odom]  which resolved streams feed RTAB-Map
+#   rtabmap_inputs: [lidar|rgbd|imu|odom]  which resolved streams feed RTAB-Map
 #   occupancy_sources: [lidar|depth]  explicit 2D occupancy policy (optional;
 #                                      legacy deploys retain automatic choice)
+#   deskew_lidar: true requires a PointCloud2 per-point timestamp field. With
+#                        external odom it uses odom TF; otherwise ICP deskews.
 # Frames / time (optional; defaults = webots tiago):
 #   base_frame, odom_frame, map_frame, use_sim_time
 # Map persistence (optional; rtabmap only):

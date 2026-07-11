@@ -40,9 +40,10 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
        # manifest: package_manifest.jetson-native.yaml   # x86+docker is default
        config:
          algo: rtabmap
-        sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }
-        rtabmap_inputs: [lidar, odom]
-        occupancy_sources: [lidar]
+         sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }
+         rtabmap_inputs: [lidar, odom]
+         occupancy_sources: [lidar]
+         deskew_lidar: true    # requires per-point timestamps (MID-360 format 0)
          base_frame: base_link
          use_sim_time: false
          rtabmap_profile: ranger_mini_v3
@@ -58,8 +59,10 @@ they match the two known-good v0.1 map databases: lidar-only occupancy
 (`Grid/Sensor=0`), 5 Hz detection, 0.05 m/rad node thresholds, and retained
 unlinked nodes. `rtabmap_params` remains an explicit per-parameter override.
 
-There is no robot-specific code to edit — sensors come from atlas, frames and
-SLAM mode come from config.
+With external odometry, `deskew_lidar` compensates each PointCloud2 point in
+the odom frame before SLAM. Without external odometry, it enables ICP's
+constant-velocity deskewing; include `imu` in `rtabmap_inputs` to initialize
+the ICP orientation from the selected IMU provider.
 
 ## Deployment targets
 

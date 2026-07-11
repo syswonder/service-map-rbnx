@@ -124,9 +124,13 @@ and fails initialization if Atlas did not resolve a requested source. Omitting
 it preserves the legacy automatic choice for existing deployments.
 
 `rtabmap_inputs` controls subscriptions independently of discovery. It accepts
-`lidar`, `rgbd`, and `odom`; a requested input must resolve through Atlas. The
+`lidar`, `rgbd`, `imu`, and `odom`; a requested input must resolve through Atlas. The
 Ranger profile uses `[lidar, odom]`, matching the scan-only v0.1 databases and
 avoiding RGB-D approximate-sync latency during rotation.
+
+`deskew_lidar: true` requires a per-point `t`, `time`, `stamps`, or `timestamp`
+field. External odom drives TF deskewing; without external odom the ICP node
+uses its motion estimate, and an explicitly selected IMU initializes attitude.
 
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 

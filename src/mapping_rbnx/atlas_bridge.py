@@ -418,13 +418,19 @@ def _retry_resolve(cap: Service, cfg: dict, deadline_s: float = 30.0,
     return resolved
 
 
-def _declare_outputs(cap: Service, algo: str) -> None:
+def _declare_outputs(cap: Service, algo: str, resolved: dict[str, str]) -> None:
     """DeclareInterface(transport=ROS2) for every exported contract.
     All algos publish the same contract surface — only the topic differs."""
     bindings = _ALGO_TOPIC_BINDINGS[algo]
     declared = 0
     for contract_id in _EXPORTED_CONTRACTS:
         topic = bindings[contract_id]
+        if contract_id == "robonix/service/map/odom" and resolved.get("odom_topic"):
+            # With external odometry RTAB-Map consumes, but does not republish,
+            # that stream. Export the real continuous source instead of a
+            # nonexistent /rtabmap/odom topic. Internal ICP explicitly publishes
+            # /rtabmap/odom and therefore keeps the static binding above.
+            topic = resolved["odom_topic"]
         try:
             mapping.declare_ros2_topic(contract_id, topic, qos="reliable")
             declared += 1
@@ -506,9 +512,13 @@ def init(cfg: dict):
     # TF / time-source overrides from cfg. Real-robot bring-ups without
     # a chassis driver pass base_frame=livox_frame so rtabmap doesn't
     # block waiting for base_link. use_sim_time=false on real hardware.
-    for key in ("base_frame", "odom_frame", "map_frame", "use_sim_time"):
+    for key in ("base_frame", "odom_frame", "map_frame", "use_sim_time", "deskew_lidar"):
         if key in cfg:
-            resolved[key] = str(cfg[key]).lower() if key == "use_sim_time" else str(cfg[key])
+            resolved[key] = (
+                str(cfg[key]).lower()
+                if key in {"use_sim_time", "deskew_lidar"}
+                else str(cfg[key])
+            )
 
     # Map persistence (map_id / mapping vs localization). Adds map_mode +
     # database_path + reset_map to resolved.yaml; start_engine.sh / the
@@ -542,7 +552,7 @@ def init(cfg: dict):
     _write_resolved_yaml(algo, resolved)
 
     # Declare outputs (after resolved.yaml so launch can start in parallel).
-    _declare_outputs(mapping, algo)
+    _declare_outputs(mapping, algo, resolved)
 
     # Map web UI (live preview + save/load/pose buttons). On by default at
     # port 8091; override via config `webui_port` (set 0 / "" to disable).

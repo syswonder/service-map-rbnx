@@ -37,6 +37,11 @@ if ! ros2 pkg prefix rtabmap_slam >/dev/null 2>&1; then
     echo "[mapping-native]      (or ROBONIX_MAPPING_FORCE=docker)" >&2
     exit 2
 fi
+if ! ros2 pkg prefix imu_filter_madgwick >/dev/null 2>&1; then
+    echo "[mapping-native] ERR: imu_filter_madgwick not found on the host ROS install." >&2
+    echo "[mapping-native]      sudo apt install ros-humble-imu-filter-madgwick" >&2
+    exit 2
+fi
 
 # ── PYTHONPATH: pkg src + codegen stubs + robonix-api ──────────────────
 CODEGEN="$PKG/rbnx-build/codegen"

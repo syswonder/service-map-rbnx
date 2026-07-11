@@ -131,6 +131,8 @@ avoiding RGB-D approximate-sync latency during rotation.
 `deskew_lidar: true` requires a per-point `t`, `time`, `stamps`, or `timestamp`
 field. External odom drives TF deskewing; without external odom the ICP node
 uses its motion estimate, and an explicitly selected IMU initializes attitude.
+Raw Livox IMU is filtered through `imu_filter_madgwick`; it is never treated as
+if its unset orientation quaternion were valid.
 
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 

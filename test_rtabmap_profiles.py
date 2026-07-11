@@ -96,6 +96,12 @@ class RtabmapProfileTest(unittest.TestCase):
             {"lidar_topic": "/scanner/cloud", "imu_topic": "/livox/imu"},
         )
 
+    def test_raw_livox_imu_is_filtered_before_icp(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn('package="imu_filter_madgwick"', source)
+        self.assertIn('(\"imu/data_raw\", imu_topic)', source)
+        self.assertIn('(\"imu\", filtered_imu_topic)', source)
+
     def test_requested_rtabmap_input_must_resolve(self):
         profiles = load_profiles()
         with self.assertRaisesRegex(RuntimeError, "rgbd input.*not resolved"):

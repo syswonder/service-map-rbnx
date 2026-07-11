@@ -278,6 +278,28 @@ def _make_nodes(context, *args, **kwargs):
 
     nodes = []
 
+    filtered_imu_topic = "/rtabmap/imu/data"
+    if have_imu and not have_odom:
+        # Livox publishes angular velocity and acceleration, but leaves the
+        # Imu orientation quaternion unset. RTAB-Map's wait_imu_to_init needs
+        # a real attitude estimate, so never feed /livox/imu directly.
+        nodes.append(Node(
+            package="imu_filter_madgwick",
+            executable="imu_filter_madgwick_node",
+            name="mapping_imu_filter",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "use_mag": False,
+                "publish_tf": False,
+                "world_frame": "enu",
+            }],
+            remappings=[
+                ("imu/data_raw", imu_topic),
+                ("imu/data", filtered_imu_topic),
+            ],
+        ))
+
     # A 100 ms Mid360 frame is visibly distorted while a skid-steer robot
     # rotates. With external odometry, compensate every point against the
     # odom TF before SLAM consumes the cloud. This requires a timestamp field
@@ -329,7 +351,7 @@ def _make_nodes(context, *args, **kwargs):
             "Odom/ScanKeyFrameThr": "0.4",
         }
         if have_imu:
-            icp_odom_remappings.append(("imu", imu_topic))
+            icp_odom_remappings.append(("imu", filtered_imu_topic))
             icp_odom_params["wait_imu_to_init"] = True
         icp_odom = Node(
             package="rtabmap_odom",

@@ -62,7 +62,8 @@ unlinked nodes. `rtabmap_params` remains an explicit per-parameter override.
 With external odometry, `deskew_lidar` compensates each PointCloud2 point in
 the odom frame before SLAM. Without external odometry, it enables ICP's
 constant-velocity deskewing; include `imu` in `rtabmap_inputs` to initialize
-the ICP orientation from the selected IMU provider.
+the ICP orientation from the selected IMU provider. Raw Livox gyro/accel is
+first converted to an orientation estimate by `imu_filter_madgwick`.
 
 ## Deployment targets
 

@@ -103,6 +103,11 @@ case "$TARGET" in
             echo "[build]   sudo apt install ros-humble-rtabmap-ros" >&2
             missing=1
         fi
+        if ! ros2 pkg prefix imu_filter_madgwick >/dev/null 2>&1; then
+            echo "[build] ERROR: imu_filter_madgwick not installed. On the Jetson host run:" >&2
+            echo "[build]   sudo apt install ros-humble-imu-filter-madgwick" >&2
+            missing=1
+        fi
         [[ "$missing" == "1" ]] && exit 1
         echo "[build] host rtabmap OK ($(ros2 pkg prefix rtabmap_slam))"
         ;;

@@ -57,6 +57,7 @@ RUN apt-get update \
         python3-numpy \
         python3-yaml \
         ros-humble-rtabmap-ros \
+        ros-humble-imu-filter-madgwick \
         ros-humble-tf2-ros \
         ros-humble-tf-transformations \
         ros-humble-pointcloud-to-laserscan \

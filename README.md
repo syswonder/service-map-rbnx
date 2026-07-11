@@ -41,6 +41,7 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
        config:
          algo: rtabmap
         sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }
+        rtabmap_inputs: [lidar, odom]
         occupancy_sources: [lidar]
          base_frame: base_link
          use_sim_time: false

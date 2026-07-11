@@ -57,6 +57,9 @@ config:
   # what the robot actually has — see the sensor table below. Required;
   # the package refuses to guess (an empty/missing `sensors:` errors out).
   sensors: { lidar2d: true, odom: true, rgb: true, depth: true }
+  # Which discovered streams RTAB-Map actually subscribes to. Ranger's known
+  # good databases contain scans only, so do not add RGB-D synchronization.
+  rtabmap_inputs: [lidar, odom]
   # Which resolved streams build the 2D occupancy grid. Availability alone
   # does not imply that depth fusion is stable on this robot.
   occupancy_sources: [lidar]           # lidar | depth | both
@@ -110,6 +113,11 @@ refuses to guess.
 `occupancy_sources` is a separate policy. It accepts `lidar`, `depth`, or both,
 and fails initialization if Atlas did not resolve a requested source. Omitting
 it preserves the legacy automatic choice for existing deployments.
+
+`rtabmap_inputs` controls subscriptions independently of discovery. It accepts
+`lidar`, `rgbd`, and `odom`; a requested input must resolve through Atlas. The
+Ranger profile uses `[lidar, odom]`, matching the scan-only v0.1 databases and
+avoiding RGB-D approximate-sync latency during rotation.
 
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 

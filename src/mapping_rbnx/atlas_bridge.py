@@ -75,6 +75,7 @@ from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
     resolve_occupancy_sources,
     resolve_rtabmap_overrides,
+    select_rtabmap_inputs,
 )
 
 
@@ -497,6 +498,8 @@ def init(cfg: dict):
     # Discover sensors → resolved.yaml. Raises if `sensors:` block missing.
     try:
         resolved = _retry_resolve(mapping, cfg)
+        if algo == "rtabmap":
+            resolved = select_rtabmap_inputs(cfg.get("rtabmap_inputs"), resolved)
     except RuntimeError as e:
         return Err(str(e))
     # TF / time-source overrides from cfg. Real-robot bring-ups without

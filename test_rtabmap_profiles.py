@@ -53,6 +53,27 @@ class RtabmapProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not resolved from Atlas"):
             profiles.resolve_occupancy_sources(["depth"], {"lidar"})
 
+    def test_ranger_inputs_drop_rgbd_without_hiding_atlas_capabilities(self):
+        profiles = load_profiles()
+        resolved = {
+            "lidar_topic": "/scanner/cloud",
+            "rgb_topic": "/camera/color",
+            "depth_topic": "/camera/depth",
+            "odom_topic": "/odom",
+        }
+        selected = profiles.select_rtabmap_inputs(["lidar", "odom"], resolved)
+        self.assertEqual(
+            selected,
+            {"lidar_topic": "/scanner/cloud", "odom_topic": "/odom"},
+        )
+
+    def test_requested_rtabmap_input_must_resolve(self):
+        profiles = load_profiles()
+        with self.assertRaisesRegex(RuntimeError, "rgbd input.*not resolved"):
+            profiles.select_rtabmap_inputs(
+                ["lidar", "rgbd"], {"lidar_topic": "/scanner/cloud"}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

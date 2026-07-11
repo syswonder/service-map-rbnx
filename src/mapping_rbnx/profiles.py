@@ -53,6 +53,43 @@ def resolve_occupancy_sources(
     }
 
 
+def select_rtabmap_inputs(
+    raw_inputs: object | None, resolved: dict[str, str]
+) -> dict[str, str]:
+    """Apply an explicit RTAB-Map subscription policy to Atlas results."""
+    if raw_inputs is None:
+        return dict(resolved)
+    if not isinstance(raw_inputs, (list, tuple)) or not raw_inputs:
+        raise RuntimeError(
+            "rtabmap_inputs must be a non-empty list containing lidar, rgbd and/or odom"
+        )
+    inputs = {str(value).strip().lower() for value in raw_inputs}
+    supported = {"lidar", "rgbd", "odom"}
+    unknown = inputs - supported
+    if unknown:
+        raise RuntimeError(
+            f"unknown RTAB-Map input(s) {sorted(unknown)}; options: {sorted(supported)}"
+        )
+
+    selected: dict[str, str] = {}
+    if "lidar" in inputs:
+        for key in ("scan_topic", "lidar_topic"):
+            if resolved.get(key):
+                selected[key] = resolved[key]
+        if not ({"scan_topic", "lidar_topic"} & selected.keys()):
+            raise RuntimeError("RTAB-Map lidar input was requested but not resolved from Atlas")
+    if "rgbd" in inputs:
+        if not resolved.get("rgb_topic") or not resolved.get("depth_topic"):
+            raise RuntimeError("RTAB-Map rgbd input was requested but not resolved from Atlas")
+        selected["rgb_topic"] = resolved["rgb_topic"]
+        selected["depth_topic"] = resolved["depth_topic"]
+    if "odom" in inputs:
+        if not resolved.get("odom_topic"):
+            raise RuntimeError("RTAB-Map odom input was requested but not resolved from Atlas")
+        selected["odom_topic"] = resolved["odom_topic"]
+    return selected
+
+
 def resolve_rtabmap_overrides(
     profile_name: str, raw: object | None
 ) -> dict[str, object]:

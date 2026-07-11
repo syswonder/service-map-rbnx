@@ -63,6 +63,7 @@ start: bash scripts/start.sh
 # Required:
 #   algo:    rtabmap | dlio | fastlio2[broken]      (rtabmap recommended)
 #   sensors: { lidar2d|lidar3d|rgb|depth|imu|odom: bool }  what the robot has
+#   rtabmap_inputs: [lidar|rgbd|odom]  which resolved streams feed RTAB-Map
 #   occupancy_sources: [lidar|depth]  explicit 2D occupancy policy (optional;
 #                                      legacy deploys retain automatic choice)
 # Frames / time (optional; defaults = webots tiago):

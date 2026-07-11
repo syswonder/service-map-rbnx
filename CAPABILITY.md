@@ -57,6 +57,9 @@ config:
   # what the robot actually has — see the sensor table below. Required;
   # the package refuses to guess (an empty/missing `sensors:` errors out).
   sensors: { lidar2d: true, odom: true, rgb: true, depth: true }
+  # Which resolved streams build the 2D occupancy grid. Availability alone
+  # does not imply that depth fusion is stable on this robot.
+  occupancy_sources: [lidar]           # lidar | depth | both
   # frames / time (all optional; defaults shown = webots tiago)
   base_frame: base_link
   odom_frame: odom
@@ -71,10 +74,11 @@ config:
   map_mode: mapping                   # mapping | localization
 ```
 
-`rtabmap_profile: ranger_mini_v3` restores the lidar-only occupancy source and
-node insertion cadence stored in the known-good v0.1 `315` and `ranger_3f`
-databases. It does not use the Nav2 pointcloud-to-laserscan adapter; Mapping
-continues to consume the original PointCloud2 stream directly.
+`rtabmap_profile: ranger_mini_v3` restores the node insertion cadence stored in
+the known-good v0.1 `315` and `ranger_3f` databases. Set
+`occupancy_sources: [lidar]` to reproduce their lidar-only occupancy policy.
+Mapping consumes the original PointCloud2 stream directly; it does not use the
+Nav2 pointcloud-to-laserscan adapter.
 
 ### `sensors:` keys
 
@@ -102,6 +106,10 @@ sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }  # Mid
 
 `sensors:` is required and must list at least one sensor — the package
 refuses to guess.
+
+`occupancy_sources` is a separate policy. It accepts `lidar`, `depth`, or both,
+and fails initialization if Atlas did not resolve a requested source. Omitting
+it preserves the legacy automatic choice for existing deployments.
 
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 

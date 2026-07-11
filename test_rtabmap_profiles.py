@@ -19,7 +19,6 @@ class RtabmapProfileTest(unittest.TestCase):
     def test_ranger_profile_matches_v01_database_parameters(self):
         profiles = load_profiles()
         values = profiles.resolve_rtabmap_overrides("ranger_mini_v3", None)
-        self.assertEqual(values["Grid/Sensor"], 0)
         self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
         self.assertEqual(values["RGBD/LinearUpdate"], 0.05)
         self.assertEqual(values["RGBD/AngularUpdate"], 0.05)
@@ -32,6 +31,27 @@ class RtabmapProfileTest(unittest.TestCase):
             "ranger_mini_v3", {"Rtabmap/DetectionRate": 2.0}
         )
         self.assertEqual(values["Rtabmap/DetectionRate"], 2.0)
+
+    def test_occupancy_source_is_policy_not_sensor_inference(self):
+        profiles = load_profiles()
+        values = profiles.resolve_occupancy_sources(
+            ["lidar"], {"lidar", "depth"}
+        )
+        self.assertEqual(values["Grid/Sensor"], 0)
+        self.assertIs(values["Grid/FromDepth"], False)
+
+    def test_explicit_lidar_and_depth_fusion(self):
+        profiles = load_profiles()
+        values = profiles.resolve_occupancy_sources(
+            ["lidar", "depth"], {"lidar", "depth"}
+        )
+        self.assertEqual(values["Grid/Sensor"], 2)
+        self.assertIs(values["Grid/FromDepth"], True)
+
+    def test_missing_requested_source_fails_loudly(self):
+        profiles = load_profiles()
+        with self.assertRaisesRegex(RuntimeError, "not resolved from Atlas"):
+            profiles.resolve_occupancy_sources(["depth"], {"lidar"})
 
 
 if __name__ == "__main__":

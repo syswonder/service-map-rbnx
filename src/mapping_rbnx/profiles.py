@@ -7,7 +7,6 @@ from __future__ import annotations
 # `ranger_3f`) with rtabmap-info. They are not generic RTAB-Map defaults.
 RTABMAP_PROFILES: dict[str, dict[str, object]] = {
     "ranger_mini_v3": {
-        "Grid/Sensor": 0,
         "RGBD/CreateOccupancyGrid": True,
         "Rtabmap/DetectionRate": 5.0,
         "RGBD/LinearUpdate": 0.05,
@@ -15,6 +14,43 @@ RTABMAP_PROFILES: dict[str, dict[str, object]] = {
         "Mem/NotLinkedNodesKept": True,
     },
 }
+
+
+def resolve_occupancy_sources(
+    raw_sources: object | None, available_sources: set[str]
+) -> dict[str, object]:
+    """Translate explicit 2D-grid policy into RTAB-Map parameters.
+
+    Atlas discovery answers which streams exist. It must not decide which
+    streams are stable enough to build a robot's occupancy grid.
+    """
+    if raw_sources is None:
+        return {}
+    if not isinstance(raw_sources, (list, tuple)) or not raw_sources:
+        raise RuntimeError(
+            "occupancy_sources must be a non-empty list containing lidar and/or depth"
+        )
+    sources = {str(value).strip().lower() for value in raw_sources}
+    supported = {"lidar", "depth"}
+    unknown = sources - supported
+    if unknown:
+        raise RuntimeError(
+            f"unknown occupancy source(s) {sorted(unknown)}; options: {sorted(supported)}"
+        )
+    missing = sources - available_sources
+    if missing:
+        raise RuntimeError(
+            f"occupancy source(s) {sorted(missing)} were requested but not resolved from Atlas"
+        )
+    grid_sensor = {
+        frozenset({"lidar"}): 0,
+        frozenset({"depth"}): 1,
+        frozenset({"lidar", "depth"}): 2,
+    }[frozenset(sources)]
+    return {
+        "Grid/Sensor": grid_sensor,
+        "Grid/FromDepth": "depth" in sources,
+    }
 
 
 def resolve_rtabmap_overrides(

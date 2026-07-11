@@ -72,7 +72,10 @@ from map_mcp import (  # type: ignore  # noqa: E402
 )
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
-from mapping_rbnx.profiles import resolve_rtabmap_overrides  # noqa: E402
+from mapping_rbnx.profiles import (  # noqa: E402
+    resolve_occupancy_sources,
+    resolve_rtabmap_overrides,
+)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -164,7 +167,7 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
     }
 
 
-def _write_rtabmap_overrides(cfg: dict) -> str:
+def _write_rtabmap_overrides(cfg: dict, resolved: dict[str, str]) -> str:
     """Persist deploy-selected RTAB-Map parameter overrides for the launch.
 
     The bridge is the only sanctioned configuration ingress.  The launcher
@@ -173,9 +176,23 @@ def _write_rtabmap_overrides(cfg: dict) -> str:
     """
     profile_name = str(cfg.get("rtabmap_profile") or "").strip()
     raw = cfg.get("rtabmap_params")
-    if raw is None and not profile_name:
+    occupancy_sources = cfg.get("occupancy_sources")
+    if raw is None and not profile_name and occupancy_sources is None:
         return ""
     normalized = resolve_rtabmap_overrides(profile_name, raw)
+    if occupancy_sources is not None:
+        if isinstance(raw, dict) and ({"Grid/Sensor", "Grid/FromDepth"} & raw.keys()):
+            raise RuntimeError(
+                "configure occupancy_sources or raw Grid/Sensor/Grid/FromDepth, not both"
+            )
+        available_sources: set[str] = set()
+        if resolved.get("scan_topic") or resolved.get("lidar_topic"):
+            available_sources.add("lidar")
+        if resolved.get("rgb_topic") and resolved.get("depth_topic"):
+            available_sources.add("depth")
+        normalized.update(
+            resolve_occupancy_sources(occupancy_sources, available_sources)
+        )
 
     path = Path(RESOLVED_DIR) / "rtabmap_overrides.json"
     path.write_text(json.dumps(normalized, sort_keys=True), encoding="utf-8")
@@ -499,7 +516,7 @@ def init(cfg: dict):
     resolved.update(persist)
     if algo == "rtabmap":
         try:
-            overrides_path = _write_rtabmap_overrides(cfg)
+            overrides_path = _write_rtabmap_overrides(cfg, resolved)
         except RuntimeError as e:
             return Err(str(e))
         if overrides_path:

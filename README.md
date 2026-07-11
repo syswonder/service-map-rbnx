@@ -40,7 +40,8 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
        # manifest: package_manifest.jetson-native.yaml   # x86+docker is default
        config:
          algo: rtabmap
-         sensors: { lidar3d: true, rgbd: true, odom: true, imu: true }
+        sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }
+        occupancy_sources: [lidar]
          base_frame: base_link
          use_sim_time: false
          rtabmap_profile: ranger_mini_v3
@@ -50,11 +51,11 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
 4. Consume the map: subscribe to `robonix/service/map/occupancy_grid` /
    `.../pointcloud` / `.../pose` (resolve them via atlas).
 
-For Ranger Mini v3, use the named profile instead of copying six slash-named
-parameters into every deploy. The profile matches the two known-good v0.1 map
-databases: lidar-only occupancy (`Grid/Sensor=0`), 5 Hz detection, 0.05 m/rad
-node thresholds, and retained unlinked nodes. `rtabmap_params` remains an
-explicit per-parameter override and wins over the profile when both are set.
+For Ranger Mini v3, select `occupancy_sources: [lidar]` and use the named
+profile instead of copying slash-named parameters into every deploy. Together
+they match the two known-good v0.1 map databases: lidar-only occupancy
+(`Grid/Sensor=0`), 5 Hz detection, 0.05 m/rad node thresholds, and retained
+unlinked nodes. `rtabmap_params` remains an explicit per-parameter override.
 
 There is no robot-specific code to edit — sensors come from atlas, frames and
 SLAM mode come from config.

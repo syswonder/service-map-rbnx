@@ -27,6 +27,9 @@ if [[ -z "${ROS_DISTRO:-}" || -z "${AMENT_PREFIX_PATH:-}" ]] || ! command -v ros
         exit 2
     fi
 fi
+if [[ -f "$PKG/rbnx-build/codegen/ros2_idl/install/setup.bash" ]]; then
+    set +u; source "$PKG/rbnx-build/codegen/ros2_idl/install/setup.bash"; set -u
+fi
 # Fail loud if rtabmap isn't actually installed natively.
 if ! ros2 pkg prefix rtabmap_slam >/dev/null 2>&1; then
     echo "[mapping-native] ERR: rtabmap_slam not found on the host ROS install." >&2

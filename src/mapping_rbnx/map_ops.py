@@ -23,6 +23,7 @@ import math
 import os
 import shutil
 import glob
+import hashlib
 import sqlite3
 import threading
 import time
@@ -294,6 +295,124 @@ def _publish_full_map(node, timeout_s: float = 30.0) -> tuple[bool, str]:
     return True, "published optimized global map"
 
 
+def _load_database(node, runtime_db: str, timeout_s: float) -> tuple[bool, str]:
+    """Load one runtime database, isolated for ordering tests."""
+    try:
+        from rtabmap_msgs.srv import LoadDatabase
+    except Exception as e:  # noqa: BLE001
+        return False, f"rtabmap_msgs/LoadDatabase unavailable: {e}"
+    req = LoadDatabase.Request()
+    req.database_path = runtime_db
+    req.clear = False
+    ok, res = _call_service(
+        node, LoadDatabase, f"{RTABMAP_NS}/load_database", req, timeout_s=timeout_s
+    )
+    return (ok, "load_database completed" if ok else str(res))
+
+
+def _saved_occupancy_signature(map_dir: str) -> dict:
+    """Return metadata and a content fingerprint for the saved occupancy map."""
+    import yaml
+    from PIL import Image
+
+    yaml_path = os.path.join(map_dir, "occupancy.yaml")
+    pgm_path = os.path.join(map_dir, "occupancy.pgm")
+    with open(yaml_path, "r", encoding="utf-8") as fh:
+        metadata = yaml.safe_load(fh) or {}
+    origin = metadata.get("origin") or []
+    if len(origin) < 2:
+        raise RuntimeError(f"invalid occupancy origin in {yaml_path}")
+    with Image.open(pgm_path) as image:
+        pixels = image.convert("L")
+        width, height = pixels.size
+        digest = hashlib.sha256(pixels.tobytes()).hexdigest()
+    return {
+        "width": int(width),
+        "height": int(height),
+        "resolution": float(metadata["resolution"]),
+        "origin_x": float(origin[0]),
+        "origin_y": float(origin[1]),
+        "sha256": digest,
+    }
+
+
+def _begin_target_map_wait(node, map_dir: str) -> dict:
+    """Subscribe before publish so load completion is tied to the target /map."""
+    import numpy as np
+    from nav_msgs.msg import OccupancyGrid
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+
+    expected = _saved_occupancy_signature(map_dir)
+    ready = threading.Event()
+    observed = {"summary": "no occupancy sample received"}
+
+    def on_map(msg):
+        try:
+            info = msg.info
+            summary = (
+                f"{info.width}x{info.height}@{info.resolution:.6f} "
+                f"origin=({info.origin.position.x:.3f},{info.origin.position.y:.3f})"
+            )
+            observed["summary"] = summary
+            metadata_matches = (
+                int(info.width) == expected["width"]
+                and int(info.height) == expected["height"]
+                and abs(float(info.resolution) - expected["resolution"]) <= 1e-6
+                and abs(float(info.origin.position.x) - expected["origin_x"]) <= 1e-3
+                and abs(float(info.origin.position.y) - expected["origin_y"]) <= 1e-3
+            )
+            if not metadata_matches:
+                return
+            data = np.asarray(msg.data, dtype=np.int16).reshape(
+                expected["height"], expected["width"]
+            )
+            image = np.full(data.shape, 205, dtype=np.uint8)
+            image[data == 0] = 254
+            image[data >= 50] = 0
+            digest = hashlib.sha256(np.flipud(image).tobytes()).hexdigest()
+            observed["summary"] = f"{summary} sha256={digest[:12]}"
+            if digest == expected["sha256"]:
+                ready.set()
+        except Exception as exc:  # noqa: BLE001
+            observed["summary"] = f"invalid occupancy sample: {exc}"
+
+    qos = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+    topic = os.environ.get("MAPPING_OCCUPANCY_TOPIC", "/map")
+    sub = node.create_subscription(OccupancyGrid, topic, on_map, qos)
+    return {
+        "event": ready,
+        "observed": observed,
+        "expected": expected,
+        "subscription": sub,
+        "topic": topic,
+    }
+
+
+def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool, str]:
+    try:
+        matched = barrier["event"].wait(timeout=max(0.0, timeout_s))
+    finally:
+        node.destroy_subscription(barrier["subscription"])
+    expected = barrier["expected"]
+    if not matched:
+        return False, (
+            f"target occupancy was not observed on {barrier['topic']} within {timeout_s:.1f}s; "
+            f"expected={expected['width']}x{expected['height']}@{expected['resolution']:.6f} "
+            f"origin=({expected['origin_x']:.3f},{expected['origin_y']:.3f}) "
+            f"sha256={expected['sha256'][:12]}; observed={barrier['observed']['summary']}"
+        )
+    return True, (
+        f"verified target occupancy on {barrier['topic']} "
+        f"({expected['width']}x{expected['height']}, sha256={expected['sha256'][:12]})"
+    )
+
+
 def load_map_impl(map_id: str, mode: str = "localization",
                   has_initial_pose: bool = False,
                   x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> dict:
@@ -321,29 +440,43 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
 
     try:
-        try:
-            from rtabmap_msgs.srv import LoadDatabase
-        except Exception:  # noqa: BLE001
-            return {"ok": False,
-                    "detail": "rtabmap_msgs/LoadDatabase not available; cannot load saved map"}
+        started = time.monotonic()
+        log.info("load_map[%s] stage=prepare source=%s requested_mode=%s", map_id,
+                 db_path, requested_mode)
         runtime_db = _runtime_db_copy(db_path, map_id)
-        req = LoadDatabase.Request()
-        req.database_path = runtime_db
-        req.clear = False
-        load_timeout_s = float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180"))
-        ok, res = _call_service(node, LoadDatabase, f"{RTABMAP_NS}/load_database", req, timeout_s=load_timeout_s)
-        if not ok:
-            return {"ok": False, "detail": f"load_database failed: {res} after {load_timeout_s:.0f}s"}
 
+        # RTAB-Map only restores the saved 2D occupancy grid when the database
+        # is opened in localization mode. Loading first while still in mapping
+        # mode omits that grid; a second load then appears to fix the UI/RViz.
+        log.info("load_map[%s] stage=switch_mode target=localization", map_id)
         ok2, info2 = _set_mode(node, mode)
         if not ok2:
-            return {"ok": False, "detail": f"loaded runtime db but failed to switch localization mode: {info2}"}
+            return {"ok": False, "detail": f"failed to switch localization before load: {info2}"}
         set_current_mode(mode)
 
+        load_timeout_s = float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180"))
+        log.info("load_map[%s] stage=load_database runtime_db=%s timeout=%.1fs",
+                 map_id, runtime_db, load_timeout_s)
+        ok, load_detail = _load_database(node, runtime_db, load_timeout_s)
+        if not ok:
+            return {"ok": False,
+                    "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
+
         publish_timeout_s = float(os.environ.get("MAPPING_PUBLISH_MAP_TIMEOUT_S", "45"))
+        barrier = _begin_target_map_wait(node, os.path.dirname(db_path))
+        log.info("load_map[%s] stage=publish_map timeout=%.1fs", map_id, publish_timeout_s)
         pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
         if not pub_ok:
+            node.destroy_subscription(barrier["subscription"])
             return {"ok": False, "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
+        verify_timeout_s = float(os.environ.get("MAPPING_VERIFY_MAP_TIMEOUT_S", "30"))
+        verified, verify_detail = _finish_target_map_wait(node, barrier, verify_timeout_s)
+        if not verified:
+            log.error("load_map[%s] stage=verify failed: %s", map_id, verify_detail)
+            return {"ok": False, "detail": f"loaded {map_id}, but {verify_detail}"}
+        elapsed = time.monotonic() - started
+        log.info("load_map[%s] stage=complete elapsed=%.3fs %s", map_id, elapsed,
+                 verify_detail)
 
         seeded = ""
         if has_initial_pose:
@@ -352,7 +485,8 @@ def load_map_impl(map_id: str, mode: str = "localization",
         note = "" if requested_mode == "localization" else f"; requested {requested_mode} coerced to localization"
         return {"ok": True,
                 "runtime_db_path": runtime_db,
-                "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}{seeded}{note}"}
+                "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}; "
+                          f"{verify_detail}; elapsed={elapsed:.1f}s{seeded}{note}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
         return {"ok": False, "detail": str(e)}

@@ -41,17 +41,20 @@ mkdir -p "$BUILD/data"
 # Without it codegen emits only proto stubs, `map_mcp` is missing, and the
 # bridge dies at import with ModuleNotFoundError → the service never registers.
 if command -v rbnx >/dev/null 2>&1; then
-    FLAGS=(--mcp --ros2)
+    FLAGS=(--mcp)
+    [[ "$TARGET" == "jetson-native" ]] && FLAGS+=(--ros2)
     [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
     echo "[build] rbnx codegen ${FLAGS[*]}"
     rbnx codegen -p "$PKG" "${FLAGS[@]}"
 
-    set +u
-    source "/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
-    set -u
-    ROS2_IDL="$PKG/rbnx-build/codegen/ros2_idl"
-    echo "[build] colcon build (Robonix ROS 2 interfaces)"
-    (cd "$ROS2_IDL" && colcon build)
+    if [[ "$TARGET" == "jetson-native" ]]; then
+        set +u
+        source "/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
+        set -u
+        ROS2_IDL="$PKG/rbnx-build/codegen/ros2_idl"
+        echo "[build] colcon build (Robonix ROS 2 interfaces)"
+        (cd "$ROS2_IDL" && colcon build)
+    fi
 else
     echo "[build] WARNING: rbnx not in PATH — skipping proto codegen"
     echo "[build]   install robonix-cli + run \`rbnx setup\` once from the robonix source root"

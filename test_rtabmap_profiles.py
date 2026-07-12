@@ -96,6 +96,35 @@ class RtabmapProfileTest(unittest.TestCase):
             {"lidar_topic": "/scanner/cloud", "imu_topic": "/livox/imu"},
         )
 
+    def test_ranger_visual_fusion_keeps_lidar_rgbd_and_external_odom(self):
+        profiles = load_profiles()
+        selected = profiles.select_rtabmap_inputs(
+            ["lidar", "rgbd", "odom"],
+            {
+                "lidar_topic": "/scanner/cloud",
+                "rgb_topic": "/camera/color/image_raw",
+                "depth_topic": "/camera/aligned_depth/image_raw",
+                "odom_topic": "/odom",
+            },
+        )
+        self.assertEqual(
+            selected,
+            {
+                "lidar_topic": "/scanner/cloud",
+                "rgb_topic": "/camera/color/image_raw",
+                "depth_topic": "/camera/aligned_depth/image_raw",
+                "odom_topic": "/odom",
+            },
+        )
+
+    def test_external_odom_keeps_its_original_capability_owner(self):
+        source = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        self.assertIn(
+            'contract_id == "robonix/service/map/odom" and resolved.get("odom_topic")',
+            source,
+        )
+        self.assertIn("external odom remains owned by its provider", source)
+
     def test_raw_livox_imu_is_filtered_before_icp(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
         self.assertIn('package="imu_filter_madgwick"', source)

@@ -424,13 +424,18 @@ def _declare_outputs(cap: Service, algo: str, resolved: dict[str, str]) -> None:
     bindings = _ALGO_TOPIC_BINDINGS[algo]
     declared = 0
     for contract_id in _EXPORTED_CONTRACTS:
-        topic = bindings[contract_id]
         if contract_id == "robonix/service/map/odom" and resolved.get("odom_topic"):
-            # With external odometry RTAB-Map consumes, but does not republish,
-            # that stream. Export the real continuous source instead of a
-            # nonexistent /rtabmap/odom topic. Internal ICP explicitly publishes
-            # /rtabmap/odom and therefore keeps the static binding above.
-            topic = resolved["odom_topic"]
+            # External odometry remains owned by its primitive/LIO provider.
+            # Re-declaring the same ROS topic here makes Atlas mint a collision
+            # endpoint that no process publishes and can also yield an invalid
+            # ROS name. Mapping consumes this stream; it does not own it.
+            log.info(
+                "not declaring %s: external odom remains owned by its provider (%s)",
+                contract_id,
+                resolved["odom_topic"],
+            )
+            continue
+        topic = bindings[contract_id]
         try:
             mapping.declare_ros2_topic(contract_id, topic, qos="reliable")
             declared += 1

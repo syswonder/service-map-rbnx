@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from mapping_rbnx import map_ops
 
 
@@ -78,6 +80,35 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("before load", result["detail"])
         load.assert_not_called()
+
+    def test_occupancy_similarity_accepts_small_edge_rebuild(self):
+        expected = np.full((100, 100), 205, dtype=np.uint8)
+        expected[20:40, 20:40] = 0
+        expected[50:80, 50:80] = 254
+        observed = expected.copy()
+        observed.flat[:1] = 254
+
+        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
+            expected, observed
+        )
+
+        self.assertGreaterEqual(agreement, 0.9999)
+        self.assertGreaterEqual(occupied_iou, 0.995)
+        self.assertGreaterEqual(free_iou, 0.995)
+
+    def test_occupancy_similarity_rejects_different_same_size_map(self):
+        expected = np.full((100, 100), 205, dtype=np.uint8)
+        expected[20:40, 20:40] = 0
+        observed = np.full((100, 100), 205, dtype=np.uint8)
+        observed[60:80, 60:80] = 0
+
+        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
+            expected, observed
+        )
+
+        self.assertLess(agreement, 0.9999)
+        self.assertLess(occupied_iou, 0.995)
+        self.assertEqual(free_iou, 1.0)
 
 
 if __name__ == "__main__":

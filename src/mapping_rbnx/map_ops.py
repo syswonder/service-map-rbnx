@@ -333,7 +333,27 @@ def _saved_occupancy_signature(map_dir: str) -> dict:
         "origin_x": float(origin[0]),
         "origin_y": float(origin[1]),
         "sha256": digest,
+        "pixels": pixels.tobytes(),
     }
+
+
+def _occupancy_similarity(expected, observed) -> tuple[float, float, float]:
+    """Return cell agreement plus occupied/free intersection-over-union."""
+    import numpy as np
+
+    if expected.shape != observed.shape or expected.size == 0:
+        return 0.0, 0.0, 0.0
+    agreement = float(np.mean(expected == observed))
+
+    def iou(value: int) -> float:
+        lhs = expected == value
+        rhs = observed == value
+        union = int(np.count_nonzero(lhs | rhs))
+        if union == 0:
+            return 1.0
+        return float(np.count_nonzero(lhs & rhs) / union)
+
+    return agreement, iou(0), iou(254)
 
 
 def _begin_target_map_wait(node, map_dir: str) -> dict:
@@ -344,6 +364,11 @@ def _begin_target_map_wait(node, map_dir: str) -> dict:
                            ReliabilityPolicy)
 
     expected = _saved_occupancy_signature(map_dir)
+    expected_image = np.frombuffer(expected["pixels"], dtype=np.uint8).reshape(
+        expected["height"], expected["width"]
+    )
+    min_agreement = float(os.environ.get("MAPPING_LOAD_MIN_CELL_AGREEMENT", "0.9999"))
+    min_class_iou = float(os.environ.get("MAPPING_LOAD_MIN_CLASS_IOU", "0.995"))
     ready = threading.Event()
     observed = {"summary": "no occupancy sample received"}
 
@@ -371,8 +396,19 @@ def _begin_target_map_wait(node, map_dir: str) -> dict:
             image[data == 0] = 254
             image[data >= 50] = 0
             digest = hashlib.sha256(np.flipud(image).tobytes()).hexdigest()
-            observed["summary"] = f"{summary} sha256={digest[:12]}"
-            if digest == expected["sha256"]:
+            image = np.flipud(image)
+            agreement, occupied_iou, free_iou = _occupancy_similarity(
+                expected_image, image
+            )
+            observed["summary"] = (
+                f"{summary} sha256={digest[:12]} agreement={agreement:.6f} "
+                f"occupied_iou={occupied_iou:.6f} free_iou={free_iou:.6f}"
+            )
+            if digest == expected["sha256"] or (
+                agreement >= min_agreement
+                and occupied_iou >= min_class_iou
+                and free_iou >= min_class_iou
+            ):
                 ready.set()
         except Exception as exc:  # noqa: BLE001
             observed["summary"] = f"invalid occupancy sample: {exc}"

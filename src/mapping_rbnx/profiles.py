@@ -14,6 +14,16 @@ RTABMAP_PROFILES: dict[str, dict[str, object]] = {
         "RGBD/LinearUpdate": 0.05,
         "RGBD/AngularUpdate": 0.05,
         "Mem/NotLinkedNodesKept": True,
+        # The MID-360 stream can contain a zero-range sample.  Once the cloud
+        # is transformed into base_link, that sample lands exactly on the
+        # lidar viewpoint (x=0.18 m) and RTAB-Map otherwise stores it as an
+        # obstacle inside the robot.  Match the padded Nav2 footprint so the
+        # static map can never seal the planner's start cell with self points.
+        "Grid/FootprintLength": 0.84,
+        "Grid/FootprintWidth": 0.60,
+        # Keep a second, narrow guard for invalid samples at the sensor origin
+        # without hiding legitimate close obstacles outside the footprint.
+        "Grid/RangeMin": 0.10,
     },
 }
 

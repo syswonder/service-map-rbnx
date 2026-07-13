@@ -33,7 +33,7 @@ class RtabmapProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "multiple Atlas providers"):
             profiles.choose_provider_record(records, "", "lidar3d")
 
-    def test_ranger_profile_matches_v01_database_parameters(self):
+    def test_ranger_profile_preserves_v01_baseline_and_filters_self_points(self):
         profiles = load_profiles()
         values = profiles.resolve_rtabmap_overrides("ranger_mini_v3", None)
         self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
@@ -41,13 +41,23 @@ class RtabmapProfileTest(unittest.TestCase):
         self.assertEqual(values["RGBD/AngularUpdate"], 0.05)
         self.assertIs(values["RGBD/CreateOccupancyGrid"], True)
         self.assertIs(values["Mem/NotLinkedNodesKept"], True)
+        self.assertEqual(values["Grid/FootprintLength"], 0.84)
+        self.assertEqual(values["Grid/FootprintWidth"], 0.60)
+        self.assertEqual(values["Grid/RangeMin"], 0.10)
+
+        # Regression for the 2026-07-13 temporary map: the invalid point was
+        # emitted at the lidar viewpoint (0.18, 0.0), inside the Ranger body.
+        self.assertLess(0.18, values["Grid/FootprintLength"] / 2.0)
+        self.assertLess(0.0, values["Grid/FootprintWidth"] / 2.0)
 
     def test_explicit_values_override_profile(self):
         profiles = load_profiles()
         values = profiles.resolve_rtabmap_overrides(
-            "ranger_mini_v3", {"Rtabmap/DetectionRate": 2.0}
+            "ranger_mini_v3",
+            {"Rtabmap/DetectionRate": 2.0, "Grid/RangeMin": 0.20},
         )
         self.assertEqual(values["Rtabmap/DetectionRate"], 2.0)
+        self.assertEqual(values["Grid/RangeMin"], 0.20)
 
     def test_occupancy_source_is_policy_not_sensor_inference(self):
         profiles = load_profiles()

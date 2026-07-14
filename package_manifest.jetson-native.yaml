@@ -12,7 +12,7 @@
 #     - name: mapping
 #       url: https://github.com/syswonder/service-map-rbnx
 #       manifest: package_manifest.jetson-native.yaml
-#       config: { algo: rtabmap, sensors: {...}, map_id: lab_3f }
+#       config: { sensor_providers: {lidar3d: roof_lidar, odom: chassis} }
 manifestVersion: 1
 
 package:

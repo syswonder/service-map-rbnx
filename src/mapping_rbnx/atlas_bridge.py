@@ -5,11 +5,10 @@ Responsibilities (kept tight; SLAM nodes do the actual work):
   1. Register `mapping` as a capability with atlas, declare a
      `service/map/driver` interface.
   2. Wait for `Driver(CMD_INIT, config_json)` from rbnx — config arrives
-     ONLY through this gRPC channel (NEVER from disk / env). The cfg
-     dict carries:
+     through this gRPC channel. Deploy-owned files are referenced by explicit
+     cfg paths and resolved from the robot manifest directory. The cfg carries:
        - algo:    rtabmap | dlio | fastlio2[broken]
-       - sensors: lidar2d / lidar3d / rgb / depth / imu / odom booleans
-       - platform: x86_desktop / jetson_orin
+       - sensor_providers: sensor role to Atlas provider ID
   3. Resolve sensor primitives via atlas, write `/tmp/<algo>_resolved.yaml`
      for the launch file (start_engine.sh greps these out).
   4. Declare the algo-appropriate output endpoints on atlas, ALL under
@@ -176,16 +175,27 @@ def _write_rtabmap_overrides(cfg: dict, resolved: dict[str, str]) -> str:
     receives a file path instead of a JSON blob so parameter names such as
     ``RGBD/LinearUpdate`` do not need shell escaping.
     """
-    profile_name = str(cfg.get("rtabmap_profile") or "").strip()
+    legacy_profile = str(cfg.get("rtabmap_profile") or "").strip()
+    if legacy_profile:
+        log.warning(
+            "DEPRECATED config.rtabmap_profile=%s; copy its values into "
+            "a deploy-owned params_file (or inline rtabmap_params)",
+            legacy_profile,
+        )
     raw = cfg.get("rtabmap_params")
+    params_file = cfg.get("params_file")
     occupancy_sources = cfg.get("occupancy_sources")
-    if raw is None and not profile_name and occupancy_sources is None:
+    if raw is None and not params_file and occupancy_sources is None and not legacy_profile:
         return ""
-    normalized = resolve_rtabmap_overrides(profile_name, raw)
+    if legacy_profile and params_file:
+        log.warning("config.params_file overrides deprecated rtabmap_profile values")
+    normalized = resolve_rtabmap_overrides(raw, legacy_profile, params_file)
     if occupancy_sources is not None:
-        if isinstance(raw, dict) and ({"Grid/Sensor", "Grid/FromDepth"} & raw.keys()):
+        conflicting = {"Grid/Sensor", "Grid/FromDepth"} & normalized.keys()
+        if conflicting:
             raise RuntimeError(
-                "configure occupancy_sources or raw Grid/Sensor/Grid/FromDepth, not both"
+                "configure occupancy_sources or Grid/Sensor/Grid/FromDepth in "
+                f"params_file/rtabmap_params, not both: {sorted(conflicting)}"
             )
         available_sources: set[str] = set()
         if resolved.get("scan_topic") or resolved.get("lidar_topic"):
@@ -199,8 +209,8 @@ def _write_rtabmap_overrides(cfg: dict, resolved: dict[str, str]) -> str:
     path = Path(RESOLVED_DIR) / "rtabmap_overrides.json"
     path.write_text(json.dumps(normalized, sort_keys=True), encoding="utf-8")
     log.info(
-        "wrote %d RTAB-Map override(s) profile=%s → %s",
-        len(normalized), profile_name or "<none>", path,
+        "wrote %d deployment RTAB-Map override(s) → %s",
+        len(normalized), path,
     )
     return str(path)
 
@@ -308,24 +318,42 @@ _SENSOR_CONTRACTS = [
 
 
 def _enabled_sensors(cfg: dict) -> dict:
-    """Read config.sensors. The deploy manifest is authoritative —
-    every robot has different sensors, so we refuse to guess.
+    """Derive enabled inputs from the deployment's provider bindings.
 
-    A missing or empty `sensors:` block is a configuration error: the
-    operator forgot to declare what the robot has, and silently
-    picking "lidar2d + depth" would mask Mid360 deploys (where the
-    correct answer is lidar3d + depth) and headless deploys (where the
-    correct answer is depth-only). Fail loud instead.
+    A provider binding both enables a sensor role and pins the Atlas provider
+    that owns it. This avoids maintaining a second, easily inconsistent
+    ``sensors`` boolean table. The legacy table remains accepted when no
+    provider bindings are present so existing deployments can migrate.
     """
+    supported = {key for key, _contract, _yaml in _SENSOR_CONTRACTS}
+    providers = cfg.get("sensor_providers")
+    if providers is not None:
+        if not isinstance(providers, dict) or not providers:
+            raise RuntimeError("sensor_providers must be a non-empty mapping")
+        unknown = set(providers) - supported
+        if unknown:
+            raise RuntimeError(
+                f"unknown sensor provider role(s) {sorted(unknown)}; "
+                f"options: {sorted(supported)}"
+            )
+        for key, provider_id in providers.items():
+            if not isinstance(provider_id, str) or not provider_id.strip():
+                raise RuntimeError(
+                    f"sensor_providers.{key} must name a non-empty provider_id"
+                )
+        return {key: key in providers for key in supported}
+
     sensors = cfg.get("sensors")
     if not isinstance(sensors, dict) or not sensors:
         raise RuntimeError(
-            "mapping config has no `sensors:` block. Declare which "
-            "sensors the robot has, e.g.:\n"
-            "  sensors: { lidar2d: true, depth: true, odom: true }     # webots tiago\n"
-            "  sensors: { lidar3d: true, depth: true, odom: true, imu: true }  # mid360 robot\n"
-            "Supported keys: " + ", ".join(k for k, _, _ in _SENSOR_CONTRACTS)
+            "mapping config has no sensor_providers. Bind each enabled role "
+            "to its Atlas provider_id, for example: "
+            "sensor_providers: {lidar3d: roof_lidar, odom: base_chassis}"
         )
+    log.warning(
+        "config.sensors is deprecated; replace it with sensor_providers, "
+        "whose keys enable sensor roles and whose values pin provider IDs"
+    )
     out = {}
     for key, _contract, _yaml in _SENSOR_CONTRACTS:
         out[key] = _truthy(sensors.get(key, False))
@@ -450,17 +478,12 @@ def _write_resolved_yaml(algo: str, resolved: dict[str, str]) -> str:
     """Write /tmp/<algo>_resolved.yaml with k=v lines. start_engine.sh
     `grep`s these out — yaml-lite is fine, no parser needed."""
     out = os.path.join(RESOLVED_DIR, f"{algo}_resolved.yaml")
-    # tf frames default for webots tiago. Real-robot deploys without a
-    # base_link TF (no chassis driver, no soma URDF yet) override
-    # base_frame to the lidar's own frame (e.g. livox_frame for MID-360)
-    # via cfg in the deploy manifest. use_sim_time follows the same
-    # cfg path so real-robot bring-ups don't get stuck waiting for a
-    # /clock that never comes.
+    # Neutral single-host defaults. Simulation deployments opt into /clock;
+    # robots with non-standard frames override them in the manifest.
     defaults = {
         "base_frame": "base_link",
         "odom_frame": "odom",
-        "map_frame": "map",
-        "use_sim_time": "true",
+        "use_sim_time": "false",
     }
     merged = {**defaults, **resolved}
     with open(out, "w") as f:
@@ -507,17 +530,15 @@ def init(cfg: dict):
     os.environ["MAPPING_ALGO"] = algo
     Path("/tmp/mapping_algo").write_text(algo)
 
-    # Discover sensors → resolved.yaml. Raises if `sensors:` block missing.
+    # Discover provider-bound sensors and write resolved.yaml.
     try:
         resolved = _retry_resolve(mapping, cfg)
         if algo == "rtabmap":
             resolved = select_rtabmap_inputs(cfg.get("rtabmap_inputs"), resolved)
     except RuntimeError as e:
         return Err(str(e))
-    # TF / time-source overrides from cfg. Real-robot bring-ups without
-    # a chassis driver pass base_frame=livox_frame so rtabmap doesn't
-    # block waiting for base_link. use_sim_time=false on real hardware.
-    for key in ("base_frame", "odom_frame", "map_frame", "use_sim_time", "deskew_lidar"):
+    # Optional frame/time overrides. Standard robots need not repeat defaults.
+    for key in ("base_frame", "odom_frame", "use_sim_time", "deskew_lidar"):
         if key in cfg:
             resolved[key] = (
                 str(cfg[key]).lower()

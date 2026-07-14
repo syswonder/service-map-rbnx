@@ -1,49 +1,64 @@
-"""Named, field-validated RTAB-Map tuning profiles."""
+"""Deployment policy helpers for Mapping configuration."""
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 
+LEGACY_PROFILE_FILE = (
+    Path(__file__).resolve().parent / "legacy_profiles.json"
+)
 
-# These values were read back from both known-good v0.1 databases (`315` and
-# `ranger_3f`) with rtabmap-info. They are not generic RTAB-Map defaults.
-RTABMAP_PROFILES: dict[str, dict[str, object]] = {
-    "ranger_mini_v3": {
-        "RGBD/CreateOccupancyGrid": True,
-        "Rtabmap/DetectionRate": 5.0,
-        "RGBD/LinearUpdate": 0.05,
-        "RGBD/AngularUpdate": 0.05,
-        "Mem/NotLinkedNodesKept": True,
-        # The MID-360 stream can contain a zero-range sample.  Once the cloud
-        # is transformed into base_link, that sample lands exactly on the
-        # lidar viewpoint (x=0.18 m) and RTAB-Map otherwise stores it as an
-        # obstacle inside the robot.  Match the padded Nav2 footprint so the
-        # static map can never seal the planner's start cell with self points.
-        "Grid/FootprintLength": 0.84,
-        "Grid/FootprintWidth": 0.60,
-        # Keep a second, narrow guard for invalid samples at the sensor origin
-        # without hiding legitimate close obstacles outside the footprint.
-        "Grid/RangeMin": 0.10,
-    },
-    "webots_tiago": {
-        "RGBD/CreateOccupancyGrid": True,
-        # Webots provides deterministic external odometry. Keep every
-        # meaningful simulator pose instead of throttling the graph to the
-        # physical-robot default of one node per second.
-        "Rtabmap/DetectionRate": 5.0,
-        "RGBD/LinearUpdate": 0.03,
-        "RGBD/AngularUpdate": 0.03,
-        "Mem/NotLinkedNodesKept": True,
-        # Do not replace exact odometry neighbor links with scan matching.
-        # Repetitive walls during in-place rotation are under-constrained for
-        # ICP and previously produced visibly duplicated walls.
-        "RGBD/NeighborLinkRefining": False,
-        "RGBD/ProximityBySpace": False,
-        # Visual registration remains available for global relocalization,
-        # while local graph geometry continues to come from simulator odom.
-        "Reg/Strategy": 0,
-    },
-}
+
+def deployment_root() -> Path:
+    """Return the directory containing the active robot manifest."""
+    raw = os.environ.get("RBNX_INVOCATION_CWD", "").strip()
+    return Path(raw).expanduser().resolve() if raw else Path.cwd().resolve()
+
+
+def validate_scalar_params(raw: dict[object, object], source: str) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise RuntimeError(f"{source} keys must be non-empty strings")
+        if isinstance(value, (dict, list, tuple)) or value is None:
+            raise RuntimeError(f"{source}[{key!r}] must be a scalar value")
+        normalized[key] = value
+    return normalized
+
+
+def load_deployment_params_file(value: object | None) -> dict[str, object]:
+    """Load scalar RTAB-Map parameters from a deploy-owned YAML file."""
+    raw_path = str(value or "").strip()
+    if not raw_path:
+        return {}
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = deployment_root() / path
+    path = path.resolve()
+    if not path.is_file():
+        raise RuntimeError(f"params_file not found: {path}")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("params_file requires the PyYAML runtime dependency") from exc
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"cannot load params_file {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"params_file must contain a YAML mapping: {path}")
+    return validate_scalar_params(raw, f"params_file {path}")
+
+
+def legacy_rtabmap_profiles() -> dict[str, dict[str, object]]:
+    """Load frozen compatibility data. New profiles are not an extension API."""
+    raw = json.loads(LEGACY_PROFILE_FILE.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"invalid legacy profile file: {LEGACY_PROFILE_FILE}")
+    return raw
 
 
 def choose_provider_record(
@@ -140,14 +155,11 @@ def select_rtabmap_inputs(
 
 
 def resolve_rtabmap_overrides(
-    profile_name: str, raw: object | None
+    raw: object | None,
+    legacy_profile: str = "",
+    params_file: object | None = None,
 ) -> dict[str, object]:
-    """Merge a named profile with scalar deploy overrides."""
-    if profile_name and profile_name not in RTABMAP_PROFILES:
-        raise RuntimeError(
-            f"unknown rtabmap_profile {profile_name!r}; "
-            f"options: {sorted(RTABMAP_PROFILES)}"
-        )
+    """Merge legacy compatibility, deploy YAML, then inline overrides."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -155,11 +167,13 @@ def resolve_rtabmap_overrides(
             "rtabmap_params must be a mapping of parameter names to scalar values"
         )
 
-    normalized: dict[str, object] = dict(RTABMAP_PROFILES.get(profile_name, {}))
-    for key, value in raw.items():
-        if not isinstance(key, str) or not key.strip():
-            raise RuntimeError("rtabmap_params keys must be non-empty strings")
-        if isinstance(value, (dict, list, tuple)) or value is None:
-            raise RuntimeError(f"rtabmap_params[{key!r}] must be a scalar value")
-        normalized[key] = value
+    legacy_profiles = legacy_rtabmap_profiles()
+    if legacy_profile and legacy_profile not in legacy_profiles:
+        raise RuntimeError(
+            f"unknown legacy rtabmap_profile {legacy_profile!r}; "
+            f"known values: {sorted(legacy_profiles)}"
+        )
+    normalized: dict[str, object] = dict(legacy_profiles.get(legacy_profile, {}))
+    normalized.update(load_deployment_params_file(params_file))
+    normalized.update(validate_scalar_params(raw, "rtabmap_params"))
     return normalized

@@ -12,6 +12,7 @@ up by `rbnx boot`. Consumers (`scene`, `nav`) bind the contracts, not the
 SLAM engine.
 
 - Capability surface, config schema, and persistence layout: **[CAPABILITY.md](CAPABILITY.md)**.
+- Provider instance configuration reference: **[config.spec](config.spec)**.
 
 ## SLAM engines (`algo`)
 
@@ -21,9 +22,9 @@ SLAM engine.
 | `dlio` | real-robot 3D Livox + IMU | lidar3d + imu, needs a colcon ws at `/ws/install` |
 | `fastlio2` | **broken (drift)** — repro only | — |
 
-The launch branches on whichever sensors the deploy enabled, so the *same*
-`rtabmap` config maps a webots Tiago (2D lidar + RGBD) and a MID-360 robot
-(3D lidar + RGBD) without code changes.
+The launch branches on the provider roles bound by the deployment, so the same
+service supports 2D lidar, 3D lidar, RGB-D, and external odometry without
+robot-specific branches.
 
 ## How to integrate it on your robot
 
@@ -39,31 +40,29 @@ The launch branches on whichever sensors the deploy enabled, so the *same*
        url: https://github.com/syswonder/service-map-rbnx
        # manifest: package_manifest.jetson-native.yaml   # x86+docker is default
        config:
-         algo: rtabmap
-         sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }
-         rtabmap_inputs: [lidar, odom]
+         sensor_providers:
+           lidar3d: roof_lidar
+           rgb: front_camera
+           depth: front_camera
+           odom: base_chassis
          occupancy_sources: [lidar]
-         deskew_lidar: true    # requires per-point timestamps (MID-360 format 0)
-         base_frame: base_link
-         use_sim_time: false
-         rtabmap_profile: ranger_mini_v3
-         map_mode: mapping       # fresh runtime session; or localization
+         deskew_lidar: true
+         params_file: config/rtabmap_params.yaml
+         rtabmap_params:
+           Grid/FootprintLength: 0.84
+           Grid/FootprintWidth: 0.60
    ```
 3. `rbnx build -f robonix_manifest.yaml` then `rbnx boot -f robonix_manifest.yaml`.
 4. Consume the map: subscribe to `robonix/service/map/occupancy_grid` /
    `.../pointcloud` / `.../pose` (resolve them via atlas).
 
-For Ranger Mini v3, select `occupancy_sources: [lidar]` and use the named
-profile instead of copying slash-named parameters into every deploy. Together
-they match the two known-good v0.1 map databases: lidar-only occupancy
-(`Grid/Sensor=0`), 5 Hz detection, 0.05 m/rad node thresholds, and retained
-unlinked nodes. `rtabmap_params` remains an explicit per-parameter override.
+[`config/rtabmap_params.template.yaml`](config/rtabmap_params.template.yaml) is
+only a starting template. Copy it into the robot deployment repository and set
+`params_file`; Mapping never loads the upstream template at runtime. Inline
+`rtabmap_params` applies after the deploy-owned file.
 
 With external odometry, `deskew_lidar` compensates each PointCloud2 point in
-the odom frame before SLAM. Without external odometry, it enables ICP's
-constant-velocity deskewing; include `imu` in `rtabmap_inputs` to initialize
-the ICP orientation from the selected IMU provider. Raw Livox gyro/accel is
-first converted to an orientation estimate by `imu_filter_madgwick`.
+the odom frame before SLAM. Bind only the sensor roles Mapping should consume.
 
 ## Deployment targets
 
@@ -160,8 +159,8 @@ mapping_rbnx/
 
 ## Troubleshooting
 
-- **`/map` never populates** — no sensor enabled, or the wrong `sensors:`
-  flags. Check the `[start_engine] rtabmap scan2d=… scan3d=…` log line.
+- **`/map` never populates** — a provider binding is missing or points to the
+  wrong provider. Check the `[start_engine] rtabmap scan2d=… scan3d=…` line.
 - **`map_mode=localization` errors "no saved map"** — run a `mapping` session
   with that `map_id` first, and confirm `MAPPING_MAPS_DIR` is the same path
   (mounted) across runs.

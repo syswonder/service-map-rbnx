@@ -1,4 +1,7 @@
 import importlib.util
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +19,72 @@ def load_profiles():
     return module
 
 
-class RtabmapProfileTest(unittest.TestCase):
+class RtabmapConfigurationTest(unittest.TestCase):
+    def test_docker_start_mounts_manifest_directory_read_only(self):
+        bash_major = int(
+            subprocess.run(
+                ["bash", "-c", "printf %s ${BASH_VERSINFO[0]}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        if bash_major < 4:
+            self.skipTest("provider Docker wrapper requires Bash 4 or newer")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            deploy = root / "robot deploy"
+            fake_bin = root / "bin"
+            package.mkdir()
+            deploy.mkdir()
+            fake_bin.mkdir()
+            docker_args = root / "docker.args"
+            docker = fake_bin / "docker"
+            docker.write_text(
+                '#!/usr/bin/env bash\n'
+                'if [[ "${1:-}" == run ]]; then\n'
+                '  printf "%s\\n" "$@" > "$DOCKER_ARGS_FILE"\n'
+                "fi\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            rbnx = fake_bin / "rbnx"
+            rbnx.write_text('#!/usr/bin/env bash\necho /tmp/robonix-api\n')
+            rbnx.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "DOCKER_ARGS_FILE": str(docker_args),
+                    "RBNX_PACKAGE_ROOT": str(package),
+                    "RBNX_INVOCATION_CWD": str(deploy),
+                    "ROBONIX_MAPPING_FORCE": "docker",
+                    "DISPLAY": "",
+                }
+            )
+            subprocess.run(
+                ["bash", str(ROOT / "scripts" / "start.sh")],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            args = docker_args.read_text(encoding="utf-8").splitlines()
+            self.assertIn(f"RBNX_INVOCATION_CWD={deploy}", args)
+            self.assertIn(f"{deploy}:{deploy}:ro", args)
+
+    def test_legacy_profile_remains_compatible(self):
+        profiles = load_profiles()
+        values = profiles.resolve_rtabmap_overrides({}, "ranger_mini_v3")
+        self.assertEqual(values["Grid/FootprintLength"], 0.84)
+        self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
+
+    def test_unknown_legacy_profile_fails(self):
+        profiles = load_profiles()
+        with self.assertRaisesRegex(RuntimeError, "unknown legacy rtabmap_profile"):
+            profiles.resolve_rtabmap_overrides({}, "unknown_robot")
+
     def test_single_provider_can_be_selected_implicitly(self):
         profiles = load_profiles()
         record = SimpleNamespace(provider_id="mid360_lidar")
@@ -33,42 +101,68 @@ class RtabmapProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "multiple Atlas providers"):
             profiles.choose_provider_record(records, "", "lidar3d")
 
-    def test_ranger_profile_preserves_v01_baseline_and_filters_self_points(self):
-        profiles = load_profiles()
-        values = profiles.resolve_rtabmap_overrides("ranger_mini_v3", None)
-        self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
-        self.assertEqual(values["RGBD/LinearUpdate"], 0.05)
-        self.assertEqual(values["RGBD/AngularUpdate"], 0.05)
-        self.assertIs(values["RGBD/CreateOccupancyGrid"], True)
-        self.assertIs(values["Mem/NotLinkedNodesKept"], True)
-        self.assertEqual(values["Grid/FootprintLength"], 0.84)
-        self.assertEqual(values["Grid/FootprintWidth"], 0.60)
-        self.assertEqual(values["Grid/RangeMin"], 0.10)
+    def test_provider_bindings_are_the_sensor_enablement_source(self):
+        source = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        self.assertIn('providers = cfg.get("sensor_providers")', source)
+        self.assertIn("return {key: key in providers", source)
+        self.assertIn("config.sensors is deprecated", source)
 
-        # Regression for the 2026-07-13 temporary map: the invalid point was
-        # emitted at the lidar viewpoint (0.18, 0.0), inside the Ranger body.
-        self.assertLess(0.18, values["Grid/FootprintLength"] / 2.0)
-        self.assertLess(0.0, values["Grid/FootprintWidth"] / 2.0)
-
-    def test_explicit_values_override_profile(self):
+    def test_deployment_overrides_are_preserved(self):
         profiles = load_profiles()
         values = profiles.resolve_rtabmap_overrides(
-            "ranger_mini_v3",
             {"Rtabmap/DetectionRate": 2.0, "Grid/RangeMin": 0.20},
         )
         self.assertEqual(values["Rtabmap/DetectionRate"], 2.0)
         self.assertEqual(values["Grid/RangeMin"], 0.20)
 
-    def test_webots_profile_preserves_external_odom_during_rotation(self):
+    def test_deploy_params_file_is_relative_to_manifest_and_inline_wins(self):
         profiles = load_profiles()
-        values = profiles.resolve_rtabmap_overrides("webots_tiago", None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config" / "rtabmap.yaml"
+            path.parent.mkdir()
+            path.write_text(
+                "Rtabmap/DetectionRate: 2.0\nGrid/RangeMin: 0.25\n",
+                encoding="utf-8",
+            )
+            old = os.environ.get("RBNX_INVOCATION_CWD")
+            os.environ["RBNX_INVOCATION_CWD"] = directory
+            try:
+                values = profiles.resolve_rtabmap_overrides(
+                    {"Rtabmap/DetectionRate": 3.0},
+                    params_file="config/rtabmap.yaml",
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("RBNX_INVOCATION_CWD", None)
+                else:
+                    os.environ["RBNX_INVOCATION_CWD"] = old
+        self.assertEqual(values["Rtabmap/DetectionRate"], 3.0)
+        self.assertEqual(values["Grid/RangeMin"], 0.25)
 
-        self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
-        self.assertEqual(values["RGBD/LinearUpdate"], 0.03)
-        self.assertEqual(values["RGBD/AngularUpdate"], 0.03)
-        self.assertIs(values["RGBD/NeighborLinkRefining"], False)
-        self.assertIs(values["RGBD/ProximityBySpace"], False)
-        self.assertEqual(values["Reg/Strategy"], 0)
+    def test_missing_deploy_params_file_fails_loudly(self):
+        profiles = load_profiles()
+        with self.assertRaisesRegex(RuntimeError, "params_file not found"):
+            profiles.resolve_rtabmap_overrides({}, params_file="missing.yaml")
+
+    def test_nested_deployment_override_is_rejected(self):
+        profiles = load_profiles()
+        with self.assertRaisesRegex(RuntimeError, "must be a scalar"):
+            profiles.resolve_rtabmap_overrides({"nested": {"value": 1}})
+
+    def test_upstream_file_is_a_template_not_a_runtime_default(self):
+        text = (ROOT / "config" / "rtabmap_params.template.yaml").read_text()
+        self.assertIn("Rtabmap/DetectionRate: 1.0", text)
+        self.assertNotIn("Grid/FootprintLength", text)
+        self.assertNotIn("Grid/FootprintWidth", text)
+        launch = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertNotIn("rtabmap_params.template.yaml", launch)
+        self.assertNotIn("_load_default_rtabmap_params", launch)
+
+    def test_config_spec_documents_deploy_owned_file(self):
+        text = (ROOT / "config.spec").read_text()
+        self.assertIn("config/rtabmap_params.template.yaml", text)
+        self.assertIn("never loaded at runtime", text)
+        self.assertIn("sensor_providers:", text)
 
     def test_occupancy_source_is_policy_not_sensor_inference(self):
         profiles = load_profiles()
@@ -91,7 +185,7 @@ class RtabmapProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not resolved from Atlas"):
             profiles.resolve_occupancy_sources(["depth"], {"lidar"})
 
-    def test_ranger_inputs_drop_rgbd_without_hiding_atlas_capabilities(self):
+    def test_explicit_inputs_drop_rgbd_without_hiding_atlas_capabilities(self):
         profiles = load_profiles()
         resolved = {
             "lidar_topic": "/scanner/cloud",
@@ -117,7 +211,7 @@ class RtabmapProfileTest(unittest.TestCase):
             {"lidar_topic": "/scanner/cloud", "imu_topic": "/livox/imu"},
         )
 
-    def test_ranger_visual_fusion_keeps_lidar_rgbd_and_external_odom(self):
+    def test_visual_fusion_keeps_lidar_rgbd_and_external_odom(self):
         profiles = load_profiles()
         selected = profiles.select_rtabmap_inputs(
             ["lidar", "rgbd", "odom"],

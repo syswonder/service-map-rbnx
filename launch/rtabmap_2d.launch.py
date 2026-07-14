@@ -35,6 +35,7 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
 """
 import json
 import os
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -168,26 +169,6 @@ def _make_nodes(context, *args, **kwargs):
         # obstacles below the lidar plane (tables, chairs) the scan misses.
         "Grid/Sensor": grid_sensor,
         "Grid/FromDepth": "true" if have_rgbd else "false",
-        # Persist per-node occupancy grids at insertion time. Saved maps must
-        # reload into a usable /map later; RTAB-Map explicitly warns that nodes
-        # inserted without this cache can make publish_map return an empty grid,
-        # which breaks save/load and scene room overlays.
-        "RGBD/CreateOccupancyGrid": "true",
-        "Grid/RangeMax": "6.0",
-        "Grid/CellSize": "0.05",
-        "Grid/RayTracing": "true",
-        # 3D pointcloud → 2D grid: when the only lidar is 3D, rtabmap
-        # projects it to the planar grid via Grid/FromObstacles using
-        # the same height clamp as the depth path.
-        "Grid/3D": "false",
-        "Grid/NormalsSegmentation": "false",
-        # Height clamps tuned for the floor unevenness of the real
-        # deploy environment (4F corridor): a stricter 0.05 m ground
-        # cutoff misclassified slope/cable bumps as obstacles, while
-        # the original 1.5 m obstacle cap clipped door frames + tall
-        # shelves. Raise both bounds.
-        "Grid/MaxObstacleHeight": "1.0",
-        "Grid/MaxGroundHeight": "0.1",
         # Memory mode follows map_mode. Mapping: incremental (add nodes,
         # grow the graph). Localization: frozen graph (IncrementalMemory
         # off) initialised with all saved nodes, so rtabmap relocalises
@@ -195,20 +176,6 @@ def _make_nodes(context, *args, **kwargs):
         # boot — the stable-origin property scene's per-map_id store needs.
         "Mem/IncrementalMemory": "false" if localization else "true",
         "Mem/InitWMWithAllNodes": "true" if localization else "false",
-        "Reg/Strategy": "1",        # 0=Visual, 1=ICP, 2=Visual+ICP
-        "Reg/Force3DoF": "true",
-        "Optimizer/Strategy": "1",  # g2o
-        "RGBD/NeighborLinkRefining": "true",
-        "RGBD/ProximityBySpace": "true",
-        # Conservative defaults work for physical robots. Fast simulators may
-        # opt into a denser profile through config.rtabmap_params.
-        "RGBD/AngularUpdate": "0.1",
-        "RGBD/LinearUpdate": "0.1",
-        "Vis/MinInliers": "12",
-        "Rtabmap/DetectionRate": "1.0",
-        "Icp/MaxCorrespondenceDistance": "0.2",
-        "Icp/MaxTranslation": "0.5",
-        "Icp/MaxRotation": "0.78",  # ~45°
     }
 
     if overrides_file:

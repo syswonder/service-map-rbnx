@@ -73,6 +73,22 @@ fi
 declare -a EXTRA_MOUNTS=()
 # NOTE: RBNX_CONFIG_FILE intentionally NOT mounted — config arrives via
 # Driver(CMD_INIT, config_json) over gRPC, never a file.
+# A deploy-owned params_file is resolved relative to the robot manifest, not
+# this package checkout. rbnx deploy exports that directory; preserve the same
+# absolute path inside Docker so both relative paths and deploy-local absolute
+# paths resolve exactly as they do in native mode.
+declare -a DEPLOY_ARGS=()
+if [[ -n "${RBNX_INVOCATION_CWD:-}" ]]; then
+    if [[ ! -d "$RBNX_INVOCATION_CWD" ]]; then
+        echo "[mapping/start] RBNX_INVOCATION_CWD is not a directory: $RBNX_INVOCATION_CWD" >&2
+        exit 2
+    fi
+    DEPLOY_DIR="$(cd "$RBNX_INVOCATION_CWD" && pwd -P)"
+    DEPLOY_ARGS=(
+        -e "RBNX_INVOCATION_CWD=$DEPLOY_DIR"
+        -v "$DEPLOY_DIR:$DEPLOY_DIR:ro"
+    )
+fi
 # If set, keep saved maps in an explicit runtime directory instead of the
 # provider cache checkout. CI uses this to keep runs isolated.
 if [[ -n "${MAPPING_MAPS_DIR:-}" ]]; then
@@ -107,6 +123,7 @@ exec docker run --rm \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
     -e MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-true}" \
     -e MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-/mapping/maps}" \
+    "${DEPLOY_ARGS[@]}" \
     "${X11_ARGS[@]}" \
     -v "$(pwd)":/mapping \
     -v "$(rbnx path robonix-api)":/robonix-api:ro \

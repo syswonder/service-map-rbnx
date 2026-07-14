@@ -4,12 +4,11 @@
 # block from the deploy manifest). One package, multiple algorithms:
 #
 #   algo: rtabmap   — ROS2-native graph SLAM (apt-installable). Sensor
-#                     inputs are NOT hardcoded: the deploy manifest's
-#                     `sensors:` block decides which of {lidar2d,
-#                     lidar3d, rgb, rgbd, odom, imu} are wired in.
+#                     inputs are NOT hardcoded: deployment provider bindings
+#                     decide which sensor roles are wired in.
 #                     Examples:
-#                       webots tiago        — sensors.lidar2d + sensors.rgbd + odom
-#                       real robot (mid360) — sensors.lidar3d + sensors.rgbd + odom + imu
+#                       simulator — lidar2d + RGB-D + odom providers
+#                       robot     — lidar3d + RGB-D + odom providers
 #                     The launch file branches on what's enabled
 #                     (`subscribe_scan` for 2D LaserScan,
 #                     `subscribe_scan_cloud` for 3D PointCloud2,
@@ -23,10 +22,7 @@
 # slam_toolbox + cartographer were dropped after rtabmap consistently
 # beat them in head-to-head testing.
 #
-# Sensor selection drives BOTH which atlas contracts atlas_bridge
-# resolves AND which subscriptions the launch file enables — there is
-# no implicit "if 2D scan exists, use it" coupling. Specify what the
-# robot has; the package wires the rest.
+# Provider bindings drive both Atlas resolution and launch subscriptions.
 #
 # Outputs (FIXED capability surface — same set declared regardless
 # of which algo is selected; consumers care about contracts, not algos):
@@ -61,17 +57,18 @@ start: bash scripts/start.sh
 
 # ── config (deploy `config:` block → Driver(CMD_INIT)) ──────────────────────
 # Required:
-#   algo:    rtabmap | dlio | fastlio2[broken]      (rtabmap recommended)
-#   sensors: { lidar2d|lidar3d|rgb|depth|imu|odom: bool }  what the robot has
-#   sensor_providers: {sensor_key: provider_id}  required when a contract has
-#                                                 more than one provider
-#   rtabmap_inputs: [lidar|rgbd|imu|odom]  which resolved streams feed RTAB-Map
+#   sensor_providers: {sensor_role: provider_id} enables each Mapping input
+#                     and pins its Atlas provider
+# Optional:
+#   algo: rtabmap | dlio | fastlio2[broken] (default: rtabmap)
 #   occupancy_sources: [lidar|depth]  explicit 2D occupancy policy (optional;
 #                                      legacy deploys retain automatic choice)
+#   params_file: deploy-owned RTAB-Map YAML, relative to robot manifest
+#   rtabmap_params: optional final scalar overrides
 #   deskew_lidar: true requires a PointCloud2 per-point timestamp field. With
 #                        external odom it uses odom TF; otherwise ICP deskews.
-# Frames / time (optional; defaults = webots tiago):
-#   base_frame, odom_frame, map_frame, use_sim_time
+# Frames / time (optional; defaults: base_link, odom, wall clock):
+#   base_frame, odom_frame, use_sim_time
 # Map persistence (optional; rtabmap only):
 #   map_id:    stable id for this map. Bind the SAME id in the scene service
 #              so its per-map_id semantic store anchors to this spatial map.

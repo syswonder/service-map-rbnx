@@ -159,6 +159,12 @@ class RtabmapProfileTest(unittest.TestCase):
                 ["lidar", "rgbd"], {"lidar_topic": "/scanner/cloud"}
             )
 
+    def test_rtabmap_exit_terminates_the_mapping_launch(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn("OnProcessExit(", source)
+        self.assertIn("target_action=rtabmap_node", source)
+        self.assertIn('Shutdown(reason="RTAB-Map engine exited")', source)
+
 
 if __name__ == "__main__":
     unittest.main()

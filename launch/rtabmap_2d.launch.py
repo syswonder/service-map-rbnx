@@ -36,7 +36,15 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
 import json
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    EmitEvent,
+    ExecuteProcess,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -276,6 +284,17 @@ def _make_nodes(context, *args, **kwargs):
         remappings=rtabmap_remappings,
     )
 
+    # RTAB-Map is the mapping engine, not an optional sidecar. If it exits,
+    # terminate the launch immediately instead of leaving rtabmap_viz and the
+    # pose adapter alive. Otherwise the package process keeps running and Soma
+    # continues to report Mapping ACTIVE even though /map has no publisher.
+    rtabmap_exit_guard = RegisterEventHandler(
+        OnProcessExit(
+            target_action=rtabmap_node,
+            on_exit=[EmitEvent(event=Shutdown(reason="RTAB-Map engine exited"))],
+        )
+    )
+
     nodes = []
 
     filtered_imu_topic = "/rtabmap/imu/data"
@@ -323,7 +342,7 @@ def _make_nodes(context, *args, **kwargs):
             ],
         ))
 
-    nodes.append(rtabmap_node)
+    nodes.extend([rtabmap_node, rtabmap_exit_guard])
 
     # When the deploy didn't supply external odom, run rtabmap's own
     # ICP-odometry node off whichever lidar source we have. icp_odometry

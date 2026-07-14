@@ -25,6 +25,24 @@ RTABMAP_PROFILES: dict[str, dict[str, object]] = {
         # without hiding legitimate close obstacles outside the footprint.
         "Grid/RangeMin": 0.10,
     },
+    "webots_tiago": {
+        "RGBD/CreateOccupancyGrid": True,
+        # Webots provides deterministic external odometry. Keep every
+        # meaningful simulator pose instead of throttling the graph to the
+        # physical-robot default of one node per second.
+        "Rtabmap/DetectionRate": 5.0,
+        "RGBD/LinearUpdate": 0.03,
+        "RGBD/AngularUpdate": 0.03,
+        "Mem/NotLinkedNodesKept": True,
+        # Do not replace exact odometry neighbor links with scan matching.
+        # Repetitive walls during in-place rotation are under-constrained for
+        # ICP and previously produced visibly duplicated walls.
+        "RGBD/NeighborLinkRefining": False,
+        "RGBD/ProximityBySpace": False,
+        # Visual registration remains available for global relocalization,
+        # while local graph geometry continues to come from simulator odom.
+        "Reg/Strategy": 0,
+    },
 }
 
 

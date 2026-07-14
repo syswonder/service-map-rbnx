@@ -59,6 +59,17 @@ class RtabmapProfileTest(unittest.TestCase):
         self.assertEqual(values["Rtabmap/DetectionRate"], 2.0)
         self.assertEqual(values["Grid/RangeMin"], 0.20)
 
+    def test_webots_profile_preserves_external_odom_during_rotation(self):
+        profiles = load_profiles()
+        values = profiles.resolve_rtabmap_overrides("webots_tiago", None)
+
+        self.assertEqual(values["Rtabmap/DetectionRate"], 5.0)
+        self.assertEqual(values["RGBD/LinearUpdate"], 0.03)
+        self.assertEqual(values["RGBD/AngularUpdate"], 0.03)
+        self.assertIs(values["RGBD/NeighborLinkRefining"], False)
+        self.assertIs(values["RGBD/ProximityBySpace"], False)
+        self.assertEqual(values["Reg/Strategy"], 0)
+
     def test_occupancy_source_is_policy_not_sensor_inference(self):
         profiles = load_profiles()
         values = profiles.resolve_occupancy_sources(

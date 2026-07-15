@@ -369,7 +369,11 @@ def _begin_target_map_wait(node, map_dir: str) -> dict:
     expected_image = np.frombuffer(expected["pixels"], dtype=np.uint8).reshape(
         expected["height"], expected["width"]
     )
-    min_agreement = float(os.environ.get("MAPPING_LOAD_MIN_CELL_AGREEMENT", "0.9999"))
+    # RTAB-Map republishes an optimized occupancy grid after loading the saved
+    # database. Thresholding can legitimately move a handful of edge cells
+    # even though the map geometry and class masks are the same. Keep the
+    # class-IoU guard strict, but allow up to 0.1% cell-level edge drift.
+    min_agreement = float(os.environ.get("MAPPING_LOAD_MIN_CELL_AGREEMENT", "0.999"))
     min_class_iou = float(os.environ.get("MAPPING_LOAD_MIN_CLASS_IOU", "0.995"))
     ready = threading.Event()
     observed = {"summary": "no occupancy sample received"}

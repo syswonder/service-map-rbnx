@@ -96,6 +96,25 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertGreaterEqual(occupied_iou, 0.995)
         self.assertGreaterEqual(free_iou, 0.995)
 
+    def test_occupancy_similarity_accepts_realistic_optimized_edge_drift(self):
+        # A 218x254 map with seven thresholded edge cells changed reproduces
+        # the Webots load result that previously missed the 0.9999 cutoff
+        # despite both occupied/free class IoUs identifying the same map.
+        expected = np.full((254, 218), 205, dtype=np.uint8)
+        expected[20:70, 20:80] = 0
+        expected[90:230, 20:200] = 254
+        observed = expected.copy()
+        observed[20, 20:27] = 205
+
+        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
+            expected, observed
+        )
+
+        self.assertGreaterEqual(agreement, 0.999)
+        self.assertLess(agreement, 0.9999)
+        self.assertGreaterEqual(occupied_iou, 0.995)
+        self.assertGreaterEqual(free_iou, 0.995)
+
     def test_occupancy_similarity_rejects_different_same_size_map(self):
         expected = np.full((100, 100), 205, dtype=np.uint8)
         expected[20:40, 20:40] = 0

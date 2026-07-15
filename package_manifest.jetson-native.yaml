@@ -33,7 +33,9 @@ capabilities:
   - name: robonix/service/map/pointcloud
   - name: robonix/service/map/pose
   - name: robonix/service/map/odom
+  - name: robonix/service/map/lifecycle
   - name: robonix/service/map/save_map
+  - name: robonix/service/map/list_maps
   - name: robonix/service/map/load_map
   - name: robonix/service/map/pose_estimate
   - name: robonix/service/map/switch_mode

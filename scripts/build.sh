@@ -57,8 +57,7 @@ if command -v rbnx >/dev/null 2>&1; then
         source "/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
         set -u
         ROS2_IDL="$PKG/rbnx-build/codegen/ros2_idl"
-        echo "[build] colcon build (Robonix ROS 2 interfaces)"
-        (cd "$ROS2_IDL" && colcon build)
+        bash "$PKG/scripts/build_ros2_overlay.sh" "$ROS2_IDL"
     fi
 else
     echo "[build] WARNING: rbnx not in PATH — skipping proto codegen"
@@ -102,7 +101,7 @@ case "$TARGET" in
         # with the lifecycle broadcast disabled.
         IDL="$PKG/rbnx-build/codegen/ros2_idl"
         if [[ -d "$IDL/src/map" ]]; then
-            echo "[build] colcon build ros2_idl (map interface pkg) in $IMG"
+            echo "[build] build ros2_idl map interface package in $IMG"
             # --user: build/ install/ land on the HOST bind mount — as root
             # they would survive a later non-root cleanup (RBNX_BUILD_CLEAN,
             # rbnx clean --cache). HOME=/tmp gives colcon a writable home
@@ -110,8 +109,8 @@ case "$TARGET" in
             docker run --rm --entrypoint bash --user "$(id -u):$(id -g)" -e HOME=/tmp \
                 -v "$PKG":/mapping "$IMG" -lc \
                 "source /opt/ros/\${ROS_DISTRO:-humble}/setup.bash && \
-                 cd /mapping/rbnx-build/codegen/ros2_idl && \
-                 colcon build --packages-up-to map"
+                 bash /mapping/scripts/build_ros2_overlay.sh \
+                   /mapping/rbnx-build/codegen/ros2_idl"
         else
             echo "[build] WARNING: ros2_idl/src/map missing — lifecycle broadcast will be disabled"
         fi

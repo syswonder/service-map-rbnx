@@ -78,6 +78,11 @@ One package, three targets (selected by the deploy `manifest:` field — see
 Add a target by adding a `package_manifest.<target>.yaml` plus a case branch
 in `scripts/build.sh` — the rest of the package is unchanged.
 
+The generated ROS 2 overlay intentionally builds only Robonix's custom `map`
+interface package. Standard interfaces such as `sensor_msgs` continue to come
+from the target's ROS 2 Humble installation, preserving its support libraries
+and CMake exports for consumers such as `cv_bridge`.
+
 ## Saving & re-using a map
 
 Mapping starts with a fresh runtime database. Call `save_map(map_id)` after
@@ -150,6 +155,7 @@ mapping_rbnx/
 ├── launch/rtabmap_2d.launch.py           sensor-agnostic rtabmap launch
 ├── scripts/
 │   ├── build.sh                          per-target build
+│   ├── build_ros2_overlay.sh             isolated map interface build
 │   ├── start.sh                          native↔docker dispatch
 │   ├── start_engine.sh                   in-container SLAM launcher
 │   ├── start_native.sh                   host-process launcher

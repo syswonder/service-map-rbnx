@@ -49,12 +49,22 @@ set -u
 
 CT="${ROBONIX_MAPPING_CONTAINER:-robonix_mapping}"
 IMG="${ROBONIX_MAPPING_IMAGE:-robonix-mapping}"
+XHOST_AUTHORIZED=false
+XHOST_DISPLAY=""
 
 cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "$XHOST_AUTHORIZED" == true ]]; then
+        DISPLAY="$XHOST_DISPLAY" xhost -local:docker >/dev/null 2>&1 || true
+        XHOST_AUTHORIZED=false
+    fi
     docker stop "$CT" >/dev/null 2>&1 || true
-    kill -- "-$$" 2>/dev/null || true
+    return "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 docker rm -f "$CT" >/dev/null 2>&1 || true
 mkdir -p rbnx-build/data
@@ -96,25 +106,42 @@ if [[ -n "${MAPPING_MAPS_DIR:-}" ]]; then
     EXTRA_MOUNTS+=(-v "${MAPPING_MAPS_DIR}:${MAPPING_MAPS_DIR}")
 fi
 
-# X11 for rtabmap_viz inside the container (auto-detect DISPLAY).
-if [[ -z "${DISPLAY:-}" ]]; then
-    if command -v xset &>/dev/null; then
+# X11 is an explicit opt-in. In particular, a missing DISPLAY must not cause
+# an unattended/headless deployment to discover a desktop and widen its X
+# server ACL. Any ACL entry we add is revoked by cleanup after docker exits.
+MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
+VIZ_ENABLED=false
+case "${MAPPING_ENABLE_VIZ,,}" in
+    1|true|yes|on) VIZ_ENABLED=true ;;
+esac
+declare -a X11_ARGS=()
+if [[ "$VIZ_ENABLED" == true ]]; then
+    if [[ -z "${DISPLAY:-}" ]] && command -v xset &>/dev/null; then
         for d in :0 :1 :10; do
-            if DISPLAY="$d" xset q &>/dev/null; then export DISPLAY="$d"; break; fi
+            if DISPLAY="$d" xset q &>/dev/null; then
+                export DISPLAY="$d"
+                break
+            fi
         done
     fi
-fi
-declare -a X11_ARGS=()
-if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
-    xhost +local:docker >/dev/null 2>&1 || true
-    X11_ARGS=(-e DISPLAY="$DISPLAY" -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix:rw)
+    if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
+        if xhost +local:docker >/dev/null 2>&1; then
+            XHOST_AUTHORIZED=true
+            XHOST_DISPLAY="$DISPLAY"
+            X11_ARGS=(-e DISPLAY="$DISPLAY" -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix:rw)
+        else
+            echo "[mapping/start] xhost authorization failed; visualization disabled" >&2
+        fi
+    fi
 fi
 
-exec docker run --rm \
+docker run --rm \
     --name "$CT" \
     --network host \
     --ipc=host \
     -e ROBONIX_ATLAS="${ROBONIX_ATLAS:-127.0.0.1:50051}" \
+    -e ROBONIX_PROVIDER_BIND_HOST="${ROBONIX_PROVIDER_BIND_HOST:-0.0.0.0}" \
+    -e ROBONIX_ADVERTISE_HOST="${ROBONIX_ADVERTISE_HOST:-}" \
     -e ROBONIX_CAPABILITY_ID="${ROBONIX_CAPABILITY_ID:-mapping}" \
     -e ROBONIX_PKG_HOST_DIR="$(pwd)" \
     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
@@ -122,7 +149,7 @@ exec docker run --rm \
     -e CYCLONEDDS_URI="${CYCLONEDDS_URI:-}" \
     "${ZENOH_ARGS[@]}" \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
-    -e MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-true}" \
+    -e MAPPING_ENABLE_VIZ="$MAPPING_ENABLE_VIZ" \
     -e MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-/mapping/maps}" \
     "${DEPLOY_ARGS[@]}" \
     "${X11_ARGS[@]}" \

@@ -61,6 +61,7 @@ RUN apt-get update \
         ros-humble-tf2-ros \
         ros-humble-tf-transformations \
         ros-humble-pointcloud-to-laserscan \
+        ros-humble-rmw-cyclonedds-cpp \
         ros-humble-rmw-zenoh-cpp \
  && rm -rf /var/lib/apt/lists/*
 

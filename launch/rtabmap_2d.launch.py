@@ -213,7 +213,7 @@ def _make_nodes(context, *args, **kwargs):
         ))
     if have_odom:
         rtabmap_remappings.append(("odom", odom_topic))
-    elif have_scan or have_scan_cloud:
+    elif have_scan or have_scan_cloud or have_rgbd:
         rtabmap_remappings.append(("odom", "/rtabmap/odom"))
     if have_rgbd:
         rtabmap_remappings += [
@@ -311,10 +311,10 @@ def _make_nodes(context, *args, **kwargs):
 
     nodes.extend([rtabmap_node, rtabmap_exit_guard])
 
-    # When the deploy didn't supply external odom, run rtabmap's own
-    # ICP-odometry node off whichever lidar source we have. icp_odometry
-    # consumes either /scan (LaserScan) or /scan_cloud (PointCloud2);
-    # we pick based on what's wired up.
+    # When the deploy didn't supply external odom, run RTAB-Map's own
+    # odometry from the strongest available sensor path. Prefer LiDAR ICP
+    # when a scan is wired; otherwise an RGB-D-only deployment must run
+    # rgbd_odometry or the SLAM node waits forever on /rtabmap/odom.
     if not have_odom and (have_scan or have_scan_cloud):
         icp_odom_remappings = [("odom", "/rtabmap/odom")]
         if have_scan_cloud:
@@ -348,6 +348,31 @@ def _make_nodes(context, *args, **kwargs):
             remappings=icp_odom_remappings,
         )
         nodes.append(icp_odom)
+    elif not have_odom and have_rgbd:
+        rgb_info = (rgb_info_topic if rgb_info_topic != _NONE
+                    else _derive_camera_info(rgb_topic))
+        rgbd_odom = Node(
+            package="rtabmap_odom",
+            executable="rgbd_odometry",
+            name="rgbd_odometry",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "frame_id": base_frame,
+                "odom_frame_id": odom_frame,
+                "publish_tf": True,
+                "approx_sync": True,
+                "queue_size": 30,
+                "wait_for_transform": 1.5,
+            }],
+            remappings=[
+                ("rgb/image", rgb_topic),
+                ("rgb/camera_info", rgb_info),
+                ("depth/image", depth_topic),
+                ("odom", "/rtabmap/odom"),
+            ],
+        )
+        nodes.append(rgbd_odom)
 
     if enable_viz:
         viz_params = {

@@ -23,6 +23,8 @@ class PackageManifestTests(unittest.TestCase):
     def test_all_targets_declare_the_same_capabilities(self) -> None:
         expected = capabilities(MANIFESTS[0])
         self.assertTrue(expected)
+        self.assertNotIn("robonix/service/map/driver", expected)
+        self.assertNotIn("robonix/lifecycle/driver", expected)
         for manifest in MANIFESTS[1:]:
             with self.subTest(manifest=manifest):
                 self.assertEqual(expected, capabilities(manifest))

@@ -246,6 +246,16 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn('(\"imu/data_raw\", imu_topic)', source)
         self.assertIn('(\"imu\", filtered_imu_topic)', source)
 
+    def test_rgbd_only_profile_starts_visual_odometry(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn("elif not have_odom and have_rgbd:", source)
+        self.assertIn('executable="rgbd_odometry"', source)
+        self.assertIn('(\"rgb/image\", rgb_topic)', source)
+        self.assertIn('(\"depth/image\", depth_topic)', source)
+        self.assertIn(
+            "elif have_scan or have_scan_cloud or have_rgbd:", source
+        )
+
     def test_requested_rtabmap_input_must_resolve(self):
         profiles = load_profiles()
         with self.assertRaisesRegex(RuntimeError, "rgbd input.*not resolved"):

@@ -27,7 +27,6 @@ start: ROBONIX_MAPPING_FORCE=docker bash scripts/start.sh
 stop: ROBONIX_MAPPING_FORCE=docker bash scripts/stop.sh
 
 capabilities:
-  - name: robonix/service/map/driver
   - name: robonix/service/map/occupancy_grid
   - name: robonix/service/map/pointcloud
   - name: robonix/service/map/pose

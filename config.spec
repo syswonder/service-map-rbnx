@@ -100,6 +100,12 @@ optional:
     type: integer_or_string
     default: 8091
     description: Set to 0 or an empty string to disable the Mapping web UI.
+  webui_host:
+    type: string
+    default: 127.0.0.1
+    description: >-
+      Bind address for the unauthenticated Mapping web UI. Keep the loopback
+      default unless an authenticated deployment overlay protects access.
 
 advanced_compatibility:
   rtabmap_inputs:

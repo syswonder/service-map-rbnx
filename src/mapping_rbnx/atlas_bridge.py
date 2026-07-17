@@ -608,8 +608,16 @@ def init(cfg: dict):
     # the two views of "current mode" cannot drift apart under a later edit.
     map_ops.set_current_mode(active_mode)
     _webui_port = str(cfg.get("webui_port", 8091)).strip()
+    _webui_host = str(cfg.get(
+        "webui_host", os.environ.get("MAPPING_WEBUI_HOST", "127.0.0.1")
+    )).strip() or "127.0.0.1"
     if _webui_port and _webui_port != "0":
         os.environ["MAPPING_WEBUI_PORT"] = _webui_port
+        os.environ["MAPPING_WEBUI_HOST"] = _webui_host
+    else:
+        # Deployment config is authoritative: an inherited shell value must
+        # not silently re-enable this unauthenticated admin plane.
+        os.environ.pop("MAPPING_WEBUI_PORT", None)
     webui.set_active_db_hint(_active_db)
     webui.maybe_start()
     return Ok()

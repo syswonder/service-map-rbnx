@@ -108,9 +108,11 @@ maps/lab_3f/rtabmap.db  occupancy.pgm  occupancy.yaml  occupancy.png  cloud.pcd 
 
 ## Web UI (live map + runtime map ops)
 
-Set `MAPPING_WEBUI_PORT` (e.g. `8091`) to enable a dependency-light operator
-page (stdlib `http.server` + Pillow), served on `0.0.0.0` so it's reachable
-from a laptop on the robot LAN (`http://<robot-ip>:8091`). Off by default.
+A dependency-light operator page (stdlib `http.server` + Pillow) is enabled on
+port `8091` by default; set deployment config `webui_port: 0` to disable it.
+It binds `127.0.0.1` by default because the map controls are unauthenticated.
+An authenticated overlay deployment may explicitly set `webui_host` (or
+`MAPPING_WEBUI_HOST`); otherwise use the local browser or an SSH tunnel.
 
 It runs **inside the mapping bridge process**, so its buttons call the same
 `map_ops` impls the gRPC/MCP capabilities use — no extra round trip — and it

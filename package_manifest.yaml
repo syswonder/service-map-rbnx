@@ -82,6 +82,9 @@ start: bash scripts/start.sh
 #   map_mode:  mapping (default; build/extend) | localization (load read-only,
 #              stable map frame across restarts — needs a saved map_id first).
 #   reset_map: true to start a named map fresh (mapping mode only).
+# Operator page (optional):
+#   webui_port: 0 disables it; any other port enables it.
+#   webui_host: bind host, default 127.0.0.1. This UI is unauthenticated.
 # Saved maps live under {MAPPING_MAPS_DIR}/{map_id}/ as rtabmap.db +
 # occupancy.pgm/.yaml/.png + cloud.pcd + meta.yaml (offline-previewable).
 

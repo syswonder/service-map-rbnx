@@ -12,8 +12,10 @@ Runs inside the mapping bridge process, so its buttons call the same
 map_ops impls the gRPC/MCP capabilities use — no extra round trip. It reads
 the live map/pose off its own dedicated rclpy node (see _ensure_subscriptions).
 
-Disabled by default; set MAPPING_WEBUI_PORT (e.g. 8091) to enable. The server
-binds 0.0.0.0 so it's reachable from the operator's laptop on the robot LAN.
+The Mapping bridge enables this on port 8091 by default; deployment config may
+set ``webui_port: 0`` to disable it. The server binds 127.0.0.1 by default
+because it exposes unauthenticated map operations; an authenticated deployment
+may explicitly set MAPPING_WEBUI_HOST otherwise.
 """
 from __future__ import annotations
 
@@ -529,13 +531,10 @@ def maybe_start() -> None:
     port = os.environ.get("MAPPING_WEBUI_PORT", "").strip()
     if not port or _server is not None:
         return
-    # Bind 0.0.0.0 by default so the UI is reachable from the operator's
-    # machine over the deployment network (here: the Tailscale tailnet, which
-    # is itself access-controlled — only approved devices can reach it). This
-    # UI is an unauthenticated admin plane (delete / reset / load map, pose
-    # seed), so on an untrusted LAN lock it down with MAPPING_WEBUI_HOST=
-    # 127.0.0.1 (config webui_host) and reach it via VNC / SSH tunnel.
-    host = os.environ.get("MAPPING_WEBUI_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    # This is an unauthenticated admin plane (delete/reset/load/pose seed), so
+    # fail safe on loopback. A deployment that has an authenticated overlay
+    # network may opt into another host explicitly through `webui_host`.
+    host = os.environ.get("MAPPING_WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
         srv = ThreadingHTTPServer((host, int(port)), _Handler)
     except Exception as e:  # noqa: BLE001

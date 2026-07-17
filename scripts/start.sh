@@ -150,6 +150,7 @@ docker run --rm \
     "${ZENOH_ARGS[@]}" \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
     -e MAPPING_ENABLE_VIZ="$MAPPING_ENABLE_VIZ" \
+    -e MAPPING_WEBUI_HOST="${MAPPING_WEBUI_HOST:-127.0.0.1}" \
     -e MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-/mapping/maps}" \
     "${DEPLOY_ARGS[@]}" \
     "${X11_ARGS[@]}" \

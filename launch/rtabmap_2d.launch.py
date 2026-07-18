@@ -111,6 +111,14 @@ def _make_nodes(context, *args, **kwargs):
     have_odom = bool(odom_topic) and odom_topic != _NONE
     have_imu = bool(imu_topic) and imu_topic != _NONE
 
+    # RTAB-Map has two mutually exclusive odometry input modes. A non-empty
+    # odom_frame_id selects TF lookup mode; an empty value makes it subscribe
+    # to the remapped odom topic. Deployments that explicitly resolve an
+    # odometry capability must use the topic so odom_sensor_sync can align the
+    # sensor packet with the matching Odometry sample. Internal RTAB-Map
+    # odometry keeps TF mode because its odometry node publishes odom -> base.
+    rtabmap_odom_frame = "" if have_odom else odom_frame
+
     if deskew_lidar and not have_scan_cloud:
         raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
 
@@ -140,7 +148,7 @@ def _make_nodes(context, *args, **kwargs):
     rtabmap_params = {
         "use_sim_time": use_sim_time,
         "frame_id": base_frame,
-        "odom_frame_id": odom_frame,
+        "odom_frame_id": rtabmap_odom_frame,
         "map_frame_id": "map",
         "publish_tf": True,
         # Sensor subscriptions branch on what the deploy actually has.
@@ -378,7 +386,7 @@ def _make_nodes(context, *args, **kwargs):
         viz_params = {
             "use_sim_time": use_sim_time,
             "frame_id": base_frame,
-            "odom_frame_id": odom_frame,
+            "odom_frame_id": rtabmap_odom_frame,
             "subscribe_scan": have_scan,
             "subscribe_scan_cloud": have_scan_cloud,
             "subscribe_rgb": False,

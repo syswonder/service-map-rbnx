@@ -111,13 +111,11 @@ def _make_nodes(context, *args, **kwargs):
     have_odom = bool(odom_topic) and odom_topic != _NONE
     have_imu = bool(imu_topic) and imu_topic != _NONE
 
-    # RTAB-Map has two mutually exclusive odometry input modes. A non-empty
-    # odom_frame_id selects TF lookup mode; an empty value makes it subscribe
-    # to the remapped odom topic. Deployments that explicitly resolve an
-    # odometry capability must use the topic so odom_sensor_sync can align the
-    # sensor packet with the matching Odometry sample. Internal RTAB-Map
-    # odometry keeps TF mode because its odometry node publishes odom -> base.
-    rtabmap_odom_frame = "" if have_odom else odom_frame
+    # Use the canonical odom -> base TF at each sensor timestamp. A compliant
+    # odometry provider publishes both nav_msgs/Odometry and the matching TF;
+    # controllers and state consumers use the topic, while RTAB-Map uses TF.
+    # Keeping one mode avoids independently synchronizing the same pose twice.
+    rtabmap_odom_frame = odom_frame
 
     if deskew_lidar and not have_scan_cloud:
         raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
@@ -160,7 +158,7 @@ def _make_nodes(context, *args, **kwargs):
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
         "subscribe_odom_info": False,
-        "odom_sensor_sync": have_odom,
+        "odom_sensor_sync": False,
         "approx_sync": True,
         "queue_size": 30,
         # webots emits image stamps slightly ahead of the dynamic TF

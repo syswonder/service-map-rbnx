@@ -240,14 +240,13 @@ class RtabmapConfigurationTest(unittest.TestCase):
         )
         self.assertIn("external odom remains owned by its provider", source)
 
-    def test_external_odom_uses_topic_subscription_mode(self):
+    def test_external_odom_uses_canonical_tf_mode(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
-        self.assertIn(
-            'rtabmap_odom_frame = "" if have_odom else odom_frame', source
-        )
+        self.assertIn('rtabmap_odom_frame = odom_frame', source)
         self.assertEqual(
             source.count('"odom_frame_id": rtabmap_odom_frame'), 2
         )
+        self.assertIn('"odom_sensor_sync": False', source)
         self.assertIn('rtabmap_remappings.append(("odom", odom_topic))', source)
 
     def test_raw_livox_imu_is_filtered_before_icp(self):

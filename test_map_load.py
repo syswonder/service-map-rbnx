@@ -4,9 +4,8 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
-
-import numpy as np
 
 from mapping_rbnx import map_ops
 
@@ -44,27 +43,35 @@ class LoadMapTransactionTest(unittest.TestCase):
             ),
             patch.object(
                 map_ops,
-                "_begin_target_map_wait",
-                side_effect=lambda *_: order.append("subscribe") or barrier,
-            ),
-            patch.object(
-                map_ops,
                 "_publish_full_map",
                 side_effect=lambda *_args, **_kwargs: order.append("publish")
                 or (True, "published optimized global map"),
             ),
             patch.object(
                 map_ops,
+                "_begin_target_map_wait",
+                side_effect=lambda *_: order.append("subscribe") or barrier,
+            ),
+            patch.object(
+                map_ops,
                 "_finish_target_map_wait",
                 side_effect=lambda *_: order.append("verify")
-                or (True, "verified target occupancy"),
+                or (True, "verified fresh occupancy"),
+            ),
+            patch.object(
+                map_ops.lifecycle,
+                "set_state",
+                side_effect=lambda *_args, **_kwargs: order.append("identity"),
             ),
         ):
             result = map_ops.load_map_impl("target")
 
         self.assertTrue(result["ok"], result)
-        self.assertEqual(order, ["copy", "mode", "load", "subscribe", "publish", "verify"])
-        self.assertIn("verified target occupancy", result["detail"])
+        self.assertEqual(
+            order,
+            ["copy", "mode", "load", "identity", "publish", "subscribe", "verify"],
+        )
+        self.assertIn("verified fresh occupancy", result["detail"])
 
     def test_mode_switch_failure_never_loads_database(self):
         with (
@@ -81,53 +88,35 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertIn("before load", result["detail"])
         load.assert_not_called()
 
-    def test_occupancy_similarity_accepts_small_edge_rebuild(self):
-        expected = np.full((100, 100), 205, dtype=np.uint8)
-        expected[20:40, 20:40] = 0
-        expected[50:80, 50:80] = 254
-        observed = expected.copy()
-        observed.flat[:1] = 254
-
-        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
-            expected, observed
+    @staticmethod
+    def _occupancy(width, height, resolution, data):
+        return SimpleNamespace(
+            info=SimpleNamespace(
+                width=width,
+                height=height,
+                resolution=resolution,
+                origin=SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0)),
+            ),
+            data=data,
         )
 
-        self.assertGreaterEqual(agreement, 0.9999)
-        self.assertGreaterEqual(occupied_iou, 0.995)
-        self.assertGreaterEqual(free_iou, 0.995)
+    def test_occupancy_readiness_accepts_optimized_non_empty_map(self):
+        msg = self._occupancy(3, 2, 0.05, [-1, 0, 0, 100, -1, 0])
 
-    def test_occupancy_similarity_accepts_realistic_optimized_edge_drift(self):
-        # A 218x254 map with seven thresholded edge cells changed reproduces
-        # the Webots load result that previously missed the 0.9999 cutoff
-        # despite both occupied/free class IoUs identifying the same map.
-        expected = np.full((254, 218), 205, dtype=np.uint8)
-        expected[20:70, 20:80] = 0
-        expected[90:230, 20:200] = 254
-        observed = expected.copy()
-        observed[20, 20:27] = 205
+        ready, summary = map_ops._occupancy_sample_ready(msg)
 
-        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
-            expected, observed
-        )
+        self.assertTrue(ready)
+        self.assertIn("3x2@0.050000", summary)
+        self.assertIn("known=4", summary)
 
-        self.assertGreaterEqual(agreement, 0.999)
-        self.assertLess(agreement, 0.9999)
-        self.assertGreaterEqual(occupied_iou, 0.995)
-        self.assertGreaterEqual(free_iou, 0.995)
+    def test_occupancy_readiness_rejects_unknown_or_malformed_grid(self):
+        unknown = self._occupancy(3, 2, 0.05, [-1] * 6)
+        malformed = self._occupancy(3, 2, 0.05, [0] * 5)
+        no_resolution = self._occupancy(3, 2, 0.0, [0] * 6)
 
-    def test_occupancy_similarity_rejects_different_same_size_map(self):
-        expected = np.full((100, 100), 205, dtype=np.uint8)
-        expected[20:40, 20:40] = 0
-        observed = np.full((100, 100), 205, dtype=np.uint8)
-        observed[60:80, 60:80] = 0
-
-        agreement, occupied_iou, free_iou = map_ops._occupancy_similarity(
-            expected, observed
-        )
-
-        self.assertLess(agreement, 0.9999)
-        self.assertLess(occupied_iou, 0.995)
-        self.assertEqual(free_iou, 1.0)
+        self.assertFalse(map_ops._occupancy_sample_ready(unknown)[0])
+        self.assertFalse(map_ops._occupancy_sample_ready(malformed)[0])
+        self.assertFalse(map_ops._occupancy_sample_ready(no_resolution)[0])
 
 
 if __name__ == "__main__":

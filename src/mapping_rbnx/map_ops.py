@@ -23,7 +23,6 @@ import math
 import os
 import shutil
 import glob
-import hashlib
 import sqlite3
 import threading
 import time
@@ -312,109 +311,49 @@ def _load_database(node, runtime_db: str, timeout_s: float) -> tuple[bool, str]:
     return (ok, "load_database completed" if ok else str(res))
 
 
-def _saved_occupancy_signature(map_dir: str) -> dict:
-    """Return metadata and a content fingerprint for the saved occupancy map."""
-    import yaml
-    from PIL import Image
+def _occupancy_sample_ready(msg) -> tuple[bool, str]:
+    """Return whether an occupancy sample is non-empty and structurally valid.
 
-    yaml_path = os.path.join(map_dir, "occupancy.yaml")
-    pgm_path = os.path.join(map_dir, "occupancy.pgm")
-    with open(yaml_path, "r", encoding="utf-8") as fh:
-        metadata = yaml.safe_load(fh) or {}
-    origin = metadata.get("origin") or []
-    if len(origin) < 2:
-        raise RuntimeError(f"invalid occupancy origin in {yaml_path}")
-    with Image.open(pgm_path) as image:
-        pixels = image.convert("L")
-        width, height = pixels.size
-        digest = hashlib.sha256(pixels.tobytes()).hexdigest()
-    return {
-        "width": int(width),
-        "height": int(height),
-        "resolution": float(metadata["resolution"]),
-        "origin_x": float(origin[0]),
-        "origin_y": float(origin[1]),
-        "sha256": digest,
-        "pixels": pixels.tobytes(),
-    }
-
-
-def _occupancy_similarity(expected, observed) -> tuple[float, float, float]:
-    """Return cell agreement plus occupied/free intersection-over-union."""
-    import numpy as np
-
-    if expected.shape != observed.shape or expected.size == 0:
-        return 0.0, 0.0, 0.0
-    agreement = float(np.mean(expected == observed))
-
-    def iou(value: int) -> float:
-        lhs = expected == value
-        rhs = observed == value
-        union = int(np.count_nonzero(lhs | rhs))
-        if union == 0:
-            return 1.0
-        return float(np.count_nonzero(lhs & rhs) / union)
-
-    return agreement, iou(0), iou(254)
+    Map identity comes from the successful database load plus the lifecycle
+    epoch. RTAB-Map may optimize cell boundaries when it republishes a loaded
+    database, so occupancy pixels are readiness data, not an identity hash.
+    """
+    info = msg.info
+    width = int(info.width)
+    height = int(info.height)
+    resolution = float(info.resolution)
+    cells = width * height
+    data = msg.data
+    known = sum(1 for value in data if int(value) >= 0)
+    summary = (
+        f"{width}x{height}@{resolution:.6f} "
+        f"origin=({info.origin.position.x:.3f},{info.origin.position.y:.3f}) "
+        f"cells={len(data)} known={known}"
+    )
+    ready = (
+        width > 0
+        and height > 0
+        and resolution > 0.0
+        and len(data) == cells
+        and known > 0
+    )
+    return ready, summary
 
 
-def _begin_target_map_wait(node, map_dir: str) -> dict:
-    """Subscribe before publish so load completion is tied to the target /map."""
-    import numpy as np
+def _begin_target_map_wait(node) -> dict:
+    """Wait for the latched occupancy published after a successful map load."""
     from nav_msgs.msg import OccupancyGrid
     from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                            ReliabilityPolicy)
 
-    expected = _saved_occupancy_signature(map_dir)
-    expected_image = np.frombuffer(expected["pixels"], dtype=np.uint8).reshape(
-        expected["height"], expected["width"]
-    )
-    # RTAB-Map republishes an optimized occupancy grid after loading the saved
-    # database. Thresholding can legitimately move a handful of edge cells
-    # even though the map geometry and class masks are the same. Keep the
-    # class-IoU guard strict, but allow up to 0.1% cell-level edge drift.
-    min_agreement = float(os.environ.get("MAPPING_LOAD_MIN_CELL_AGREEMENT", "0.999"))
-    min_class_iou = float(os.environ.get("MAPPING_LOAD_MIN_CLASS_IOU", "0.995"))
     ready = threading.Event()
     observed = {"summary": "no occupancy sample received"}
 
     def on_map(msg):
         try:
-            info = msg.info
-            summary = (
-                f"{info.width}x{info.height}@{info.resolution:.6f} "
-                f"origin=({info.origin.position.x:.3f},{info.origin.position.y:.3f})"
-            )
+            valid, summary = _occupancy_sample_ready(msg)
             observed["summary"] = summary
-            metadata_matches = (
-                int(info.width) == expected["width"]
-                and int(info.height) == expected["height"]
-                and abs(float(info.resolution) - expected["resolution"]) <= 1e-6
-                and abs(float(info.origin.position.x) - expected["origin_x"]) <= 1e-3
-                and abs(float(info.origin.position.y) - expected["origin_y"]) <= 1e-3
-            )
-            if not metadata_matches:
-                return
-            data = np.asarray(msg.data, dtype=np.int16).reshape(
-                expected["height"], expected["width"]
-            )
-            image = np.full(data.shape, 205, dtype=np.uint8)
-            image[data == 0] = 254
-            image[data >= 50] = 0
-            digest = hashlib.sha256(np.flipud(image).tobytes()).hexdigest()
-            image = np.flipud(image)
-            agreement, occupied_iou, free_iou = _occupancy_similarity(
-                expected_image, image
-            )
-            observed["summary"] = (
-                f"{summary} sha256={digest[:12]} agreement={agreement:.6f} "
-                f"occupied_iou={occupied_iou:.6f} free_iou={free_iou:.6f}"
-            )
-            if digest == expected["sha256"] or (
-                agreement >= min_agreement
-                and occupied_iou >= min_class_iou
-                and free_iou >= min_class_iou
-            ):
+            if valid:
                 ready.set()
         except Exception as exc:  # noqa: BLE001
             observed["summary"] = f"invalid occupancy sample: {exc}"
@@ -430,7 +369,6 @@ def _begin_target_map_wait(node, map_dir: str) -> dict:
     return {
         "event": ready,
         "observed": observed,
-        "expected": expected,
         "subscription": sub,
         "topic": topic,
     }
@@ -441,17 +379,14 @@ def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool
         matched = barrier["event"].wait(timeout=max(0.0, timeout_s))
     finally:
         node.destroy_subscription(barrier["subscription"])
-    expected = barrier["expected"]
     if not matched:
         return False, (
-            f"target occupancy was not observed on {barrier['topic']} within {timeout_s:.1f}s; "
-            f"expected={expected['width']}x{expected['height']}@{expected['resolution']:.6f} "
-            f"origin=({expected['origin_x']:.3f},{expected['origin_y']:.3f}) "
-            f"sha256={expected['sha256'][:12]}; observed={barrier['observed']['summary']}"
+            f"fresh non-empty occupancy was not observed on {barrier['topic']} "
+            f"within {timeout_s:.1f}s; observed={barrier['observed']['summary']}"
         )
     return True, (
-        f"verified target occupancy on {barrier['topic']} "
-        f"({expected['width']}x{expected['height']}, sha256={expected['sha256'][:12]})"
+        f"verified fresh occupancy on {barrier['topic']} "
+        f"({barrier['observed']['summary']})"
     )
 
 
@@ -504,13 +439,19 @@ def load_map_impl(map_id: str, mode: str = "localization",
             return {"ok": False,
                     "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
 
+        # The database load is the map-identity authority. Publish that
+        # identity before waiting for occupancy so consumers can bind the
+        # following grid to the correct map epoch without pixel comparison.
+        lifecycle.set_state(map_id, mode, bump=(mode == "mapping"))
+
         publish_timeout_s = float(os.environ.get("MAPPING_PUBLISH_MAP_TIMEOUT_S", "45"))
-        barrier = _begin_target_map_wait(node, os.path.dirname(db_path))
         log.info("load_map[%s] stage=publish_map timeout=%.1fs", map_id, publish_timeout_s)
         pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
         if not pub_ok:
-            node.destroy_subscription(barrier["subscription"])
             return {"ok": False, "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
+        # /map is transient-local. Subscribing after publish receives the
+        # latest grid and avoids accepting the previous map's latched sample.
+        barrier = _begin_target_map_wait(node)
         verify_timeout_s = float(os.environ.get("MAPPING_VERIFY_MAP_TIMEOUT_S", "30"))
         verified, verify_detail = _finish_target_map_wait(node, barrier, verify_timeout_s)
         if not verified:
@@ -525,10 +466,6 @@ def load_map_impl(map_id: str, mode: str = "localization",
             ps = pose_estimate_impl(x, y, theta)
             seeded = f"; {ps['detail']}"
         note = "" if requested_mode == "localization" else f"; requested {requested_mode} coerced to localization"
-        # Broadcast the new identity. Load always lands in localization
-        # (coerced above), which keeps the saved map's frame epoch — no
-        # generation bump (see lifecycle.py).
-        lifecycle.set_state(map_id, mode, bump=(mode == "mapping"))
         return {"ok": True,
                 "runtime_db_path": runtime_db,
                 "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}; "

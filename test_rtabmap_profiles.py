@@ -255,6 +255,14 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn('(\"imu/data_raw\", imu_topic)', source)
         self.assertIn('(\"imu\", filtered_imu_topic)', source)
 
+    def test_icp_motion_limits_are_forwarded_to_internal_odometry(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn(
+            'for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):',
+            source,
+        )
+        self.assertIn('icp_odom_params[key] = rtabmap_params[key]', source)
+
     def test_rgbd_only_profile_starts_visual_odometry(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
         self.assertIn("elif not have_odom and have_rgbd:", source)

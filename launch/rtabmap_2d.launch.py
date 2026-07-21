@@ -342,6 +342,9 @@ def _make_nodes(context, *args, **kwargs):
             "Icp/MaxCorrespondenceDistance": "1.0",
             "Odom/ScanKeyFrameThr": "0.4",
         }
+        for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):
+            if key in rtabmap_params:
+                icp_odom_params[key] = rtabmap_params[key]
         if have_imu:
             icp_odom_remappings.append(("imu", filtered_imu_topic))
             icp_odom_params["wait_imu_to_init"] = True

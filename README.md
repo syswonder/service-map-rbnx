@@ -64,6 +64,49 @@ only a starting template. Copy it into the robot deployment repository and set
 With external odometry, `deskew_lidar` compensates each PointCloud2 point in
 the odom frame before SLAM. Bind only the sensor roles Mapping should consume.
 
+### Separate localization and navigation odometry
+
+Some robots need accurate ICP/RGB-D odometry for RTAB-Map localization but a
+lower-latency chassis odometry stream for navigation. Enable the optional
+split-odometry bridge for this setup:
+
+```yaml
+service:
+  - name: mapping
+    url: https://github.com/syswonder/service-map-rbnx
+    config:
+      algo: rtabmap
+      base_frame: base_link
+
+      # Private RTAB-Map odometry frame.
+      odom_frame: odom_icp
+
+      # Public chassis odometry used by navigation.
+      navigation_odom_bridge: true
+      navigation_odom_topic: /odom
+      navigation_odom_frame: odom
+
+      sensor_providers:
+        lidar3d: roof_lidar
+        # Do not bind odom in split-odometry mode.
+```
+
+In this mode, RTAB-Map uses an internal message-only odometry trajectory in
+`odom_icp`, the chassis owns `odom -> base_link`, and Mapping publishes the
+correction required by navigation:
+
+```text
+map -> odom -> base_link
+```
+
+The bridge computes `map -> odom` from RTAB-Map localization and the two
+timestamp-aligned odometry poses. `odom_frame` and `navigation_odom_frame`
+must be different, and `sensor_providers.odom` must not be configured.
+
+The feature defaults to `false`; existing external- and internal-odometry
+deployments are unchanged. See [config.spec](config.spec) for the complete
+field definitions.
+
 ## Deployment targets
 
 One package, three targets (selected by the deploy `manifest:` field — see
@@ -154,6 +197,8 @@ mapping_rbnx/
 ├── package_manifest.jetson-native.yaml   arm64 Jetson + host ROS2
 ├── CAPABILITY.md                         capability surface + config spec
 ├── src/mapping_rbnx/atlas_bridge.py      cap registration, sensor discovery, persistence
+├── src/mapping_rbnx/map_to_odom_bridge.py optional split-odometry TF bridge
+├── src/mapping_rbnx/odom_bridge_math.py   planar transform and interpolation helpers
 ├── launch/rtabmap_2d.launch.py           sensor-agnostic rtabmap launch
 ├── scripts/
 │   ├── build.sh                          per-target build

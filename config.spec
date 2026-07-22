@@ -67,6 +67,26 @@ optional:
     description: >-
       Local continuous-motion frame used for odometry and map-to-odom
       estimation. The selected odom provider must publish poses in this frame.
+  navigation_odom_bridge:
+    type: boolean
+    default: false
+    description: >-
+      Opt-in split-odometry mode for robots whose accurate mapping odometry is
+      too latent for Navigation. Internal RTAB-Map odometry becomes a
+      message-only private trajectory and a bridge publishes map-to-navigation
+      odom using the chassis pose. The default preserves legacy TF behaviour.
+  navigation_odom_topic:
+    type: string
+    default: /odom
+    description: >-
+      Chassis Odometry topic used by the optional navigation bridge. It is not
+      passed into RTAB-Map and does not require a sensor_providers.odom binding.
+  navigation_odom_frame:
+    type: string
+    default: odom
+    description: >-
+      Frame owned by the chassis navigation odometry. When the bridge is
+      enabled this must differ from the private RTAB-Map odom_frame.
   use_sim_time:
     type: boolean
     default: false

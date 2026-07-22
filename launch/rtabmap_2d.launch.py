@@ -66,6 +66,13 @@ def generate_launch_description():
         DeclareLaunchArgument("deskew_lidar", default_value="false"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
+        # Opt-in split-odometry mode. Defaults preserve the legacy behaviour:
+        # internal odometry publishes odom -> base_link and RTAB-Map publishes
+        # map -> odom. When enabled, internal odometry is message-only in a
+        # private frame and a bridge combines it with chassis navigation odom.
+        DeclareLaunchArgument("navigation_odom_bridge", default_value="false"),
+        DeclareLaunchArgument("navigation_odom_topic", default_value="/odom"),
+        DeclareLaunchArgument("navigation_odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="false"),
         # Map persistence (set by atlas_bridge from the deploy's map_id /
         # map_mode config; empty database_path = ephemeral, the legacy
@@ -95,6 +102,11 @@ def _make_nodes(context, *args, **kwargs):
     deskew_lidar = LaunchConfiguration("deskew_lidar").perform(context).lower() == "true"
     base_frame = LaunchConfiguration("base_frame").perform(context)
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
+    navigation_odom_bridge = (
+        LaunchConfiguration("navigation_odom_bridge").perform(context).lower() == "true"
+    )
+    navigation_odom_topic = LaunchConfiguration("navigation_odom_topic").perform(context)
+    navigation_odom_frame = LaunchConfiguration("navigation_odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
     use_sim_time = use_sim_time_str.lower() == "true"
     database_path = LaunchConfiguration("database_path").perform(context).strip()
@@ -111,11 +123,26 @@ def _make_nodes(context, *args, **kwargs):
     have_odom = bool(odom_topic) and odom_topic != _NONE
     have_imu = bool(imu_topic) and imu_topic != _NONE
 
-    # Use the canonical odom -> base TF at each sensor timestamp. A compliant
-    # odometry provider publishes both nav_msgs/Odometry and the matching TF;
-    # controllers and state consumers use the topic, while RTAB-Map uses TF.
-    # Keeping one mode avoids independently synchronizing the same pose twice.
-    rtabmap_odom_frame = odom_frame
+    if navigation_odom_bridge:
+        if have_odom:
+            raise RuntimeError(
+                "navigation_odom_bridge requires internal RTAB-Map odometry; "
+                "remove the mapping sensor_providers.odom binding"
+            )
+        if odom_frame == navigation_odom_frame:
+            raise RuntimeError(
+                "navigation_odom_bridge requires distinct odom_frame and "
+                "navigation_odom_frame (for example odom_icp and odom)"
+            )
+        if not navigation_odom_topic or navigation_odom_topic == _NONE:
+            raise RuntimeError("navigation_odom_bridge requires navigation_odom_topic")
+
+    # Legacy/default mode reads odometry from the canonical TF. The opt-in
+    # navigation bridge deliberately disables internal odometry TF, so RTAB-Map
+    # must consume the remapped Odometry message instead (empty odom_frame_id
+    # is RTAB-Map's documented topic mode). The message header still names
+    # odom_frame, allowing RTAB-Map to publish map -> odom_icp.
+    rtabmap_odom_frame = "" if navigation_odom_bridge else odom_frame
 
     if deskew_lidar and not have_scan_cloud:
         raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
@@ -217,10 +244,13 @@ def _make_nodes(context, *args, **kwargs):
         rtabmap_remappings.append((
             "scan_cloud", deskewed_cloud_topic if deskew_lidar and have_odom else scan_cloud_topic
         ))
+    internal_odom_topic = (
+        "/rtabmap/odom_icp" if navigation_odom_bridge else "/rtabmap/odom"
+    )
     if have_odom:
         rtabmap_remappings.append(("odom", odom_topic))
     elif have_scan or have_scan_cloud or have_rgbd:
-        rtabmap_remappings.append(("odom", "/rtabmap/odom"))
+        rtabmap_remappings.append(("odom", internal_odom_topic))
     if have_rgbd:
         rtabmap_remappings += [
             ("rgb/image", rgb_topic),
@@ -322,7 +352,7 @@ def _make_nodes(context, *args, **kwargs):
     # when a scan is wired; otherwise an RGB-D-only deployment must run
     # rgbd_odometry or the SLAM node waits forever on /rtabmap/odom.
     if not have_odom and (have_scan or have_scan_cloud):
-        icp_odom_remappings = [("odom", "/rtabmap/odom")]
+        icp_odom_remappings = [("odom", internal_odom_topic)]
         if have_scan_cloud:
             icp_odom_remappings.append(("scan_cloud", scan_cloud_topic))
         elif have_scan:
@@ -331,7 +361,7 @@ def _make_nodes(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "frame_id": base_frame,
             "odom_frame_id": odom_frame,
-            "publish_tf": True,
+            "publish_tf": not navigation_odom_bridge,
             "approx_sync": True,
             "wait_for_transform": 1.5,
             "deskewing": deskew_lidar,
@@ -369,7 +399,7 @@ def _make_nodes(context, *args, **kwargs):
                 "use_sim_time": use_sim_time,
                 "frame_id": base_frame,
                 "odom_frame_id": odom_frame,
-                "publish_tf": True,
+                "publish_tf": not navigation_odom_bridge,
                 "approx_sync": True,
                 "queue_size": 30,
                 "wait_for_transform": 1.5,
@@ -378,10 +408,27 @@ def _make_nodes(context, *args, **kwargs):
                 ("rgb/image", rgb_topic),
                 ("rgb/camera_info", rgb_info),
                 ("depth/image", depth_topic),
-                ("odom", "/rtabmap/odom"),
+                ("odom", internal_odom_topic),
             ],
         )
         nodes.append(rgbd_odom)
+
+    if navigation_odom_bridge:
+        nodes.append(ExecuteProcess(
+            cmd=[
+                "python3", "-m", "mapping_rbnx.map_to_odom_bridge",
+                "--ros-args",
+                "-p", f"use_sim_time:={'true' if use_sim_time else 'false'}",
+                "-p", "map_frame:=map",
+                "-p", f"icp_odom_frame:={odom_frame}",
+                "-p", f"nav_odom_frame:={navigation_odom_frame}",
+                "-p", f"base_frame:={base_frame}",
+                "-p", f"icp_odom_topic:={internal_odom_topic}",
+                "-p", f"nav_odom_topic:={navigation_odom_topic}",
+            ],
+            name="map_to_odom_bridge",
+            output="screen",
+        ))
 
     if enable_viz:
         viz_params = {

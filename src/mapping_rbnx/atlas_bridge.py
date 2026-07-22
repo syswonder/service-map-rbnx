@@ -539,11 +539,21 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     # Optional frame/time overrides. Standard robots need not repeat defaults.
-    for key in ("base_frame", "odom_frame", "use_sim_time", "deskew_lidar"):
+    for key in (
+        "base_frame",
+        "odom_frame",
+        "use_sim_time",
+        "deskew_lidar",
+        "navigation_odom_bridge",
+        "navigation_odom_topic",
+        "navigation_odom_frame",
+    ):
         if key in cfg:
             resolved[key] = (
                 str(cfg[key]).lower()
-                if key in {"use_sim_time", "deskew_lidar"}
+                if key in {
+                    "use_sim_time", "deskew_lidar", "navigation_odom_bridge"
+                }
                 else str(cfg[key])
             )
 

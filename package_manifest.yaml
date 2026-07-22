@@ -73,6 +73,16 @@ start: bash scripts/start.sh
 #   rtabmap_params: optional final scalar overrides
 #   deskew_lidar: true requires a PointCloud2 per-point timestamp field. With
 #                        external odom it uses odom TF; otherwise ICP deskews.
+#   navigation_odom_bridge: false by default. When true, internal RTAB-Map
+#                        odometry uses a private odom_frame message without TF,
+#                        and mapping publishes map -> navigation_odom_frame by
+#                        combining RTAB-Map localization with a low-latency
+#                        chassis navigation_odom_topic. This mode requires no
+#                        sensor_providers.odom binding.
+#   navigation_odom_topic: chassis Odometry topic used only by the bridge
+#                        (default /odom; it is not an RTAB-Map sensor input).
+#   navigation_odom_frame: navigation-local frame (default odom). Must differ
+#                        from odom_frame when the bridge is enabled.
 # Frames / time (optional; defaults: base_link, odom, wall clock):
 #   base_frame, odom_frame, use_sim_time
 # Map persistence (optional; rtabmap only):

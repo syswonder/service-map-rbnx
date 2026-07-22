@@ -63,9 +63,15 @@ case "$ALGO" in
         # to the lidar's own frame so rtabmap doesn't block on base_link.
         BASE_FRAME=$(read_y base_frame)
         ODOM_FRAME=$(read_y odom_frame)
+        NAV_ODOM_BRIDGE=$(read_y navigation_odom_bridge)
+        NAV_ODOM_TOPIC=$(read_y navigation_odom_topic)
+        NAV_ODOM_FRAME=$(read_y navigation_odom_frame)
         USE_SIM_TIME_R=$(read_y use_sim_time)
         BASE_FRAME="${BASE_FRAME:-base_link}"
         ODOM_FRAME="${ODOM_FRAME:-odom}"
+        NAV_ODOM_BRIDGE="${NAV_ODOM_BRIDGE:-false}"
+        NAV_ODOM_TOPIC="${NAV_ODOM_TOPIC:-/odom}"
+        NAV_ODOM_FRAME="${NAV_ODOM_FRAME:-odom}"
         USE_SIM_TIME="${USE_SIM_TIME_R:-${MAPPING_USE_SIM_TIME:-true}}"
         ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
         # Map persistence (atlas_bridge wrote these from the deploy's
@@ -102,6 +108,9 @@ case "$ALGO" in
             deskew_lidar:="$DESKEW_LIDAR" \
             base_frame:="$BASE_FRAME" \
             odom_frame:="$ODOM_FRAME" \
+            navigation_odom_bridge:="$NAV_ODOM_BRIDGE" \
+            navigation_odom_topic:="$NAV_ODOM_TOPIC" \
+            navigation_odom_frame:="$NAV_ODOM_FRAME" \
             use_sim_time:="$USE_SIM_TIME" \
             enable_viz:="$ENABLE_VIZ" \
             map_mode:="$MAP_MODE" \

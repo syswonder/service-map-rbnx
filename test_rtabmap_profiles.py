@@ -242,7 +242,10 @@ class RtabmapConfigurationTest(unittest.TestCase):
 
     def test_external_odom_uses_canonical_tf_mode(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
-        self.assertIn('rtabmap_odom_frame = odom_frame', source)
+        self.assertIn(
+            'rtabmap_odom_frame = "" if navigation_odom_bridge else odom_frame',
+            source,
+        )
         self.assertEqual(
             source.count('"odom_frame_id": rtabmap_odom_frame'), 2
         )
@@ -262,6 +265,31 @@ class RtabmapConfigurationTest(unittest.TestCase):
             source,
         )
         self.assertIn('icp_odom_params[key] = rtabmap_params[key]', source)
+
+    def test_navigation_odom_bridge_is_opt_in_and_keeps_legacy_defaults(self):
+        launch = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn(
+            'DeclareLaunchArgument("navigation_odom_bridge", default_value="false")',
+            launch,
+        )
+        self.assertIn(
+            '"/rtabmap/odom_icp" if navigation_odom_bridge else "/rtabmap/odom"',
+            launch,
+        )
+        self.assertIn('"publish_tf": not navigation_odom_bridge', launch)
+        self.assertIn(
+            'rtabmap_odom_frame = "" if navigation_odom_bridge else odom_frame',
+            launch,
+        )
+        self.assertIn('"publish_tf": True', launch)
+
+    def test_navigation_odom_bridge_config_reaches_launch(self):
+        bridge = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        engine = (ROOT / "scripts" / "start_engine.sh").read_text()
+        self.assertIn('"navigation_odom_bridge"', bridge)
+        self.assertIn('navigation_odom_bridge:="$NAV_ODOM_BRIDGE"', engine)
+        self.assertIn('navigation_odom_topic:="$NAV_ODOM_TOPIC"', engine)
+        self.assertIn('navigation_odom_frame:="$NAV_ODOM_FRAME"', engine)
 
     def test_rgbd_only_profile_starts_visual_odometry(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()

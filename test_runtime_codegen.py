@@ -35,6 +35,16 @@ class RuntimeCodegenTests(unittest.TestCase):
         docker_codegen = start.index("prepare_runtime_proto_gen\n")
         self.assertLess(native_exit, docker_codegen)
 
+    def test_host_codegen_uses_and_validates_native_runtime_python(self) -> None:
+        build = (ROOT / "scripts" / "build.sh").read_text(encoding="utf-8")
+        native = (ROOT / "scripts" / "start_native.sh").read_text(encoding="utf-8")
+        self.assertIn('PYBIN="${MAPPING_NATIVE_PYTHON:-python3}"', build)
+        self.assertIn('RBNX_CODEGEN_PYTHON="$PYBIN"', build)
+        self.assertIn('"$PYBIN" - <<', build)
+        self.assertIn("import atlas_pb2_grpc", build)
+        self.assertIn("import map_mcp", build)
+        self.assertIn('PYBIN="${MAPPING_NATIVE_PYTHON:-python3}"', native)
+
     def test_entrypoint_reports_missing_runtime_stubs(self) -> None:
         entrypoint = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
         self.assertIn("missing runtime-compatible protobuf stubs", entrypoint)

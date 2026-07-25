@@ -28,6 +28,7 @@ TARGET="${RBNX_BUILD_TARGET:-x86-docker}"
 ROS_BASE_IMAGE="${ROBONIX_MAPPING_ROS_BASE_IMAGE:-robonix-ros:humble-ros-base}"
 UPSTREAM_ROS_BASE_IMAGE="ros:humble-ros-base"
 JETSON_ROS_BASE_IMAGE="${ROBONIX_MAPPING_JETSON_ROS_BASE_IMAGE:-dustynv/ros:humble-ros-base-l4t-r36.4.0}"
+PYBIN="${MAPPING_NATIVE_PYTHON:-python3}"
 
 if [[ "$CLEAN" == "1" ]]; then
     echo "[build] clean: removing $BUILD"
@@ -50,7 +51,17 @@ if command -v rbnx >/dev/null 2>&1; then
     FLAGS=(--mcp --ros2)
     [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
     echo "[build] rbnx codegen ${FLAGS[*]}"
-    rbnx codegen -p "$PKG" "${FLAGS[@]}"
+    RBNX_CODEGEN_PYTHON="$PYBIN" \
+        rbnx codegen -p "$PKG" "${FLAGS[@]}"
+
+    CODEGEN_PYTHONPATH="$PKG/$BUILD/codegen/proto_gen:$PKG/$BUILD/codegen/robonix_mcp_types"
+    PYTHONPATH="$CODEGEN_PYTHONPATH:${PYTHONPATH:-}" "$PYBIN" - <<'PY'
+import atlas_pb2_grpc
+import map_mcp
+import robonix_contracts_pb2_grpc
+
+print("[build] generated Mapping gRPC and MCP imports OK")
+PY
 
     if [[ "$TARGET" == "jetson-native" ]]; then
         set +u

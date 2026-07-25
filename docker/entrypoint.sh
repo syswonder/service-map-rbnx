@@ -55,6 +55,17 @@ configure_zenoh_session
 
 cd /mapping
 
+# Docker start generates these modules with this image and bind-masks the
+# host-generated proto_gen. Emit a focused error before Python's descriptor
+# compatibility traceback obscures the deployment problem.
+PROTO_GEN=/mapping/rbnx-build/codegen/proto_gen
+if [ ! -f "$PROTO_GEN/atlas_pb2.py" ] \
+    || [ ! -f "$PROTO_GEN/map_pb2.py" ] \
+    || [ ! -f "$PROTO_GEN/robonix_contracts_pb2_grpc.py" ]; then
+    echo "[entrypoint] missing runtime-compatible protobuf stubs in $PROTO_GEN; rebuild and restart mapping" >&2
+    exit 1
+fi
+
 # Codegen output lives under <pkg>/rbnx-build/codegen/ per v0.1 (matches
 # `rbnx codegen` default + `robonix_api.codegen.ensure_proto_gen` walks).
 # atlas_bridge needs the generated atlas_pb2 etc., so prepend the

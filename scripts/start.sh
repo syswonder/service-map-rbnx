@@ -51,6 +51,7 @@ CT="${ROBONIX_MAPPING_CONTAINER:-robonix_mapping}"
 IMG="${ROBONIX_MAPPING_IMAGE:-robonix-mapping}"
 XHOST_AUTHORIZED=false
 XHOST_DISPLAY=""
+RUNTIME_PROTO_TMP=""
 
 cleanup() {
     local status=$?
@@ -60,6 +61,9 @@ cleanup() {
         XHOST_AUTHORIZED=false
     fi
     docker stop "$CT" >/dev/null 2>&1 || true
+    if [[ -n "$RUNTIME_PROTO_TMP" && -d "$RUNTIME_PROTO_TMP" ]]; then
+        rm -rf -- "$RUNTIME_PROTO_TMP"
+    fi
     return "$status"
 }
 trap cleanup EXIT
@@ -67,6 +71,57 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 docker rm -f "$CT" >/dev/null 2>&1 || true
+
+# Host codegen is retained for native deployments. Docker imports protobuf
+# modules generated and validated with the exact image that executes them.
+prepare_runtime_proto_gen() {
+    local proto_staging="$PKG/rbnx-build/proto-staging"
+    local runtime_proto
+    local runtime_proto_gen="$PKG/rbnx-build/codegen/mapping_proto_gen"
+
+    runtime_proto="$(rbnx path runtime-proto)" || {
+        echo "[mapping/start] cannot resolve Robonix runtime proto directory" >&2
+        return 1
+    }
+    [[ -d "$runtime_proto" && -f "$runtime_proto/atlas.proto" ]] || {
+        echo "[mapping/start] missing runtime atlas.proto: $runtime_proto" >&2
+        return 1
+    }
+    [[ -d "$proto_staging" ]] \
+        && find "$proto_staging" -maxdepth 1 -type f -name '*.proto' -print -quit \
+            | grep -q . || {
+        echo "[mapping/start] missing staged package protos; run rbnx build first" >&2
+        return 1
+    }
+
+    mkdir -p "$PKG/rbnx-build/codegen"
+    RUNTIME_PROTO_TMP="$(mktemp -d "${runtime_proto_gen}.tmp.XXXXXX")"
+    docker run --rm \
+        --network none \
+        --entrypoint sh \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$runtime_proto:/runtime-proto:ro" \
+        -v "$proto_staging:/proto-staging:ro" \
+        -v "$RUNTIME_PROTO_TMP:/proto-gen" \
+        "$IMG" -ec '
+            python3 -m grpc_tools.protoc \
+                -I/runtime-proto \
+                -I/proto-staging \
+                --python_out=/proto-gen \
+                --grpc_python_out=/proto-gen \
+                /runtime-proto/*.proto \
+                /proto-staging/*.proto
+            PYTHONPATH=/proto-gen python3 -c '\''import importlib, pathlib; p = pathlib.Path("/proto-gen"); modules = sorted({f.stem for f in p.glob("*_pb2.py")} | {f.stem for f in p.glob("*_pb2_grpc.py")}); assert modules; [importlib.import_module(name) for name in modules]'\''
+        '
+
+    rm -rf -- "$runtime_proto_gen"
+    mv "$RUNTIME_PROTO_TMP" "$runtime_proto_gen"
+    RUNTIME_PROTO_TMP=""
+    echo "[mapping/start] runtime-compatible protobuf stubs ready"
+}
+
+prepare_runtime_proto_gen
 mkdir -p rbnx-build/data
 
 declare -a ZENOH_ARGS=()
@@ -111,8 +166,8 @@ fi
 # server ACL. Any ACL entry we add is revoked by cleanup after docker exits.
 MAPPING_ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
 VIZ_ENABLED=false
-case "${MAPPING_ENABLE_VIZ,,}" in
-    1|true|yes|on) VIZ_ENABLED=true ;;
+case "$MAPPING_ENABLE_VIZ" in
+    1|true|TRUE|yes|YES|on|ON) VIZ_ENABLED=true ;;
 esac
 declare -a X11_ARGS=()
 if [[ "$VIZ_ENABLED" == true ]]; then
@@ -135,6 +190,9 @@ if [[ "$VIZ_ENABLED" == true ]]; then
     fi
 fi
 
+# Bash 3.2 treats an empty array expansion as an unset variable under `set -u`.
+# All scalar values below already have explicit defaults.
+set +u
 docker run --rm \
     --name "$CT" \
     --network host \
@@ -155,6 +213,7 @@ docker run --rm \
     "${DEPLOY_ARGS[@]}" \
     "${X11_ARGS[@]}" \
     -v "$(pwd)":/mapping \
+    -v "$PKG/rbnx-build/codegen/mapping_proto_gen:/mapping/rbnx-build/codegen/proto_gen:ro" \
     -v "$(rbnx path robonix-api)":/robonix-api:ro \
     "${EXTRA_MOUNTS[@]}" \
     "$IMG"

@@ -18,9 +18,19 @@ class CycloneDDSRuntimeTests(unittest.TestCase):
             package = root / "package"
             fake_bin = root / "bin"
             fake_x11 = root / "x11"
+            runtime_proto = root / "runtime-proto"
             package.mkdir()
             fake_bin.mkdir()
             fake_x11.mkdir()
+            runtime_proto.mkdir()
+            (runtime_proto / "atlas.proto").write_text(
+                'syntax = "proto3";\n', encoding="utf-8"
+            )
+            proto_staging = package / "rbnx-build" / "proto-staging"
+            proto_staging.mkdir(parents=True)
+            (proto_staging / "map.proto").write_text(
+                'syntax = "proto3";\n', encoding="utf-8"
+            )
             docker_log = root / "docker.log"
             display_log = root / "display.log"
 
@@ -30,7 +40,12 @@ class CycloneDDSRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (fake_bin / "rbnx").write_text(
-                '#!/usr/bin/env bash\nprintf "/tmp/robonix-api\\n"\n',
+                "#!/usr/bin/env bash\n"
+                'if [[ "${1:-}" == path && "${2:-}" == runtime-proto ]]; then\n'
+                '  printf "%s\\n" "$RUNTIME_PROTO_DIR"\n'
+                "else\n"
+                '  printf "/tmp/robonix-api\\n"\n'
+                "fi\n",
                 encoding="utf-8",
             )
             (fake_bin / "xset").write_text(
@@ -59,6 +74,7 @@ class CycloneDDSRuntimeTests(unittest.TestCase):
                     "DOCKER_LOG": str(docker_log),
                     "DISPLAY_LOG": str(display_log),
                     "RBNX_PACKAGE_ROOT": str(package),
+                    "RUNTIME_PROTO_DIR": str(runtime_proto),
                     "ROBONIX_MAPPING_FORCE": "docker",
                     "DISPLAY": "",
                 }
@@ -101,7 +117,9 @@ class CycloneDDSRuntimeTests(unittest.TestCase):
     def test_visualization_defaults_off_without_x11_side_effects(self) -> None:
         docker_calls, display_calls = self._run_start(None)
         self.assertEqual(display_calls, [])
-        run = next(call for call in docker_calls if call.startswith("docker run "))
+        run = next(
+            call for call in reversed(docker_calls) if call.startswith("docker run ")
+        )
         self.assertIn("MAPPING_ENABLE_VIZ=false", run)
         self.assertNotIn("DISPLAY=", run)
         self.assertNotIn("QT_X11_NO_MITSHM", run)
@@ -109,13 +127,17 @@ class CycloneDDSRuntimeTests(unittest.TestCase):
     def test_explicit_false_never_probes_or_authorizes_x11(self) -> None:
         docker_calls, display_calls = self._run_start("false")
         self.assertEqual(display_calls, [])
-        run = next(call for call in docker_calls if call.startswith("docker run "))
+        run = next(
+            call for call in reversed(docker_calls) if call.startswith("docker run ")
+        )
         self.assertIn("MAPPING_ENABLE_VIZ=false", run)
         self.assertNotIn("DISPLAY=", run)
 
     def test_visualization_authorization_is_revoked_on_cleanup(self) -> None:
         docker_calls, display_calls = self._run_start("true")
-        run = next(call for call in docker_calls if call.startswith("docker run "))
+        run = next(
+            call for call in reversed(docker_calls) if call.startswith("docker run ")
+        )
         self.assertIn("MAPPING_ENABLE_VIZ=true", run)
         self.assertIn("DISPLAY=:0", run)
         self.assertEqual(

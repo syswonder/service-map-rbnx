@@ -50,6 +50,8 @@ case "$ALGO" in
         DEPTH_TOPIC=$(read_y depth_topic)
         IMU_TOPIC=$(read_y imu_topic)
         DESKEW_LIDAR=$(read_y deskew_lidar)
+        DENSE_SCAN_2D=$(read_y dense_scan_2d)
+        DENSE_SCAN_REFINE_NEIGHBORS=$(read_y dense_scan_refine_neighbors)
         SCAN_TOPIC="${SCAN_TOPIC:-<none>}"
         SCAN_CLOUD_TOPIC="${SCAN_CLOUD_TOPIC:-<none>}"
         ODOM_TOPIC="${ODOM_TOPIC:-<none>}"
@@ -57,6 +59,8 @@ case "$ALGO" in
         DEPTH_TOPIC="${DEPTH_TOPIC:-<none>}"
         IMU_TOPIC="${IMU_TOPIC:-<none>}"
         DESKEW_LIDAR="${DESKEW_LIDAR:-false}"
+        DENSE_SCAN_2D="${DENSE_SCAN_2D:-false}"
+        DENSE_SCAN_REFINE_NEIGHBORS="${DENSE_SCAN_REFINE_NEIGHBORS:-false}"
         # tf + time-source from atlas_bridge's resolved.yaml (cfg-driven
         # in the deploy manifest); fall back to legacy env / defaults.
         # Real-robot bring-ups without a chassis TF override base_frame
@@ -91,7 +95,7 @@ case "$ALGO" in
         [ -n "$DATABASE_PATH" ] && DB_ARG=(database_path:="$DATABASE_PATH")
         OVERRIDES_ARG=()
         [ -n "$RTABMAP_OVERRIDES_FILE" ] && OVERRIDES_ARG=(rtabmap_overrides_file:="$RTABMAP_OVERRIDES_FILE")
-        echo "[start_engine] rtabmap scan2d=$SCAN_TOPIC scan3d=$SCAN_CLOUD_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC imu=$IMU_TOPIC deskew=$DESKEW_LIDAR base=$BASE_FRAME odomf=$ODOM_FRAME use_sim_time=$USE_SIM_TIME viz=$ENABLE_VIZ"
+        echo "[start_engine] rtabmap scan2d=$SCAN_TOPIC scan3d=$SCAN_CLOUD_TOPIC odom=$ODOM_TOPIC rgb=$RGB_TOPIC depth=$DEPTH_TOPIC imu=$IMU_TOPIC deskew=$DESKEW_LIDAR dense_scan_2d=$DENSE_SCAN_2D dense_scan_refine_neighbors=$DENSE_SCAN_REFINE_NEIGHBORS base=$BASE_FRAME odomf=$ODOM_FRAME use_sim_time=$USE_SIM_TIME viz=$ENABLE_VIZ"
         # Run launch in the background so a sidecar can scrape
         # rtabmap_slam's actual --params-file path (the temp file ros2
         # launch generated, e.g. /tmp/launch_params_xxxxxx) plus its
@@ -106,6 +110,8 @@ case "$ALGO" in
             depth_topic:="$DEPTH_TOPIC" \
             imu_topic:="$IMU_TOPIC" \
             deskew_lidar:="$DESKEW_LIDAR" \
+            dense_scan_2d:="$DENSE_SCAN_2D" \
+            dense_scan_refine_neighbors:="$DENSE_SCAN_REFINE_NEIGHBORS" \
             base_frame:="$BASE_FRAME" \
             odom_frame:="$ODOM_FRAME" \
             navigation_odom_bridge:="$NAV_ODOM_BRIDGE" \

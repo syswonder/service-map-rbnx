@@ -547,12 +547,18 @@ def init(cfg: dict):
         "navigation_odom_bridge",
         "navigation_odom_topic",
         "navigation_odom_frame",
+        "dense_scan_2d",
+        "dense_scan_refine_neighbors",
     ):
         if key in cfg:
             resolved[key] = (
                 str(cfg[key]).lower()
                 if key in {
-                    "use_sim_time", "deskew_lidar", "navigation_odom_bridge"
+                    "use_sim_time",
+                    "deskew_lidar",
+                    "navigation_odom_bridge",
+                    "dense_scan_2d",
+                    "dense_scan_refine_neighbors",
                 }
                 else str(cfg[key])
             )

@@ -49,8 +49,16 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from mapping_rbnx.profiles import select_icp_odometry_overrides
+
 
 _NONE = "<none>"  # sentinel for "no such topic in this deploy"
+# Point clouds and laser scans are sensor streams.  Their publishers commonly
+# use the ROS sensor-data profile (best effort), including the Go2 Mid360
+# bridge.  RTAB-Map encodes input reliability as 0=system default, 1=reliable,
+# 2=best effort.  Leaving this at 0 makes CycloneDDS select reliable and the
+# subscription cannot match a best-effort /scanner/cloud publisher.
+_SENSOR_DATA_QOS = 2
 
 
 def generate_launch_description():
@@ -64,6 +72,16 @@ def generate_launch_description():
         DeclareLaunchArgument("depth_topic", default_value=_NONE),
         DeclareLaunchArgument("imu_topic", default_value=_NONE),
         DeclareLaunchArgument("deskew_lidar", default_value="false"),
+        # Optional real-robot lidar conditioning.  Existing deployments keep
+        # the direct PointCloud2 path.  A deploy must opt in explicitly after
+        # verifying that its cloud has per-point timestamps and external odom.
+        DeclareLaunchArgument("dense_scan_2d", default_value="false"),
+        # Optional adjacent-edge ICP correction. It is deliberately separate
+        # from dense_scan_2d: conditioning a sparse cloud must not silently
+        # change the pose graph, and the raw PointCloud2 path is never eligible.
+        DeclareLaunchArgument(
+            "dense_scan_refine_neighbors", default_value="false"
+        ),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
         # Opt-in split-odometry mode. Defaults preserve the legacy behaviour:
@@ -100,6 +118,13 @@ def _make_nodes(context, *args, **kwargs):
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
     imu_topic = LaunchConfiguration("imu_topic").perform(context)
     deskew_lidar = LaunchConfiguration("deskew_lidar").perform(context).lower() == "true"
+    dense_scan_2d = LaunchConfiguration("dense_scan_2d").perform(context).lower() == "true"
+    dense_scan_refine_neighbors = (
+        LaunchConfiguration("dense_scan_refine_neighbors")
+        .perform(context)
+        .lower()
+        == "true"
+    )
     base_frame = LaunchConfiguration("base_frame").perform(context)
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
     navigation_odom_bridge = (
@@ -146,6 +171,22 @@ def _make_nodes(context, *args, **kwargs):
 
     if deskew_lidar and not have_scan_cloud:
         raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
+    if dense_scan_refine_neighbors and not dense_scan_2d:
+        raise RuntimeError(
+            "dense_scan_refine_neighbors requires dense_scan_2d=true; "
+            "neighbor refinement is never enabled on the sparse raw "
+            "PointCloud2 path"
+        )
+    if dense_scan_2d:
+        if not have_scan_cloud:
+            raise RuntimeError("dense_scan_2d requires a lidar3d PointCloud2 input")
+        if not have_odom:
+            raise RuntimeError("dense_scan_2d requires external odometry")
+        if not deskew_lidar:
+            raise RuntimeError(
+                "dense_scan_2d requires deskew_lidar=true so it never "
+                "accumulates motion-distorted raw clouds"
+            )
 
     if not (have_scan or have_scan_cloud or have_rgbd):
         # rtabmap with neither lidar nor RGBD has nothing to map. Bail
@@ -170,6 +211,10 @@ def _make_nodes(context, *args, **kwargs):
     else:
         grid_sensor = "0"
 
+    rtabmap_have_scan = have_scan or dense_scan_2d
+    rtabmap_have_scan_cloud = have_scan_cloud and not dense_scan_2d
+    dense_scan_topic = "/rtabmap/scan_dense"
+
     rtabmap_params = {
         "use_sim_time": use_sim_time,
         "frame_id": base_frame,
@@ -179,12 +224,13 @@ def _make_nodes(context, *args, **kwargs):
         # Sensor subscriptions branch on what the deploy actually has.
         # rtabmap accepts EITHER 2D scan OR 3D scan_cloud (or both); the
         # 3D path is what real-robot Mid360 deployments use.
-        "subscribe_scan": have_scan,
-        "subscribe_scan_cloud": have_scan_cloud,
+        "subscribe_scan": rtabmap_have_scan,
+        "subscribe_scan_cloud": rtabmap_have_scan_cloud,
         "subscribe_rgbd": False,
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
         "subscribe_odom_info": False,
+        "qos_scan": _SENSOR_DATA_QOS,
         "odom_sensor_sync": False,
         "approx_sync": True,
         "queue_size": 30,
@@ -210,7 +256,23 @@ def _make_nodes(context, *args, **kwargs):
         "Mem/IncrementalMemory": "false" if localization else "true",
         "Mem/InitWMWithAllNodes": "true" if localization else "false",
     }
+    if dense_scan_2d:
+        # The generated LaserScan contains +inf for angular bins without an
+        # obstacle return.  Those bins are unknown, not observed free space.
+        # Keeping them unknown avoids recreating the radial free-space spokes
+        # this conditioning path is intended to suppress.
+        rtabmap_params["Grid/Scan2dUnknownSpaceFilled"] = "false"
+    if have_rgbd:
+        # RealSense and other camera drivers commonly publish Image and
+        # CameraInfo with the ROS sensor-data profile. Apply the compatible
+        # reader QoS only when RGB-D is actually enabled so the established
+        # lidar-only RTAB-Map parameter baseline remains unchanged.
+        rtabmap_params.update({
+            "qos_image": _SENSOR_DATA_QOS,
+            "qos_camera_info": _SENSOR_DATA_QOS,
+        })
 
+    deployment_overrides = {}
     if overrides_file:
         try:
             with open(overrides_file, encoding="utf-8") as f:
@@ -225,11 +287,69 @@ def _make_nodes(context, *args, **kwargs):
         # The ROS wrapper forwards RTAB-Map's slash-named parameters as
         # strings. Preserve that established type boundary even though JSON
         # decoded booleans/numbers have native Python types.
-        rtabmap_params.update({
+        deployment_overrides = {
             key: str(value).lower() if isinstance(value, bool) else str(value)
             for key, value in overrides.items()
-        })
+        }
+        rtabmap_params.update(deployment_overrides)
         print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
+
+    if dense_scan_refine_neighbors:
+        # The feature supplies conservative defaults only. The deploy-owned
+        # params_file is merged before inline rtabmap_params by atlas_bridge,
+        # and that merged object has already been applied above. setdefault()
+        # therefore preserves an explicit deploy value, including an explicit
+        # RGBD/NeighborLinkRefining=false.
+        rtabmap_params.setdefault("Reg/Strategy", "1")
+        rtabmap_params.setdefault("Reg/Force3DoF", "true")
+        rtabmap_params.setdefault("RGBD/NeighborLinkRefining", "true")
+        rtabmap_params.setdefault("RGBD/ProximityBySpace", "false")
+        rtabmap_params.setdefault("RGBD/ProximityPathMaxNeighbors", "0")
+        # The generated scan has enough adjacent returns to estimate planar
+        # normals. RTAB-Map's low-complexity strategy preserves the odometry
+        # guess along an underconstrained corridor axis while still correcting
+        # the wall-normal direction and yaw. Keep the search window smaller
+        # than a normal route step so it cannot accept a lookalike corridor
+        # jump.
+        rtabmap_params.setdefault("Icp/PointToPlane", "true")
+        rtabmap_params.setdefault("Icp/PointToPlaneK", "5")
+        rtabmap_params.setdefault("Icp/PointToPlaneMinComplexity", "0.02")
+        rtabmap_params.setdefault("Icp/PointToPlaneLowComplexityStrategy", "1")
+        rtabmap_params.setdefault("Icp/CorrespondenceRatio", "0.20")
+        rtabmap_params.setdefault("Icp/MaxCorrespondenceDistance", "0.15")
+        rtabmap_params.setdefault("Icp/MaxTranslation", "0.10")
+        rtabmap_params.setdefault("Icp/MaxRotation", "0.10")
+        rtabmap_params.setdefault("Icp/RangeMin", "0.492")
+        rtabmap_params.setdefault("Icp/RangeMax", "6.0")
+
+        neighbor_refining = _rtabmap_bool(
+            "RGBD/NeighborLinkRefining",
+            rtabmap_params["RGBD/NeighborLinkRefining"],
+        )
+        proximity_by_space = _rtabmap_bool(
+            "RGBD/ProximityBySpace",
+            rtabmap_params["RGBD/ProximityBySpace"],
+        )
+        if proximity_by_space:
+            raise RuntimeError(
+                "dense_scan_refine_neighbors requires "
+                "RGBD/ProximityBySpace=false; spatial proximity links remain "
+                "disabled to avoid unrelated corridor-edge matches"
+            )
+        if neighbor_refining and str(rtabmap_params["Reg/Strategy"]).strip() != "1":
+            raise RuntimeError(
+                "dense_scan_refine_neighbors requires Reg/Strategy=1 while "
+                "RGBD/NeighborLinkRefining is enabled"
+            )
+        if (
+            "RGBD/NeighborLinkRefining" in deployment_overrides
+            and not neighbor_refining
+        ):
+            print(
+                "[rtabmap.launch] dense_scan_refine_neighbors requested, but "
+                "the deploy explicitly set RGBD/NeighborLinkRefining=false; "
+                "the explicit deploy value takes precedence"
+            )
 
     rtabmap_remappings = [
         # rviz "2D Pose Estimate" → /initialpose: rtabmap defaults to
@@ -237,10 +357,12 @@ def _make_nodes(context, *args, **kwargs):
         # tool reaches us without rviz config gymnastics.
         ("initialpose", "/initialpose"),
     ]
-    if have_scan:
-        rtabmap_remappings.append(("scan", scan_topic))
+    if rtabmap_have_scan:
+        rtabmap_remappings.append((
+            "scan", dense_scan_topic if dense_scan_2d else scan_topic
+        ))
     deskewed_cloud_topic = "/rtabmap/scan_cloud_deskewed"
-    if have_scan_cloud:
+    if rtabmap_have_scan_cloud:
         rtabmap_remappings.append((
             "scan_cloud", deskewed_cloud_topic if deskew_lidar and have_odom else scan_cloud_topic
         ))
@@ -338,10 +460,71 @@ def _make_nodes(context, *args, **kwargs):
                 "fixed_frame_id": odom_frame,
                 "wait_for_transform": 0.2,
                 "slerp": True,
+                # Real LiDAR relays normally publish the ROS sensor-data
+                # (best-effort) profile.  lidar_deskewing defaults to reliable,
+                # which is incompatible and silently starves this pipeline.
+                "qos": _SENSOR_DATA_QOS,
             }],
             remappings=[
                 ("input_cloud", scan_cloud_topic),
                 (f"{scan_cloud_topic}/deskewed", deskewed_cloud_topic),
+            ],
+        ))
+
+    if dense_scan_2d:
+        assembled_cloud_topic = "/rtabmap/scan_cloud_assembled"
+        # Keep four recent, deskewed frames aligned in odom while publishing
+        # the rolling window back in base_link.  Upstream treats max_clouds
+        # and assembling_time as an OR bound: four clouds is the normal
+        # steady-state window, while 0.75 s is a secondary cap if input timing
+        # slows down.  A modest voxel leaf bounds CPU/memory without throwing
+        # away the wall continuity that a sparse non-repetitive MID-360 packet
+        # lacks on its own.
+        nodes.append(Node(
+            package="rtabmap_util",
+            executable="point_cloud_assembler",
+            name="mapping_point_cloud_assembler",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "fixed_frame_id": odom_frame,
+                "frame_id": base_frame,
+                "max_clouds": 4,
+                "assembling_time": 0.75,
+                "circular_buffer": True,
+                "qos": _SENSOR_DATA_QOS,
+                "voxel_size": 0.035,
+                "wait_for_transform": 0.2,
+            }],
+            remappings=[
+                ("cloud", deskewed_cloud_topic),
+                ("assembled_cloud", assembled_cloud_topic),
+            ],
+        ))
+        nodes.append(Node(
+            package="pointcloud_to_laserscan",
+            executable="pointcloud_to_laserscan_node",
+            name="mapping_pointcloud_to_laserscan",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "target_frame": base_frame,
+                "transform_tolerance": 0.2,
+                "queue_size": 10,
+                "min_height": -0.25,
+                "max_height": 0.50,
+                "angle_min": -3.141592653589793,
+                "angle_max": 3.141592653589793,
+                "angle_increment": 0.008726646259971648,
+                "scan_time": 0.26,
+                "range_min": 0.492,
+                "range_max": 6.0,
+                "use_inf": True,
+                "inf_epsilon": 1.0,
+            }],
+            remappings=[
+                ("cloud_in", assembled_cloud_topic),
+                ("scan", dense_scan_topic),
             ],
         ))
 
@@ -363,6 +546,12 @@ def _make_nodes(context, *args, **kwargs):
             "odom_frame_id": odom_frame,
             "publish_tf": not navigation_odom_bridge,
             "approx_sync": True,
+            # `icp_odometry` uses the generic `qos` parameter for both its
+            # LaserScan and PointCloud2 inputs (not rtabmap's `qos_scan`).
+            "qos": _SENSOR_DATA_QOS,
+            # Accept both best-effort raw sensor relays and reliable filtered
+            # IMU publishers. A best-effort reader is compatible with either.
+            "qos_imu": _SENSOR_DATA_QOS,
             "wait_for_transform": 1.5,
             "deskewing": deskew_lidar,
             "deskewing_slerp": True,
@@ -372,9 +561,13 @@ def _make_nodes(context, *args, **kwargs):
             "Icp/MaxCorrespondenceDistance": "1.0",
             "Odom/ScanKeyFrameThr": "0.4",
         }
-        for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):
-            if key in rtabmap_params:
-                icp_odom_params[key] = rtabmap_params[key]
+        # The actual /rtabmap/odom producer is a different process from the
+        # SLAM node above, so explicitly forward the deploy-approved Icp/Odom
+        # core parameters. Deploy values intentionally win over the generic
+        # internal-odometry defaults in this launch file.
+        icp_odom_params.update(
+            select_icp_odometry_overrides(deployment_overrides)
+        )
         if have_imu:
             icp_odom_remappings.append(("imu", filtered_imu_topic))
             icp_odom_params["wait_imu_to_init"] = True
@@ -435,18 +628,21 @@ def _make_nodes(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "frame_id": base_frame,
             "odom_frame_id": rtabmap_odom_frame,
-            "subscribe_scan": have_scan,
-            "subscribe_scan_cloud": have_scan_cloud,
+            "subscribe_scan": rtabmap_have_scan,
+            "subscribe_scan_cloud": rtabmap_have_scan_cloud,
             "subscribe_rgb": False,
             "subscribe_depth": False,
+            "qos_scan": _SENSOR_DATA_QOS,
             "approx_sync": True,
             "queue_size": 30,
             "wait_for_transform": 1.5,
         }
         viz_remappings = []
-        if have_scan:
-            viz_remappings.append(("scan", scan_topic))
-        if have_scan_cloud:
+        if rtabmap_have_scan:
+            viz_remappings.append((
+                "scan", dense_scan_topic if dense_scan_2d else scan_topic
+            ))
+        if rtabmap_have_scan_cloud:
             viz_remappings.append(("scan_cloud", scan_cloud_topic))
         if have_odom:
             viz_remappings.append(("odom", odom_topic))
@@ -490,6 +686,16 @@ def _make_nodes(context, *args, **kwargs):
     nodes.append(tf_adapter)
 
     return nodes
+
+
+def _rtabmap_bool(name, value):
+    """Parse a deploy-owned RTAB-Map boolean without truthy-string surprises."""
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean value, got {value!r}")
 
 
 def _derive_camera_info(rgb_topic: str) -> str:

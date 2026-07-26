@@ -39,6 +39,16 @@ class RtabmapConfigurationTest(unittest.TestCase):
             package.mkdir()
             deploy.mkdir()
             fake_bin.mkdir()
+            runtime_proto = root / "runtime-proto"
+            runtime_proto.mkdir()
+            (runtime_proto / "atlas.proto").write_text(
+                'syntax = "proto3";\n', encoding="utf-8"
+            )
+            proto_staging = package / "rbnx-build" / "proto-staging"
+            proto_staging.mkdir(parents=True)
+            (proto_staging / "mapping.proto").write_text(
+                'syntax = "proto3";\n', encoding="utf-8"
+            )
             docker_args = root / "docker.args"
             docker = fake_bin / "docker"
             docker.write_text(
@@ -50,7 +60,10 @@ class RtabmapConfigurationTest(unittest.TestCase):
             )
             docker.chmod(0o755)
             rbnx = fake_bin / "rbnx"
-            rbnx.write_text('#!/usr/bin/env bash\necho /tmp/robonix-api\n')
+            rbnx.write_text(
+                f'#!/usr/bin/env bash\necho "{runtime_proto}"\n',
+                encoding="utf-8",
+            )
             rbnx.chmod(0o755)
             env = os.environ.copy()
             env.update(
@@ -163,6 +176,10 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn("config/rtabmap_params.template.yaml", text)
         self.assertIn("never loaded at runtime", text)
         self.assertIn("sensor_providers:", text)
+        self.assertIn("Icp/* and Odom/* values", text)
+        self.assertIn("dense_scan_2d:", text)
+        self.assertIn("dense_scan_refine_neighbors:", text)
+        self.assertIn("default: false", text)
 
     def test_occupancy_source_is_policy_not_sensor_inference(self):
         profiles = load_profiles()
@@ -259,12 +276,21 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn('(\"imu\", filtered_imu_topic)', source)
 
     def test_icp_motion_limits_are_forwarded_to_internal_odometry(self):
-        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
-        self.assertIn(
-            'for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):',
-            source,
+        profiles = load_profiles()
+        selected = profiles.select_icp_odometry_overrides(
+            {
+                "Icp/MaxTranslation": "0.25",
+                "Icp/MaxRotation": "0.20",
+                "Grid/RangeMax": "10.0",
+            }
         )
-        self.assertIn('icp_odom_params[key] = rtabmap_params[key]', source)
+        self.assertEqual(
+            selected,
+            {
+                "Icp/MaxTranslation": "0.25",
+                "Icp/MaxRotation": "0.20",
+            },
+        )
 
     def test_navigation_odom_bridge_is_opt_in_and_keeps_legacy_defaults(self):
         launch = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
@@ -300,6 +326,251 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn(
             "elif have_scan or have_scan_cloud or have_rgbd:", source
         )
+
+    def test_lidar_consumers_use_sensor_data_best_effort_qos(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        self.assertIn("_SENSOR_DATA_QOS = 2", source)
+        # rtabmap_slam and rtabmap_viz expose qos_scan, while
+        # rtabmap_odom/icp_odometry exposes generic qos plus qos_imu.
+        self.assertEqual(source.count('"qos_scan": _SENSOR_DATA_QOS'), 2)
+        # icp_odometry, lidar_deskewing and the opt-in cloud assembler expose
+        # generic `qos`.
+        self.assertEqual(source.count('"qos": _SENSOR_DATA_QOS'), 3)
+        self.assertEqual(source.count('"qos_imu": _SENSOR_DATA_QOS'), 1)
+
+    def test_dense_scan_2d_is_explicit_and_disabled_by_default(self):
+        bridge = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        engine = (ROOT / "scripts" / "start_engine.sh").read_text()
+        launch = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+
+        self.assertIn('"dense_scan_2d",', bridge)
+        self.assertIn("DENSE_SCAN_2D=$(read_y dense_scan_2d)", engine)
+        self.assertIn('DENSE_SCAN_2D="${DENSE_SCAN_2D:-false}"', engine)
+        self.assertIn('dense_scan_2d:="$DENSE_SCAN_2D"', engine)
+        self.assertIn(
+            'DeclareLaunchArgument("dense_scan_2d", default_value="false")',
+            launch,
+        )
+        self.assertIn("if dense_scan_2d:", launch)
+        self.assertIn("dense_scan_2d requires external odometry", launch)
+        self.assertIn("dense_scan_2d requires deskew_lidar=true", launch)
+
+    def test_dense_scan_2d_chain_has_bounded_production_parameters(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+
+        self.assertIn('executable="point_cloud_assembler"', source)
+        self.assertIn('"fixed_frame_id": odom_frame', source)
+        self.assertIn('"frame_id": base_frame', source)
+        self.assertIn('"max_clouds": 4', source)
+        self.assertIn('"assembling_time": 0.75', source)
+        self.assertIn("max_clouds\n        # and assembling_time as an OR bound", source)
+        self.assertIn('"circular_buffer": True', source)
+        self.assertIn('"voxel_size": 0.035', source)
+        self.assertIn('("cloud", deskewed_cloud_topic)', source)
+        self.assertIn('("assembled_cloud", assembled_cloud_topic)', source)
+
+        self.assertIn('executable="pointcloud_to_laserscan_node"', source)
+        self.assertIn('"target_frame": base_frame', source)
+        self.assertIn('"min_height": -0.25', source)
+        self.assertIn('"max_height": 0.50', source)
+        self.assertIn('"angle_increment": 0.008726646259971648', source)
+        self.assertIn('"queue_size": 10', source)
+        self.assertIn('"scan_time": 0.26', source)
+        self.assertIn('"range_min": 0.492', source)
+        self.assertIn('"range_max": 6.0', source)
+        self.assertIn('"use_inf": True', source)
+        self.assertIn('"inf_epsilon": 1.0', source)
+        self.assertIn('("cloud_in", assembled_cloud_topic)', source)
+        self.assertIn('("scan", dense_scan_topic)', source)
+
+        self.assertIn('"subscribe_scan": rtabmap_have_scan', source)
+        self.assertIn(
+            '"subscribe_scan_cloud": rtabmap_have_scan_cloud',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params["Grid/Scan2dUnknownSpaceFilled"] = "false"',
+            source,
+        )
+
+    def test_dense_neighbor_refinement_is_explicit_and_dense_only(self):
+        bridge = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        engine = (ROOT / "scripts" / "start_engine.sh").read_text()
+        launch = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+
+        self.assertIn('"dense_scan_refine_neighbors",', bridge)
+        self.assertIn(
+            "DENSE_SCAN_REFINE_NEIGHBORS=$(read_y dense_scan_refine_neighbors)",
+            engine,
+        )
+        self.assertIn(
+            'DENSE_SCAN_REFINE_NEIGHBORS="${DENSE_SCAN_REFINE_NEIGHBORS:-false}"',
+            engine,
+        )
+        self.assertIn(
+            'dense_scan_refine_neighbors:="$DENSE_SCAN_REFINE_NEIGHBORS"',
+            engine,
+        )
+        self.assertIn(
+            '"dense_scan_refine_neighbors", default_value="false"',
+            launch,
+        )
+        self.assertIn(
+            "dense_scan_refine_neighbors requires dense_scan_2d=true",
+            launch,
+        )
+        self.assertIn(
+            "neighbor refinement is never enabled on the sparse raw",
+            launch,
+        )
+
+    def test_dense_neighbor_refinement_preserves_deploy_precedence(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+
+        applied = source.index("rtabmap_params.update(deployment_overrides)")
+        neighbor_default = source.index(
+            'rtabmap_params.setdefault("RGBD/NeighborLinkRefining", "true")'
+        )
+        self.assertLess(applied, neighbor_default)
+        self.assertIn(
+            'rtabmap_params.setdefault("Reg/Strategy", "1")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Reg/Force3DoF", "true")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("RGBD/ProximityBySpace", "false")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("RGBD/ProximityPathMaxNeighbors", "0")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/PointToPlane", "true")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/PointToPlaneK", "5")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/PointToPlaneMinComplexity", "0.02")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/PointToPlaneLowComplexityStrategy", "1")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/CorrespondenceRatio", "0.20")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/MaxCorrespondenceDistance", "0.15")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/MaxTranslation", "0.10")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/MaxRotation", "0.10")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/RangeMin", "0.492")',
+            source,
+        )
+        self.assertIn(
+            'rtabmap_params.setdefault("Icp/RangeMax", "6.0")',
+            source,
+        )
+        self.assertIn(
+            '"RGBD/NeighborLinkRefining" in deployment_overrides',
+            source,
+        )
+        self.assertIn("the explicit deploy value takes precedence", source)
+        self.assertIn("dense_scan_refine_neighbors requires ", source)
+        self.assertIn("RGBD/ProximityBySpace=false", source)
+        self.assertIn(
+            "dense_scan_refine_neighbors requires Reg/Strategy=1",
+            source,
+        )
+
+    def test_dense_neighbor_inline_false_overrides_params_file_true(self):
+        profiles = load_profiles()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rtabmap.yaml"
+            path.write_text(
+                "RGBD/NeighborLinkRefining: true\n"
+                "RGBD/ProximityBySpace: false\n",
+                encoding="utf-8",
+            )
+            old = os.environ.get("RBNX_INVOCATION_CWD")
+            os.environ["RBNX_INVOCATION_CWD"] = directory
+            try:
+                values = profiles.resolve_rtabmap_overrides(
+                    {"RGBD/NeighborLinkRefining": False},
+                    params_file="rtabmap.yaml",
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("RBNX_INVOCATION_CWD", None)
+                else:
+                    os.environ["RBNX_INVOCATION_CWD"] = old
+
+        self.assertIs(values["RGBD/NeighborLinkRefining"], False)
+        self.assertIs(values["RGBD/ProximityBySpace"], False)
+
+    def test_rgbd_profile_uses_sensor_data_image_qos_only_when_enabled(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        base_params, rgbd_and_later = source.split(
+            "\n    if have_rgbd:\n"
+            "        # RealSense and other camera drivers commonly publish",
+            1,
+        )
+        rgbd_params, _ = rgbd_and_later.split("\n\n    deployment_overrides", 1)
+
+        # Lidar-only keeps the established RTAB-Map parameter baseline.
+        self.assertNotIn('"qos_image"', base_params)
+        self.assertNotIn('"qos_camera_info"', base_params)
+
+        # RGB-D readers accept the sensor-data (best-effort) publishers.
+        self.assertIn('"qos_image": _SENSOR_DATA_QOS', rgbd_params)
+        self.assertIn('"qos_camera_info": _SENSOR_DATA_QOS', rgbd_params)
+        self.assertEqual(source.count('"qos_image": _SENSOR_DATA_QOS'), 1)
+        self.assertEqual(source.count('"qos_camera_info": _SENSOR_DATA_QOS'), 1)
+
+    def test_icp_odometry_receives_only_deploy_icp_and_odom_overrides(self):
+        profiles = load_profiles()
+        selected = profiles.select_icp_odometry_overrides(
+            {
+                "Icp/MaxCorrespondenceDistance": "0.2",
+                "Odom/GuessMotion": "false",
+                "Odom/ResetCountdown": "1",
+                "Grid/RangeMax": "10.0",
+                "Rtabmap/DetectionRate": "2.0",
+            }
+        )
+        self.assertEqual(
+            selected,
+            {
+                "Icp/MaxCorrespondenceDistance": "0.2",
+                "Odom/GuessMotion": "false",
+                "Odom/ResetCountdown": "1",
+            },
+        )
+
+    def test_icp_deploy_overrides_are_applied_after_internal_defaults(self):
+        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
+        defaults = source.index('"Icp/MaxCorrespondenceDistance": "1.0"')
+        forwarded = source.index(
+            "select_icp_odometry_overrides(deployment_overrides)"
+        )
+        self.assertLess(defaults, forwarded)
 
     def test_requested_rtabmap_input_must_resolve(self):
         profiles = load_profiles()

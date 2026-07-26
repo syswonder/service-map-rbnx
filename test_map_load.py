@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mapping_rbnx import map_ops
+from mapping_rbnx import lifecycle, map_ops
 
 
 class LoadMapTransactionTest(unittest.TestCase):
@@ -100,6 +100,26 @@ class LoadMapTransactionTest(unittest.TestCase):
             data=data,
         )
 
+    def test_corrupt_generation_fails_before_mode_or_database_services(self):
+        generation = os.path.join(self.tmp.name, "target", "generation")
+        with open(generation, "w", encoding="utf-8") as stream:
+            stream.write("not-an-integer")
+
+        with (
+            patch.object(map_ops, "MAPS_DIR", self.tmp.name),
+            patch.object(map_ops, "_sqlite_quick_check", return_value=(True, "ok")),
+            patch.object(map_ops, "_get_node") as get_node,
+            patch.object(map_ops, "_set_mode") as set_mode,
+            patch.object(map_ops, "_load_database") as load,
+        ):
+            result = map_ops.load_map_impl("target")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("generation is unreadable", result["detail"])
+        get_node.assert_not_called()
+        set_mode.assert_not_called()
+        load.assert_not_called()
+
     def test_occupancy_readiness_accepts_optimized_non_empty_map(self):
         msg = self._occupancy(3, 2, 0.05, [-1, 0, 0, 100, -1, 0])
 
@@ -117,6 +137,62 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertFalse(map_ops._occupancy_sample_ready(unknown)[0])
         self.assertFalse(map_ops._occupancy_sample_ready(malformed)[0])
         self.assertFalse(map_ops._occupancy_sample_ready(no_resolution)[0])
+
+
+class SavedMapGenerationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.maps_dir_patch = patch.object(lifecycle, "MAPS_DIR", self.tmp.name)
+        self.maps_dir_patch.start()
+        self.addCleanup(self.maps_dir_patch.stop)
+
+    def test_published_map_without_sidecar_starts_at_positive_epoch(self):
+        map_dir = os.path.join(self.tmp.name, "saved")
+        os.makedirs(map_dir)
+        open(os.path.join(map_dir, "rtabmap.db"), "wb").close()
+
+        self.assertEqual(lifecycle._load_gen("saved"), 1)
+
+    def test_unpublished_named_mapping_session_starts_at_zero(self):
+        os.makedirs(os.path.join(self.tmp.name, "new-session"))
+
+        self.assertEqual(lifecycle._load_gen("new-session"), 0)
+
+    def test_explicit_generation_sidecar_remains_authoritative(self):
+        map_dir = os.path.join(self.tmp.name, "saved")
+        os.makedirs(map_dir)
+        open(os.path.join(map_dir, "rtabmap.db"), "wb").close()
+        with open(os.path.join(map_dir, "generation"), "w", encoding="utf-8") as stream:
+            stream.write("7")
+
+        self.assertEqual(lifecycle._load_gen("saved"), 7)
+
+    def test_legacy_generation_is_persisted_once_without_touching_spatial_db(self):
+        map_dir = os.path.join(self.tmp.name, "saved")
+        os.makedirs(map_dir)
+        db_path = os.path.join(map_dir, "rtabmap.db")
+        with open(db_path, "wb") as stream:
+            stream.write(b"immutable-spatial-artifact")
+        with open(db_path, "rb") as stream:
+            before = stream.read()
+
+        with patch.object(map_ops, "MAPS_DIR", self.tmp.name):
+            self.assertEqual(map_ops._ensure_saved_map_generation("saved"), 1)
+            self.assertEqual(map_ops._ensure_saved_map_generation("saved"), 1)
+
+        with open(os.path.join(map_dir, "generation"), encoding="utf-8") as stream:
+            self.assertEqual(stream.read(), "1")
+        with open(db_path, "rb") as stream:
+            self.assertEqual(stream.read(), before)
+
+    def test_generation_writer_rejects_zero_negative_and_overflow(self):
+        map_dir = os.path.join(self.tmp.name, "saved")
+        os.makedirs(map_dir)
+        for value in (0, -1, map_ops.UINT64_MAX + 1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    map_ops._write_generation_file(map_dir, value)
 
 
 if __name__ == "__main__":

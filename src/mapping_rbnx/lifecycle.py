@@ -64,17 +64,25 @@ def _gen_path(map_id: str) -> str:
 
 
 def _load_gen(map_id: str) -> int:
-    """Read the persisted generation for a named map; 0 when absent (fresh
-    map — first bump makes it 1). An EXISTING but unparseable file is not
-    the same thing: it means the counter was lost (crash mid-write, manual
-    edit), so warn — silently restarting at 0 would reuse generation values
-    consumers have already seen."""
+    """Read the persisted generation for a named map.
+
+    A published saved map whose spatial artifact already exists but predates
+    the generation sidecar starts at epoch 1: its map frame is real and stable,
+    and localization consumers must never receive the reserved ``0`` epoch.
+    A not-yet-published named mapping session still starts at 0 so its first
+    mapping-mode bump becomes 1.
+
+    An EXISTING but unparseable file is not the same thing: it means the
+    counter was lost (crash mid-write, manual edit), so warn — silently
+    restarting at 0 would reuse generation values consumers have already
+    seen."""
     path = _gen_path(map_id)
     try:
         with open(path) as f:
             return max(0, int(f.read().strip()))
     except FileNotFoundError:
-        return 0
+        saved_db = os.path.join(MAPS_DIR, map_id, "rtabmap.db")
+        return 1 if os.path.isfile(saved_db) else 0
     except (OSError, ValueError) as e:
         log.warning("generation file %s unreadable (%s) — treating as 0; "
                     "epoch numbers may repeat for this map", path, e)

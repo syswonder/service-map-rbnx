@@ -95,6 +95,32 @@ it preserves the legacy automatic choice for existing deployments.
 field. External odom drives TF deskewing; without external odom the ICP node
 uses its motion estimate.
 
+`dense_scan_2d: true` is an opt-in conditioning path for sparse,
+non-repetitive 3D lidar packets. It requires `lidar3d`, external `odom`, and
+`deskew_lidar: true`. The launch aligns a rolling window of four deskewed
+clouds in `odom`, publishes the accumulated cloud in `base_frame`, and projects
+that cloud to a 0.5-degree `LaserScan` for RTAB-Map. In this mode RTAB-Map
+subscribes to the generated scan rather than the original `scan_cloud`, and
+unobserved scan bins remain unknown. Omitting the option preserves the direct
+PointCloud2 path exactly.
+
+`dense_scan_refine_neighbors: true` is a second, independent opt-in that uses
+the generated dense `LaserScan` to ICP-refine only consecutive RTAB-Map graph
+edges. It requires `dense_scan_2d: true`, is never enabled on the sparse raw
+PointCloud2 path, and keeps `RGBD/ProximityBySpace=false` so corridor lookalikes
+cannot create spatial-proximity links. The switch supplies defaults for
+planar point-to-plane ICP (`Reg/Strategy=1`, `Reg/Force3DoF=true`,
+`Icp/PointToPlane=true`, five-neighbor normals, and RTAB-Map's
+low-complexity-corridor strategy), `Icp/CorrespondenceRatio=0.20`, a
+`0.492`-to-`6.0` metre input range, and bounded correspondence/translation/
+rotation values of `0.15`/`0.10`/`0.10`. It also defaults
+`RGBD/ProximityPathMaxNeighbors=0` and
+`RGBD/NeighborLinkRefining=true`. Deploy `params_file` values override these
+defaults and inline `rtabmap_params` overrides the file. An explicit
+`RGBD/NeighborLinkRefining=false` is therefore preserved and reported at
+launch rather than silently replaced. A conflicting
+`RGBD/ProximityBySpace=true` is rejected.
+
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 
 Runtime RPC+MCP controls for managing maps without re-deploying. All three are

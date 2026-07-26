@@ -37,6 +37,7 @@ log = logging.getLogger("mapping_rbnx.map_ops")
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
 PKG_HOST_DIR = os.environ.get("ROBONIX_PKG_HOST_DIR", "/mapping")
 RUNTIME_DB_DIR = os.environ.get("MAPPING_RUNTIME_DB_DIR", "/tmp/robonix-mapping-runtime")
+UINT64_MAX = (1 << 64) - 1
 
 # rtabmap node name prefix; the launch runs the slam node as `/rtabmap/rtabmap`
 # so its services live under `/rtabmap/...`.
@@ -52,6 +53,63 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 def _sanitize_map_id(map_id: str) -> str:
     import re
     return re.sub(r"[^A-Za-z0-9._-]", "_", (map_id or "").strip()) or "default"
+
+
+def _write_generation_file(map_dir: str, generation: int) -> None:
+    """Atomically persist a positive map-frame epoch beside the spatial map."""
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise ValueError("map generation must be an integer")
+    if generation <= 0 or generation > UINT64_MAX:
+        raise ValueError(f"map generation must be within [1, {UINT64_MAX}]")
+    path = os.path.join(map_dir, "generation")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            stream.write(str(generation))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _ensure_saved_map_generation(map_id: str) -> int:
+    """Return a positive persisted epoch for a valid published map.
+
+    Legacy maps saved before lifecycle sidecars existed are migrated from a
+    missing or explicit zero value to epoch 1. Corrupt, negative, or overflowing
+    values fail closed before RTAB-Map mode or database services are touched.
+    Spatial artifacts are never modified.
+    """
+    map_dir = os.path.join(MAPS_DIR, _sanitize_map_id(map_id))
+    db_path = os.path.join(map_dir, "rtabmap.db")
+    if not os.path.isfile(db_path):
+        raise ValueError(f"saved map spatial artifact is missing: {db_path}")
+    path = os.path.join(map_dir, "generation")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            raw = stream.read().strip()
+        generation = int(raw)
+    except FileNotFoundError:
+        generation = 0
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"saved map generation is unreadable: {exc}") from exc
+    if generation < 0 or generation > UINT64_MAX:
+        raise ValueError(f"saved map generation must be within [0, {UINT64_MAX}]")
+    if generation == 0:
+        generation = 1
+        _write_generation_file(map_dir, generation)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            verified = int(stream.read().strip())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"saved map generation verification failed: {exc}") from exc
+    if verified != generation or verified <= 0:
+        raise ValueError("saved map generation verification did not preserve a positive epoch")
+    return verified
 
 
 def _sqlite_quick_check(db_path: str) -> tuple[bool, str]:
@@ -411,6 +469,10 @@ def load_map_impl(map_id: str, mode: str = "localization",
     db_ok, db_detail = _sqlite_quick_check(db_path)
     if not db_ok:
         return {"ok": False, "detail": f"saved map database is invalid: {db_detail}"}
+    try:
+        map_generation = _ensure_saved_map_generation(map_id)
+    except ValueError as exc:
+        return {"ok": False, "detail": str(exc)}
 
     node = _get_node()
     if node is None:
@@ -469,7 +531,8 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": True,
                 "runtime_db_path": runtime_db,
                 "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}; "
-                          f"{verify_detail}; elapsed={elapsed:.1f}s{seeded}{note}"}
+                          f"{verify_detail}; generation={map_generation}; "
+                          f"elapsed={elapsed:.1f}s{seeded}{note}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
         return {"ok": False, "detail": str(e)}
@@ -863,6 +926,10 @@ def save_map_impl(map_id: str, note: str = "",
                 "detail": f"staged database failed final integrity check: {db_detail}",
             }
 
+        # Publish the frame epoch in the same atomic directory transition as
+        # the DB and occupancy files. A saved map is a stable named frame, so
+        # its first lifecycle generation is 1 rather than the reserved 0.
+        _write_generation_file(staging_dir, 1)
         _atomic_publish_map_dir(staging_dir, map_dir)
         staging_dir = ""
         return {

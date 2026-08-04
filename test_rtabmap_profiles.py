@@ -240,6 +240,15 @@ class RtabmapConfigurationTest(unittest.TestCase):
         )
         self.assertIn("external odom remains owned by its provider", source)
 
+    def test_occupancy_grid_declares_transient_local_qos(self):
+        source = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()
+        self.assertIn(
+            'contract_id == "robonix/service/map/occupancy_grid"',
+            source,
+        )
+        self.assertIn('mapping.declare_ros2_topic(contract_id, topic, qos=output_qos)', source)
+        self.assertIn('"transient_local"', source)
+
     def test_external_odom_uses_canonical_tf_mode(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
         self.assertIn(

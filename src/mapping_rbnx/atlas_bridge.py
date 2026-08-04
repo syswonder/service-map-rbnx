@@ -466,7 +466,12 @@ def _declare_outputs(cap: Service, algo: str, resolved: dict[str, str]) -> None:
             continue
         topic = bindings[contract_id]
         try:
-            mapping.declare_ros2_topic(contract_id, topic, qos="reliable")
+            output_qos = (
+                "transient_local"
+                if contract_id == "robonix/service/map/occupancy_grid"
+                else "reliable"
+            )
+            mapping.declare_ros2_topic(contract_id, topic, qos=output_qos)
             declared += 1
             log.info("declared %s → ROS2 topic %s", contract_id, topic)
         except Exception as e:  # noqa: BLE001

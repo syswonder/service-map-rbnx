@@ -291,6 +291,18 @@ class RtabmapConfigurationTest(unittest.TestCase):
             launch,
         )
         self.assertIn('"publish_tf": True', launch)
+        self.assertIn('"odom_sensor_sync": navigation_odom_bridge', launch)
+        self.assertIn(
+            'if navigation_odom_bridge\n        else "/initialpose"', launch
+        )
+        self.assertIn(
+            '"-p", "initialpose_topic:=/initialpose"', launch
+        )
+        self.assertNotIn("icp_reset_service", launch)
+        bridge_source = (
+            ROOT / "src" / "mapping_rbnx" / "map_to_odom_bridge.py"
+        ).read_text()
+        self.assertNotIn("ResetPose", bridge_source)
 
     def test_navigation_odom_bridge_config_reaches_launch(self):
         bridge = (ROOT / "src" / "mapping_rbnx" / "atlas_bridge.py").read_text()

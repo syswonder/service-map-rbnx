@@ -10,6 +10,11 @@ the sole navigation correction ``map -> odom``.
 
 The node is opt-in.  Legacy mapping deployments never start it and retain the
 existing RTAB-Map/odometry TF behaviour unchanged.
+
+In split-odometry mode this node also relays the public ``/initialpose`` to
+RTAB-Map. It deliberately does not reset ICP or judge whether RTAB-Map accepted
+the rough seed: the single-odometry path does neither. The bridge only prevents
+pre-seed cached samples from being fused with post-seed transforms.
 """
 from __future__ import annotations
 
@@ -17,20 +22,20 @@ import math
 from collections import deque
 
 import rclpy
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
-
 from mapping_rbnx.odom_bridge_math import (
     Pose2,
     TimedPose2,
     compose,
     interpolate,
     inverse,
+    post_seed_pair_ready,
 )
 
 
@@ -69,6 +74,10 @@ class MapToOdomBridge(Node):
         self.declare_parameter("localization_timeout_s", 2.0)
         self.declare_parameter("reset_translation_m", 0.30)
         self.declare_parameter("reset_rotation_rad", math.radians(30.0))
+        self.declare_parameter("initialpose_topic", "/initialpose")
+        self.declare_parameter(
+            "rtabmap_initialpose_topic", "/rtabmap/initialpose_bridge"
+        )
 
         self.map_frame = self._string("map_frame")
         self.icp_odom_frame = self._string("icp_odom_frame")
@@ -84,6 +93,10 @@ class MapToOdomBridge(Node):
         )
         self.reset_translation_m = self._double("reset_translation_m")
         self.reset_rotation_rad = self._double("reset_rotation_rad")
+        self.initialpose_topic = self._string("initialpose_topic")
+        self.rtabmap_initialpose_topic = self._string(
+            "rtabmap_initialpose_topic"
+        )
 
         if self.icp_odom_frame == self.nav_odom_frame:
             raise RuntimeError(
@@ -102,6 +115,15 @@ class MapToOdomBridge(Node):
         self.create_subscription(
             Odometry, self.icp_odom_topic, self._on_icp_odom, qos
         )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.initialpose_topic,
+            self._on_initialpose,
+            10,
+        )
+        self.initialpose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped, self.rtabmap_initialpose_topic, 10
+        )
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -111,6 +133,8 @@ class MapToOdomBridge(Node):
         self.last_correction: Pose2 | None = None
         self.last_processed_icp_ns = -1
         self.last_nav_pose: TimedPose2 | None = None
+        self.relocalization_forwarded_ns = -1
+        self.relocalization_pending = False
         self.wait_reason = ""
         self.timer = self.create_timer(max(0.01, 1.0 / max(0.1, rate)), self._tick)
         self.get_logger().info(
@@ -124,6 +148,28 @@ class MapToOdomBridge(Node):
                 self.icp_odom_topic,
                 self.nav_odom_topic,
             )
+        )
+
+    def _on_initialpose(self, msg: PoseWithCovarianceStamped) -> None:
+        if msg.header.frame_id and msg.header.frame_id != self.map_frame:
+            self.get_logger().error(
+                "ignoring initial pose in frame %r; expected %r"
+                % (msg.header.frame_id, self.map_frame)
+            )
+            return
+
+        # Match the single-odometry path: RTAB-Map alone interprets the rough
+        # pose and performs scan matching. The bridge does not reset ICP and
+        # does not synthesize a map->odom transform from the clicked pose.
+        self.relocalization_forwarded_ns = self.get_clock().now().nanoseconds
+        self.relocalization_pending = True
+        self.latest_icp = None
+        self.last_processed_icp_ns = -1
+        self.wait_reason = ""
+        self.initialpose_publisher.publish(msg)
+        self.get_logger().info(
+            "forwarded RViz rough pose directly to RTAB-Map on %s; preserving "
+            "the ICP trajectory" % self.rtabmap_initialpose_topic
         )
 
     def _string(self, name: str) -> str:
@@ -176,7 +222,14 @@ class MapToOdomBridge(Node):
     def _on_icp_odom(self, msg: Odometry) -> None:
         if not self._valid_frames(msg, self.icp_odom_frame, "ICP odom"):
             return
-        self.latest_icp = TimedPose2(self._stamp_ns(msg), pose_from_odometry(msg))
+        sample = TimedPose2(self._stamp_ns(msg), pose_from_odometry(msg))
+        if (
+            self.relocalization_pending
+            and sample.stamp_ns <= self.relocalization_forwarded_ns
+        ):
+            self._warn_once("discarding pre-relocalization ICP odometry sample")
+            return
+        self.latest_icp = sample
 
     def _nav_pose_at(self, stamp_ns: int) -> Pose2 | None:
         if not self.nav_history:
@@ -217,8 +270,31 @@ class MapToOdomBridge(Node):
         except Exception as exc:  # noqa: BLE001
             self._warn_once(f"waiting for RTAB-Map map->odom_icp: {exc}")
             return
-        map_to_base = compose(pose_from_transform(map_to_icp_msg), icp.pose)
-        self.last_correction = compose(map_to_base, inverse(chassis))
+        map_to_icp = pose_from_transform(map_to_icp_msg)
+        tf_stamp_ns = (
+            int(map_to_icp_msg.header.stamp.sec) * 1_000_000_000
+            + int(map_to_icp_msg.header.stamp.nanosec)
+        )
+        map_to_base = compose(map_to_icp, icp.pose)
+        correction = compose(map_to_base, inverse(chassis))
+
+        if self.relocalization_pending:
+            if not post_seed_pair_ready(
+                self.relocalization_forwarded_ns,
+                icp.stamp_ns,
+                tf_stamp_ns,
+            ):
+                self._warn_once(
+                    "waiting for post-seed ICP and RTAB-Map TF samples"
+                )
+                return
+            self.get_logger().info(
+                "post-seed RTAB-Map/ICP stream observed; resuming normal "
+                "split-odometry composition"
+            )
+            self.relocalization_pending = False
+
+        self.last_correction = correction
         self.last_processed_icp_ns = icp.stamp_ns
         if self.wait_reason:
             self.get_logger().info("map-to-odom bridge inputs recovered")
@@ -233,12 +309,13 @@ class MapToOdomBridge(Node):
         self._update_correction()
         correction = self.last_correction
         icp = self.latest_icp
-        if correction is None or icp is None:
+        if correction is None:
             return
-        age_ns = self.get_clock().now().nanoseconds - icp.stamp_ns
-        if age_ns > self.localization_timeout_ns:
+        now_ns = self.get_clock().now().nanoseconds
+        if icp is not None and now_ns - icp.stamp_ns > self.localization_timeout_ns:
             self._warn_once(
-                f"ICP/RTAB-Map correction is stale ({age_ns / 1e9:.2f}s); "
+                "ICP/RTAB-Map correction is stale "
+                f"({(now_ns - icp.stamp_ns) / 1e9:.2f}s); "
                 "holding the last map->odom correction"
             )
         msg = TransformStamped()

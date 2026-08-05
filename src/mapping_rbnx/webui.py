@@ -37,9 +37,17 @@ log = logging.getLogger("mapping_rbnx.webui")
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
 MAP_TOPIC = os.environ.get("MAPPING_MAP_TOPIC", "/map")
 POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
+MAP_STALE_AFTER_S = float(os.environ.get("MAPPING_WEBUI_MAP_STALE_AFTER_S", "5.0"))
+POSE_STALE_AFTER_S = float(os.environ.get("MAPPING_WEBUI_POSE_STALE_AFTER_S", "2.0"))
 
 # Latest map / pose, filled by ROS subscriptions on the webui's own node.
-_latest = {"grid": None, "pose": None}
+_latest = {
+    "grid": None,
+    "pose": None,
+    "grid_received_monotonic": None,
+    "pose_received_monotonic": None,
+}
+_latest_lock = threading.Lock()
 _subscribed = False
 _sub_lock = threading.Lock()
 # Keep the dedicated node + executor alive for the process lifetime.
@@ -60,6 +68,59 @@ _seed = {"x": None, "y": None, "theta": None, "t": 0.0}
 _mode = os.environ.get("MAPPING_STARTUP_MODE", "mapping")
 
 
+def _record_latest(kind: str, msg, *, received_monotonic: float | None = None) -> None:
+    """Store a ROS sample together with its local receipt time.
+
+    ROS header time cannot tell the browser whether this process is still
+    receiving data: a frozen publisher leaves a perfectly valid-looking last
+    message in memory.  A local monotonic receipt clock makes that distinction
+    explicit and is immune to workstation wall-clock adjustments.
+    """
+    if kind not in ("grid", "pose"):
+        raise ValueError(f"unsupported live sample kind: {kind}")
+    received = time.monotonic() if received_monotonic is None else received_monotonic
+    with _latest_lock:
+        _latest[kind] = msg
+        _latest[f"{kind}_received_monotonic"] = received
+
+
+def _clear_latest() -> None:
+    """Drop every cached live sample and its receipt timestamp."""
+    with _latest_lock:
+        _latest.update(
+            grid=None,
+            pose=None,
+            grid_received_monotonic=None,
+            pose_received_monotonic=None,
+        )
+
+
+def _latest_snapshot(*, now_monotonic: float | None = None) -> dict:
+    """Return an atomic live-data snapshot with age and staleness metadata."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    with _latest_lock:
+        grid = _latest["grid"]
+        pose = _latest["pose"]
+        grid_received = _latest["grid_received_monotonic"]
+        pose_received = _latest["pose_received_monotonic"]
+
+    def _age(received):
+        if received is None:
+            return None
+        return max(0.0, now - received)
+
+    map_age = _age(grid_received)
+    pose_age = _age(pose_received)
+    return {
+        "grid": grid,
+        "pose": pose,
+        "map_age_s": map_age,
+        "pose_age_s": pose_age,
+        "map_stale": map_age is None or map_age > MAP_STALE_AFTER_S,
+        "pose_stale": pose_age is None or pose_age > POSE_STALE_AFTER_S,
+    }
+
+
 def set_mode_hint(mode: str) -> None:
     """Record the current SLAM mode for the UI (called by atlas_bridge at init
     with the config's startup map_mode, and by the switch/load handlers)."""
@@ -76,9 +137,9 @@ def _log_add(kind: str, msg: str) -> None:
     log.info("[webui:%s] %s", kind, msg)
 
 
-def _live_pose_xytheta():
+def _live_pose_xytheta(snapshot: dict | None = None):
     """Current map-frame pose as (x, y, yaw) from the latest /pose, or None."""
-    ps = _latest.get("pose")
+    ps = (snapshot or _latest_snapshot()).get("pose")
     if ps is None:
         return None
     pp = ps.pose.pose
@@ -144,10 +205,10 @@ def _ensure_subscriptions() -> None:
             latched.reliability = QoSReliabilityPolicy.RELIABLE
 
             def _on_grid(msg):
-                _latest["grid"] = msg
+                _record_latest("grid", msg)
 
             def _on_pose(msg):
-                _latest["pose"] = msg
+                _record_latest("pose", msg)
 
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
@@ -253,6 +314,8 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  .mapitem img{width:64px;height:64px;object-fit:contain;background:#000;border-radius:4px}
  .muted{color:#8b93a3;font-size:12px}
  #status{padding:6px 16px;color:#8b93a3;font-size:13px}
+ #status.stale{color:#ff6b6b;font-weight:600}
+ #status.disconnected{color:#ff6b6b;font-weight:600}
 </style></head><body>
 <header>Robonix · mapping live map</header>
 <div id=status>connecting…</div>
@@ -286,7 +349,7 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  </div>
 </div>
 <script>
-function setStatus(t){document.getElementById('status').textContent=t}
+function setStatus(t,kind=''){let e=document.getElementById('status');e.textContent=t;e.className=kind}
 // ── interactive canvas map: pan (drag) / zoom (wheel) / grid / pose / click-pose
 // ── scene-style world-centered canvas (proven model from scene webui) ──
 // fit() pins the canvas backing-store resolution to its CSS display size,
@@ -298,7 +361,8 @@ let MI=null, mapImg=null;
 let center=[0,0], pxPerM=40, userMoved=false;   // world center + zoom
 function w2p(x,y){return [cv.width/2+(x-center[0])*pxPerM, cv.height/2-(y-center[1])*pxPerM]}
 function p2w(sx,sy){return [center[0]+(sx-cv.width/2)/pxPerM, center[1]-(sy-cv.height/2)/pxPerM]}
-function reloadMapImg(){let i=new Image();i.onload=()=>{mapImg=i;draw()};i.onerror=()=>{};i.src='/api/map.png?'+Date.now()}
+function reloadMapImg(){if(MI&&!MI.has_map){mapImg=null;draw();return}
+ let i=new Image();i.onload=()=>{mapImg=i;draw()};i.onerror=()=>{mapImg=null;draw()};i.src='/api/map.png?'+Date.now()}
 function fitView(){if(!MI)return;userMoved=false;fit();
  let wM=MI.width*MI.resolution,hM=MI.height*MI.resolution;
  center=MI.pose?[MI.pose.x,MI.pose.y]:[MI.origin_x+wM/2,MI.origin_y+hM/2];
@@ -319,7 +383,7 @@ function draw(){fit();cx.clearRect(0,0,cv.width,cv.height);
  for(let y=oy;y<cv.height;y+=step){cx.moveTo(0,y);cx.lineTo(cv.width,y)}
  cx.stroke();
  // live pose marker
- if(MI.pose){let p=w2p(MI.pose.x,MI.pose.y),yaw=MI.pose.theta;
+ if(MI.pose&&!MI.pose_stale){let p=w2p(MI.pose.x,MI.pose.y),yaw=MI.pose.theta;
   cx.fillStyle='#e63b3b';cx.strokeStyle='#e63b3b';cx.lineWidth=2;
   cx.beginPath();cx.arc(p[0],p[1],5,0,7);cx.fill();
   cx.beginPath();cx.moveTo(p[0],p[1]);cx.lineTo(p[0]+18*Math.cos(yaw),p[1]-18*Math.sin(yaw));cx.stroke()}}
@@ -342,10 +406,17 @@ cv.addEventListener('click',async e=>{if(moved>4||!MI)return;
  setStatus('seeding pose…');
  let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:wp[0],y:wp[1],theta:0})})).json();
  setStatus(r.detail||'seeded')});
-async function poll(){try{let s=await (await fetch('/api/state')).json();MI=s;
+function ageText(x){return x==null?'never':x.toFixed(1)+'s ago'}
+async function poll(){try{let r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);
+  let s=await r.json();MI=s;
   if(CURMODE==null&&s.mode)CURMODE=s.mode;applyMode();
-  setStatus(s.has_map?('map '+s.width+'×'+s.height+' @'+s.resolution+'m  pose='+(s.pose?('('+s.pose.x.toFixed(2)+', '+s.pose.y.toFixed(2)+', '+s.pose.theta.toFixed(2)+')'):'—')+(s.dist_from_seed!=null?'  Δseed='+s.dist_from_seed+'m':'')):'no map yet');draw()}
-  catch(e){setStatus('disconnected')}}
+  if(s.has_map&&s.pose_stale){
+   setStatus('STALE — pose last received '+ageText(s.pose_age_s)+'; base map retained, old robot pose hidden','stale');
+  }else if(s.has_map){
+   setStatus('LIVE · map '+s.width+'×'+s.height+' @'+s.resolution+'m · grid age '+ageText(s.map_age_s)+(s.map_stale?' (cached base map)':'')+' · pose='+(s.pose?('('+s.pose.x.toFixed(2)+', '+s.pose.y.toFixed(2)+', '+s.pose.theta.toFixed(2)+')'):'waiting')+(s.dist_from_seed!=null?'  Δseed='+s.dist_from_seed+'m':''));
+  }else{setStatus('connected · waiting for a fresh map')}
+  draw()}
+  catch(e){MI=null;mapImg=null;draw();setStatus('DISCONNECTED — mapping state API is unreachable','disconnected')}}
 setInterval(poll,1000);poll()
 async function loadLib(){let m=await (await fetch('/api/maps')).json();
  let el=document.getElementById('lib');el.innerHTML='';
@@ -378,7 +449,7 @@ async function doSwitch(mode){setStatus('switching to '+mode+'…');
 async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch? The new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
  setStatus('resetting map…');
  let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
- setStatus(r.detail||'reset')}
+ if(r.ok){MI=null;mapImg=null;userMoved=false;draw()}setStatus(r.detail||'reset')}
 async function doDelete(id){if(!confirm('Delete saved map '+id+'? This cannot be undone.'))return;
  setStatus('deleting '+id+'…');
  let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
@@ -390,19 +461,35 @@ function applyMode(){let mp=document.getElementById('btn-mapping'),lo=document.g
 </script></body></html>"""
 
 
+def _reset_map_from_webui() -> dict:
+    """Reset RTAB-Map and invalidate the web UI cache only on success."""
+    out = map_ops.reset_map_impl()
+    if out.get("ok"):
+        # The previous OccupancyGrid is transient-local/latched and otherwise
+        # remains indistinguishable from the first grid of the new map.  Make
+        # the browser wait for post-reset callbacks instead of rendering the
+        # old frame as though reset had already rebuilt it.
+        _clear_latest()
+    return out
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         return
 
-    def _send(self, code, ctype, body: bytes):
+    def _send(self, code, ctype, body: bytes, *, no_store: bool = False):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if no_store:
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, code=200):
-        self._send(code, "application/json", json.dumps(obj).encode())
+    def _json(self, obj, code=200, *, no_store: bool = False):
+        self._send(code, "application/json", json.dumps(obj).encode(), no_store=no_store)
 
     def do_GET(self):
         p = urlparse(self.path).path
@@ -411,29 +498,46 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, "text/html; charset=utf-8", _PAGE.encode())
             if p == "/api/map.png":
                 _ensure_subscriptions()
-                g = _latest["grid"]
+                live = _latest_snapshot()
+                g = live["grid"]
                 if g is None:
-                    return self._send(503, "text/plain", b"no map yet")
+                    return self._send(503, "text/plain", b"no map yet", no_store=True)
                 # Pure occupancy only — the live pose marker is drawn by the
                 # canvas on top, so don't bake a second (scaled) one into the PNG.
-                return self._send(200, "image/png", _grid_to_png(g))
+                # A grid may be intentionally latched and unchanged while the
+                # robot is stationary; map_age_s remains available from state,
+                # but an old grid is still a valid base map. Pose receipt age is
+                # the UI's primary live-chain signal.
+                return self._send(200, "image/png", _grid_to_png(g), no_store=True)
             if p == "/api/state":
                 _ensure_subscriptions()
-                g = _latest["grid"]
-                st = {"has_map": g is not None, "mode": _mode}
+                live = _latest_snapshot()
+                g = live["grid"]
+                st = {
+                    "has_map": g is not None,
+                    "mode": _mode,
+                    "map_age_s": (round(live["map_age_s"], 3)
+                                  if live["map_age_s"] is not None else None),
+                    "pose_age_s": (round(live["pose_age_s"], 3)
+                                   if live["pose_age_s"] is not None else None),
+                    "map_stale": live["map_stale"],
+                    "pose_stale": live["pose_stale"],
+                    "map_stale_after_s": MAP_STALE_AFTER_S,
+                    "pose_stale_after_s": POSE_STALE_AFTER_S,
+                }
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
                               resolution=round(g.info.resolution, 4),
                               origin_x=g.info.origin.position.x,
                               origin_y=g.info.origin.position.y)
-                cur = _live_pose_xytheta()
+                cur = _live_pose_xytheta(live)
                 if cur is not None:
                     st["pose"] = {"x": cur[0], "y": cur[1], "theta": cur[2]}
                     if _seed["x"] is not None:
                         st["seed"] = {"x": _seed["x"], "y": _seed["y"], "theta": _seed["theta"]}
                         st["dist_from_seed"] = round(math.hypot(cur[0] - _seed["x"],
                                                                 cur[1] - _seed["y"]), 3)
-                return self._json(st)
+                return self._json(st, no_store=True)
             if p == "/api/log":
                 with _log_lock:
                     return self._json(list(_LOG))
@@ -477,7 +581,7 @@ class _Handler(BaseHTTPRequestHandler):
                 _log_add("delete", out.get("detail") or (f"deleted {mid}" if out.get("ok") else "delete failed"))
                 return self._json(out)
             if p == "/api/reset":
-                out = map_ops.reset_map_impl()
+                out = _reset_map_from_webui()
                 _log_add("reset", out.get("detail") or ("map cleared" if out.get("ok") else "reset failed"))
                 return self._json(out)
             if p == "/api/pose_estimate":

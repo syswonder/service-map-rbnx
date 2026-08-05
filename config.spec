@@ -40,6 +40,8 @@ optional:
     description: >-
       Optional final overrides on the deploy-owned params_file. Keys use
       RTAB-Map names such as Grid/FootprintLength. Values must be scalar.
+      When Mapping runs its internal icp_odometry, Icp/* and Odom/* values
+      are applied to both the SLAM node and that odometry producer.
 
   params_file:
     type: path
@@ -54,6 +56,33 @@ optional:
     type: boolean
     default: false
     description: Deskew a lidar3d PointCloud2. Requires per-point timestamps.
+
+  dense_scan_2d:
+    type: boolean
+    default: false
+    description: >-
+      Opt in to the bounded dense 2D lidar chain for sparse non-repetitive
+      lidar packets. Requires lidar3d, external odom, and deskew_lidar=true.
+      Four deskewed clouds are aligned in odom, emitted in base_frame, and
+      projected to a LaserScan before RTAB-Map. Existing deployments keep the
+      direct PointCloud2 path when this field is omitted.
+
+  dense_scan_refine_neighbors:
+    type: boolean
+    default: false
+    description: >-
+      Opt in to ICP refinement of consecutive RTAB-Map graph edges using the
+      generated dense LaserScan. Requires dense_scan_2d=true and is never
+      enabled on the sparse raw PointCloud2 path. It supplies defaults for
+      planar point-to-plane ICP with a low-complexity corridor strategy,
+      bounded 0.10 m/rad corrections, a 0.15 m correspondence window, a
+      0.492-6.0 m input range, and no path proximity neighbors,
+      Reg/Strategy=1, RGBD/NeighborLinkRefining=true, and
+      RGBD/ProximityBySpace=false. Deploy-owned params_file values override
+      all non-safety defaults, and inline rtabmap_params overrides params_file;
+      an explicit RGBD/NeighborLinkRefining=false is preserved. Spatial
+      proximity links must remain false and a conflicting true value is
+      rejected.
 
   base_frame:
     type: string

@@ -177,3 +177,21 @@ def resolve_rtabmap_overrides(
     normalized.update(load_deployment_params_file(params_file))
     normalized.update(validate_scalar_params(raw, "rtabmap_params"))
     return normalized
+
+
+def select_icp_odometry_overrides(
+    overrides: dict[str, object],
+) -> dict[str, object]:
+    """Select deploy-owned RTAB-Map core parameters used by ICP odometry.
+
+    ``rtabmap`` and ``icp_odometry`` are separate processes. Passing the
+    deploy override file only to the SLAM node silently leaves the odometry
+    node on unrelated hard-coded Icp/Odom defaults. Keep the shared core
+    namespace in sync while leaving SLAM-only, grid and wrapper parameters
+    with rtabmap.
+    """
+    return {
+        key: value
+        for key, value in overrides.items()
+        if key.startswith("Icp/") or key.startswith("Odom/")
+    }

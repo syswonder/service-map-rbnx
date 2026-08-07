@@ -42,6 +42,13 @@ def inverse(value: Pose2) -> Pose2:
     )
 
 
+def post_seed_pair_ready(
+    forwarded_ns: int, icp_stamp_ns: int, tf_stamp_ns: int
+) -> bool:
+    """Return true only when both bridge inputs are newer than a pose seed."""
+    return icp_stamp_ns > forwarded_ns and tf_stamp_ns > forwarded_ns
+
+
 def interpolate(a: TimedPose2, b: TimedPose2, stamp_ns: int) -> Pose2:
     if b.stamp_ns <= a.stamp_ns:
         return a.pose

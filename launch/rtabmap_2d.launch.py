@@ -185,7 +185,10 @@ def _make_nodes(context, *args, **kwargs):
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
         "subscribe_odom_info": False,
-        "odom_sensor_sync": False,
+        # In split mode RTAB-Map consumes the private ICP Odometry topic
+        # instead of odom->base TF. Synchronize that pose to each sensor stamp,
+        # matching the accuracy normally provided by the single-odom TF path.
+        "odom_sensor_sync": navigation_odom_bridge,
         "approx_sync": True,
         "queue_size": 30,
         # webots emits image stamps slightly ahead of the dynamic TF
@@ -231,11 +234,16 @@ def _make_nodes(context, *args, **kwargs):
         })
         print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
 
+    rtabmap_initialpose_topic = (
+        "/rtabmap/initialpose_bridge"
+        if navigation_odom_bridge
+        else "/initialpose"
+    )
     rtabmap_remappings = [
         # rviz "2D Pose Estimate" → /initialpose: rtabmap defaults to
         # the node-relative ~initialpose, remap to global so the rviz
         # tool reaches us without rviz config gymnastics.
-        ("initialpose", "/initialpose"),
+        ("initialpose", rtabmap_initialpose_topic),
     ]
     if have_scan:
         rtabmap_remappings.append(("scan", scan_topic))
@@ -425,6 +433,8 @@ def _make_nodes(context, *args, **kwargs):
                 "-p", f"base_frame:={base_frame}",
                 "-p", f"icp_odom_topic:={internal_odom_topic}",
                 "-p", f"nav_odom_topic:={navigation_odom_topic}",
+                "-p", "initialpose_topic:=/initialpose",
+                "-p", f"rtabmap_initialpose_topic:={rtabmap_initialpose_topic}",
             ],
             name="map_to_odom_bridge",
             output="screen",

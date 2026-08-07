@@ -61,6 +61,15 @@ class MapToOdomMathTest(unittest.TestCase):
         self.assertAlmostEqual(result.y, 1.0)
         self.assertAlmostEqual(abs(result.yaw), math.pi)
 
+    def test_post_seed_pair_rejects_cached_icp(self):
+        self.assertFalse(self.bridge.post_seed_pair_ready(100, 100, 101))
+
+    def test_post_seed_pair_rejects_cached_tf(self):
+        self.assertFalse(self.bridge.post_seed_pair_ready(100, 101, 100))
+
+    def test_post_seed_pair_accepts_fresh_stream(self):
+        self.assertTrue(self.bridge.post_seed_pair_ready(100, 101, 102))
+
 
 if __name__ == "__main__":
     unittest.main()

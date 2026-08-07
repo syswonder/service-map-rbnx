@@ -78,7 +78,11 @@ start: bash scripts/start.sh
 #                        and mapping publishes map -> navigation_odom_frame by
 #                        combining RTAB-Map localization with a low-latency
 #                        chassis navigation_odom_topic. This mode requires no
-#                        sensor_providers.odom binding.
+#                        sensor_providers.odom binding. It also coordinates
+#                        RViz /initialpose recovery by forwarding the same
+#                        rough pose to RTAB-Map without resetting ICP. Cached
+#                        pre-seed bridge samples are discarded before normal
+#                        split-odometry composition resumes.
 #   navigation_odom_topic: chassis Odometry topic used only by the bridge
 #                        (default /odom; it is not an RTAB-Map sensor input).
 #   navigation_odom_frame: navigation-local frame (default odom). Must differ

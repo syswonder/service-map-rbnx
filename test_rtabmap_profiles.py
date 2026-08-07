@@ -258,7 +258,7 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertEqual(
             source.count('"odom_frame_id": rtabmap_odom_frame'), 2
         )
-        self.assertIn('"odom_sensor_sync": False', source)
+        self.assertIn('"odom_sensor_sync": navigation_odom_bridge', source)
         self.assertIn('rtabmap_remappings.append(("odom", odom_topic))', source)
 
     def test_raw_livox_imu_is_filtered_before_icp(self):

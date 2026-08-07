@@ -19,9 +19,10 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.saved_db = os.path.join(map_dir, "rtabmap.db")
         open(self.saved_db, "wb").close()
 
-    def test_localization_precedes_database_load_and_publish_is_verified(self):
+    def test_localization_brackets_database_load_and_publish_is_verified(self):
         order = []
         barrier = {"subscription": object()}
+        mode_stages = iter(("mode-before", "mode-after"))
 
         with (
             patch.object(map_ops, "MAPS_DIR", self.tmp.name),
@@ -33,9 +34,11 @@ class LoadMapTransactionTest(unittest.TestCase):
                 side_effect=lambda *_: order.append("copy") or "/runtime/target.db",
             ),
             patch.object(
-                map_ops, "_set_mode", side_effect=lambda *_: order.append("mode") or (True, "ok")
+                map_ops,
+                "_set_mode",
+                side_effect=lambda *_: order.append(next(mode_stages)) or (True, "ok"),
             ),
-            patch.object(map_ops, "set_current_mode"),
+            patch.object(map_ops, "set_current_mode") as set_mode_state,
             patch.object(
                 map_ops,
                 "_load_database",
@@ -69,8 +72,19 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(
             order,
-            ["copy", "mode", "load", "identity", "publish", "subscribe", "verify"],
+            [
+                "copy",
+                "mode-before",
+                "load",
+                "mode-after",
+                "identity",
+                "publish",
+                "subscribe",
+                "verify",
+            ],
         )
+        self.assertEqual(set_mode_state.call_count, 2)
+        set_mode_state.assert_called_with("localization")
         self.assertIn("verified fresh occupancy", result["detail"])
 
     def test_mode_switch_failure_never_loads_database(self):
@@ -87,6 +101,34 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("before load", result["detail"])
         load.assert_not_called()
+
+    def test_post_load_mode_switch_failure_stops_publication_and_pose_seed(self):
+        with (
+            patch.object(map_ops, "MAPS_DIR", self.tmp.name),
+            patch.object(map_ops, "_sqlite_quick_check", return_value=(True, "ok")),
+            patch.object(map_ops, "_get_node", return_value=object()),
+            patch.object(map_ops, "_runtime_db_copy", return_value="/runtime/target.db"),
+            patch.object(
+                map_ops,
+                "_set_mode",
+                side_effect=((True, "before load"), (False, "mode failed")),
+            ),
+            patch.object(map_ops, "_load_database", return_value=(True, "loaded")),
+            patch.object(map_ops, "set_current_mode") as set_mode_state,
+            patch.object(map_ops.lifecycle, "set_state") as set_lifecycle,
+            patch.object(map_ops, "_publish_full_map") as publish,
+            patch.object(map_ops, "_begin_target_map_wait") as begin_wait,
+            patch.object(map_ops, "pose_estimate_impl") as seed_pose,
+        ):
+            result = map_ops.load_map_impl("target", has_initial_pose=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("failed to reassert localization after load", result["detail"])
+        set_mode_state.assert_called_once_with("localization")
+        set_lifecycle.assert_not_called()
+        publish.assert_not_called()
+        begin_wait.assert_not_called()
+        seed_pose.assert_not_called()
 
     @staticmethod
     def _occupancy(width, height, resolution, data):

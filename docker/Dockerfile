@@ -72,7 +72,7 @@ RUN pip install --no-cache-dir \
         pyyaml>=6.0 \
         numpy \
         pillow \
-        mcp>=1.28.1
+        'mcp>=1.28.1,<2'
 
 WORKDIR /mapping
 COPY entrypoint.sh /entrypoint.sh

@@ -776,15 +776,20 @@ def _record_save_result(map_id: str, out: dict) -> None:
 
 
 def _record_load_result(map_id: str, out: dict) -> None:
-    if not out.get("ok"):
-        return
+    # runtime_db_path is present whenever rtabmap.LoadDatabase actually
+    # switched databases -- even on a partial failure where a later stage
+    # (preview publish, verify) failed and out["ok"] is False. Sync active-db
+    # bookkeeping on that signal, not on the RPC overall ok flag: rtabmap is
+    # already serving the new database regardless of what happens after.
     runtime_db = str(out.get("runtime_db_path") or "")
+    if not runtime_db:
+        return
     _ACTIVE.update({
         "map_id": _sanitize_map_id(map_id),
         "map_dir": _saved_map_dir(map_id),
         "active_db": runtime_db,
         "map_mode": "localization",
-        "finalized": "true",
+        "finalized": "true" if out.get("ok") else "false",
     })
 
 

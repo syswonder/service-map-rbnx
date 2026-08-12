@@ -448,7 +448,13 @@ def load_map_impl(map_id: str, mode: str = "localization",
         log.info("load_map[%s] stage=publish_map timeout=%.1fs", map_id, publish_timeout_s)
         pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
         if not pub_ok:
-            return {"ok": False, "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
+            # The database swap already happened via _load_database above --
+            # rtabmap is genuinely serving runtime_db now even though the
+            # preview publish failed. Surface it so callers (atlas_bridges
+            # _record_load_result) can sync active-db bookkeeping instead of
+            # leaving save_map pointed at the stale pre-load database.
+            return {"ok": False, "runtime_db_path": runtime_db,
+                    "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
         # /map is transient-local. Subscribing after publish receives the
         # latest grid and avoids accepting the previous map's latched sample.
         barrier = _begin_target_map_wait(node)
@@ -456,7 +462,11 @@ def load_map_impl(map_id: str, mode: str = "localization",
         verified, verify_detail = _finish_target_map_wait(node, barrier, verify_timeout_s)
         if not verified:
             log.error("load_map[%s] stage=verify failed: %s", map_id, verify_detail)
-            return {"ok": False, "detail": f"loaded {map_id}, but {verify_detail}"}
+            # Same reasoning as the publish-failure branch above: the
+            # database itself is already switched, only the post-load
+            # verification failed.
+            return {"ok": False, "runtime_db_path": runtime_db,
+                    "detail": f"loaded {map_id}, but {verify_detail}"}
         elapsed = time.monotonic() - started
         log.info("load_map[%s] stage=complete elapsed=%.3fs %s", map_id, elapsed,
                  verify_detail)

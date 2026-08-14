@@ -425,7 +425,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
         # RTAB-Map only restores the saved 2D occupancy grid when the database
         # is opened in localization mode. Loading first while still in mapping
         # mode omits that grid; a second load then appears to fix the UI/RViz.
-        log.info("load_map[%s] stage=switch_mode target=localization", map_id)
+        log.info("load_map[%s] stage=switch_mode_before_load target=localization", map_id)
         ok2, info2 = _set_mode(node, mode)
         if not ok2:
             return {"ok": False, "detail": f"failed to switch localization before load: {info2}"}
@@ -438,6 +438,19 @@ def load_map_impl(map_id: str, mode: str = "localization",
         if not ok:
             return {"ok": False,
                     "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
+
+        # load_database reinitializes RTAB-Map from its stored parameter map.
+        # On affected versions this can restore Mem/IncrementalMemory=true
+        # internally even while the ROS parameter reports false, causing
+        # initial poses to be rejected. Reassert localization after the load
+        # and only then expose the mode/map epoch to consumers.
+        log.info("load_map[%s] stage=switch_mode_after_load target=localization", map_id)
+        ok2, info2 = _set_mode(node, mode)
+        if not ok2:
+            return {"ok": False,
+                    "detail": f"loaded {map_id}, but failed to reassert localization "
+                              f"after load: {info2}"}
+        set_current_mode(mode)
 
         # The database load is the map-identity authority. Publish that
         # identity before waiting for occupancy so consumers can bind the

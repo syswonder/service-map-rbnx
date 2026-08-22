@@ -3,6 +3,7 @@ rbnx-build/
 build/
 install/
 log/
+logs/
 
 # Python
 __pycache__/

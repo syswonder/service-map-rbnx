@@ -61,16 +61,18 @@ RUN apt-get update \
         ros-humble-tf2-ros \
         ros-humble-tf-transformations \
         ros-humble-pointcloud-to-laserscan \
+        ros-humble-rmw-cyclonedds-cpp \
         ros-humble-rmw-zenoh-cpp \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-        grpcio>=1.60.0 \
-        protobuf>=4.25.0 \
+        grpcio==1.80.0 \
+        grpcio-tools==1.76.0 \
+        protobuf==6.33.6 \
         pyyaml>=6.0 \
         numpy \
         pillow \
-        mcp>=1.28.1
+        'mcp>=1.28.1,<2'
 
 WORKDIR /mapping
 COPY entrypoint.sh /entrypoint.sh

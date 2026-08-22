@@ -12,7 +12,7 @@
 #     - name: mapping
 #       url: https://github.com/syswonder/service-map-rbnx
 #       manifest: package_manifest.jetson-native.yaml
-#       config: { algo: rtabmap, sensors: {...}, map_id: lab_3f }
+#       config: { sensor_providers: {lidar3d: roof_lidar, odom: chassis} }
 manifestVersion: 1
 
 package:
@@ -28,12 +28,13 @@ start: ROBONIX_MAPPING_FORCE=native bash scripts/start.sh
 stop: ROBONIX_MAPPING_FORCE=native bash scripts/stop.sh
 
 capabilities:
-  - name: robonix/service/map/driver
   - name: robonix/service/map/occupancy_grid
   - name: robonix/service/map/pointcloud
   - name: robonix/service/map/pose
   - name: robonix/service/map/odom
+  - name: robonix/service/map/lifecycle
   - name: robonix/service/map/save_map
+  - name: robonix/service/map/list_maps
   - name: robonix/service/map/load_map
   - name: robonix/service/map/pose_estimate
   - name: robonix/service/map/switch_mode

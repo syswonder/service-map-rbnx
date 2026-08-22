@@ -21,6 +21,7 @@ which engine runs — they only bind the `robonix/service/map/*` contracts.
 | `robonix/service/map/pointcloud` | ros2 topic | `sensor_msgs/PointCloud2` | 3D fused cloud |
 | `robonix/service/map/pose` | ros2 topic | `geometry_msgs/PoseWithCovarianceStamped` | SLAM-corrected, map frame; can jump on loop closure |
 | `robonix/service/map/odom` | ros2 topic | `nav_msgs/Odometry` | SLAM-corrected, odom frame; continuous between closures |
+| `robonix/service/map/lifecycle` | ros2 topic | `map/msg/MapLifecycle` | `{map_id, mode, generation}`, latched (transient_local): current map identity for consumers keying state by map (scene). Re-published on init / load / reset / mode switch; `generation` bumps whenever the map origin may have changed (mapping-mode session start, reset) and is persisted per named map, so a localization round-trip keeps the same value. Bridge-owned + algo-independent. |
 | `robonix/service/map/save_map` | grpc + mcp | `map_id, note → ok, map_id, detail` | snapshot the live map under a stable id |
 | `robonix/service/map/list_maps` | grpc + mcp | `→ ok, detail, maps_json` | list saved map metadata by map id; artifacts remain opaque |
 | `robonix/service/map/load_map` | grpc + mcp | `map_id, mode, [x,y,theta] → ok` | switch onto a saved map (localization / mapping) |
@@ -32,9 +33,9 @@ engine-agnostic.
 
 ## Consumes (via atlas discovery)
 
-Resolved at `Driver(CMD_INIT)` from the `sensors:` config — only the enabled
-ones are looked up. Topic names are **never** hardcoded; they come from
-whichever primitive registered the contract.
+Resolved at `Driver(CMD_INIT)` from `sensor_providers` — only bound roles are
+looked up. Topic names are **never** hardcoded; they come from the selected
+Atlas provider.
 
 | config flag | contract | role |
 |---|---|---|
@@ -52,48 +53,27 @@ subscription rather than blocking.
 
 ```yaml
 config:
-  algo: rtabmap                       # rtabmap | dlio | fastlio2[broken]
-  platform: x86_desktop               # x86_desktop | jetson_orin (optional)
-  # what the robot actually has — see the sensor table below. Required;
-  # the package refuses to guess (an empty/missing `sensors:` errors out).
-  sensors: { lidar2d: true, odom: true, rgb: true, depth: true }
   sensor_providers:
     lidar2d: front_lidar
     rgb: front_camera
     depth: front_camera
     odom: chassis
-  # Which discovered streams RTAB-Map actually subscribes to. Ranger's known
-  # good databases contain scans only, so do not add RGB-D synchronization.
-  rtabmap_inputs: [lidar, odom]
-  # Which resolved streams build the 2D occupancy grid. Availability alone
-  # does not imply that depth fusion is stable on this robot.
   occupancy_sources: [lidar]           # lidar | depth | both
-  # frames / time (all optional; defaults shown = webots tiago)
-  base_frame: base_link
-  odom_frame: odom
-  map_frame: map
-  use_sim_time: true
-  # Optional field-validated hardware tuning. Raw rtabmap_params below may
-  # override individual values from the selected profile.
-  rtabmap_profile: ranger_mini_v3
-  rtabmap_params: {}
-  # map persistence (optional; rtabmap only — see "Map persistence" below)
-  # Mapping is a fresh runtime session; save_map publishes it under an id.
-  map_mode: mapping                   # mapping | localization
+  params_file: config/rtabmap_params.yaml
+  rtabmap_params:
+    Grid/FootprintLength: 0.84
+    Grid/FootprintWidth: 0.60
 ```
 
-`rtabmap_profile: ranger_mini_v3` restores the node insertion cadence stored in
-the known-good v0.1 `315` and `ranger_3f` databases. Set
-`occupancy_sources: [lidar]` to reproduce their lidar-only occupancy policy.
-Mapping consumes the original PointCloud2 stream directly; it does not use the
-Nav2 pointcloud-to-laserscan adapter.
+`sensor_providers` is the only required sensor-selection block. Its keys enable
+roles and its values pin Atlas provider IDs. Copy
+[`config/rtabmap_params.template.yaml`](config/rtabmap_params.template.yaml) to
+the robot deployment and reference that copy with `params_file`. The upstream
+template is never loaded at runtime. Inline `rtabmap_params` applies last.
 
-### `sensors:` keys
+### Sensor provider roles
 
-Booleans; set `true` only for what the body provides. Each maps to an atlas
-contract the package resolves at init (it never hardcodes a topic). **`rgb`
-and `depth` are separate** — for full RGB-D visual fusion (loop closure +
-below-lidar depth obstacles) enable **both**.
+Each key maps to an Atlas contract. Include both `rgb` and `depth` for RGB-D.
 
 | key       | atlas contract                      | feeds rtabmap   |
 | --------- | ----------------------------------- | --------------- |
@@ -104,35 +84,16 @@ below-lidar depth obstacles) enable **both**.
 | `imu`     | `robonix/primitive/imu/imu`         | `imu`           |
 | `odom`    | `robonix/primitive/chassis/odom`    | `odom`          |
 
-Examples:
-
-```yaml
-sensors: { lidar2d: true, odom: true, rgb: true, depth: true }  # webots tiago (RGB-D fusion)
-sensors: { lidar2d: true, odom: true }                          # 2D-lidar only, no images
-sensors: { lidar3d: true, rgb: true, depth: true, odom: true, imu: true }  # Mid-360 robot
-```
-
-`sensors:` is required and must list at least one sensor — the package
-refuses to guess.
-
-`sensor_providers` pins each enabled sensor key to an Atlas provider ID. It is
-optional only while exactly one provider exposes that contract; multiple
-candidates without a pin are rejected instead of selecting the first result.
+The legacy `sensors` boolean block remains accepted for migration, but new
+deployments should use only `sensor_providers`.
 
 `occupancy_sources` is a separate policy. It accepts `lidar`, `depth`, or both,
 and fails initialization if Atlas did not resolve a requested source. Omitting
 it preserves the legacy automatic choice for existing deployments.
 
-`rtabmap_inputs` controls subscriptions independently of discovery. It accepts
-`lidar`, `rgbd`, `imu`, and `odom`; a requested input must resolve through Atlas. The
-Ranger profile uses `[lidar, odom]`, matching the scan-only v0.1 databases and
-avoiding RGB-D approximate-sync latency during rotation.
-
 `deskew_lidar: true` requires a per-point `t`, `time`, `stamps`, or `timestamp`
 field. External odom drives TF deskewing; without external odom the ICP node
-uses its motion estimate, and an explicitly selected IMU initializes attitude.
-Raw Livox IMU is filtered through `imu_filter_madgwick`; it is never treated as
-if its unset orientation quaternion were valid.
+uses its motion estimate.
 
 ## Map operations (`save_map` / `load_map` / `pose_estimate`)
 

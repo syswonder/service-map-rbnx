@@ -35,8 +35,17 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
 """
 import json
 import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    EmitEvent,
+    ExecuteProcess,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -57,6 +66,13 @@ def generate_launch_description():
         DeclareLaunchArgument("deskew_lidar", default_value="false"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
+        # Opt-in split-odometry mode. Defaults preserve the legacy behaviour:
+        # internal odometry publishes odom -> base_link and RTAB-Map publishes
+        # map -> odom. When enabled, internal odometry is message-only in a
+        # private frame and a bridge combines it with chassis navigation odom.
+        DeclareLaunchArgument("navigation_odom_bridge", default_value="false"),
+        DeclareLaunchArgument("navigation_odom_topic", default_value="/odom"),
+        DeclareLaunchArgument("navigation_odom_frame", default_value="odom"),
         DeclareLaunchArgument("enable_viz", default_value="true"),
         # Map persistence (set by atlas_bridge from the deploy's map_id /
         # map_mode config; empty database_path = ephemeral, the legacy
@@ -86,6 +102,11 @@ def _make_nodes(context, *args, **kwargs):
     deskew_lidar = LaunchConfiguration("deskew_lidar").perform(context).lower() == "true"
     base_frame = LaunchConfiguration("base_frame").perform(context)
     odom_frame = LaunchConfiguration("odom_frame").perform(context)
+    navigation_odom_bridge = (
+        LaunchConfiguration("navigation_odom_bridge").perform(context).lower() == "true"
+    )
+    navigation_odom_topic = LaunchConfiguration("navigation_odom_topic").perform(context)
+    navigation_odom_frame = LaunchConfiguration("navigation_odom_frame").perform(context)
     enable_viz = LaunchConfiguration("enable_viz").perform(context).lower() == "true"
     use_sim_time = use_sim_time_str.lower() == "true"
     database_path = LaunchConfiguration("database_path").perform(context).strip()
@@ -101,6 +122,27 @@ def _make_nodes(context, *args, **kwargs):
     have_rgbd = have_rgb and have_depth
     have_odom = bool(odom_topic) and odom_topic != _NONE
     have_imu = bool(imu_topic) and imu_topic != _NONE
+
+    if navigation_odom_bridge:
+        if have_odom:
+            raise RuntimeError(
+                "navigation_odom_bridge requires internal RTAB-Map odometry; "
+                "remove the mapping sensor_providers.odom binding"
+            )
+        if odom_frame == navigation_odom_frame:
+            raise RuntimeError(
+                "navigation_odom_bridge requires distinct odom_frame and "
+                "navigation_odom_frame (for example odom_icp and odom)"
+            )
+        if not navigation_odom_topic or navigation_odom_topic == _NONE:
+            raise RuntimeError("navigation_odom_bridge requires navigation_odom_topic")
+
+    # Legacy/default mode reads odometry from the canonical TF. The opt-in
+    # navigation bridge deliberately disables internal odometry TF, so RTAB-Map
+    # must consume the remapped Odometry message instead (empty odom_frame_id
+    # is RTAB-Map's documented topic mode). The message header still names
+    # odom_frame, allowing RTAB-Map to publish map -> odom_icp.
+    rtabmap_odom_frame = "" if navigation_odom_bridge else odom_frame
 
     if deskew_lidar and not have_scan_cloud:
         raise RuntimeError("deskew_lidar requires a lidar3d PointCloud2 input")
@@ -131,7 +173,7 @@ def _make_nodes(context, *args, **kwargs):
     rtabmap_params = {
         "use_sim_time": use_sim_time,
         "frame_id": base_frame,
-        "odom_frame_id": odom_frame,
+        "odom_frame_id": rtabmap_odom_frame,
         "map_frame_id": "map",
         "publish_tf": True,
         # Sensor subscriptions branch on what the deploy actually has.
@@ -143,7 +185,10 @@ def _make_nodes(context, *args, **kwargs):
         "subscribe_rgb": have_rgbd,
         "subscribe_depth": have_rgbd,
         "subscribe_odom_info": False,
-        "odom_sensor_sync": have_odom,
+        # In split mode RTAB-Map consumes the private ICP Odometry topic
+        # instead of odom->base TF. Synchronize that pose to each sensor stamp,
+        # matching the accuracy normally provided by the single-odom TF path.
+        "odom_sensor_sync": navigation_odom_bridge,
         "approx_sync": True,
         "queue_size": 30,
         # webots emits image stamps slightly ahead of the dynamic TF
@@ -160,26 +205,6 @@ def _make_nodes(context, *args, **kwargs):
         # obstacles below the lidar plane (tables, chairs) the scan misses.
         "Grid/Sensor": grid_sensor,
         "Grid/FromDepth": "true" if have_rgbd else "false",
-        # Persist per-node occupancy grids at insertion time. Saved maps must
-        # reload into a usable /map later; RTAB-Map explicitly warns that nodes
-        # inserted without this cache can make publish_map return an empty grid,
-        # which breaks save/load and scene room overlays.
-        "RGBD/CreateOccupancyGrid": "true",
-        "Grid/RangeMax": "6.0",
-        "Grid/CellSize": "0.05",
-        "Grid/RayTracing": "true",
-        # 3D pointcloud → 2D grid: when the only lidar is 3D, rtabmap
-        # projects it to the planar grid via Grid/FromObstacles using
-        # the same height clamp as the depth path.
-        "Grid/3D": "false",
-        "Grid/NormalsSegmentation": "false",
-        # Height clamps tuned for the floor unevenness of the real
-        # deploy environment (4F corridor): a stricter 0.05 m ground
-        # cutoff misclassified slope/cable bumps as obstacles, while
-        # the original 1.5 m obstacle cap clipped door frames + tall
-        # shelves. Raise both bounds.
-        "Grid/MaxObstacleHeight": "1.0",
-        "Grid/MaxGroundHeight": "0.1",
         # Memory mode follows map_mode. Mapping: incremental (add nodes,
         # grow the graph). Localization: frozen graph (IncrementalMemory
         # off) initialised with all saved nodes, so rtabmap relocalises
@@ -187,20 +212,6 @@ def _make_nodes(context, *args, **kwargs):
         # boot — the stable-origin property scene's per-map_id store needs.
         "Mem/IncrementalMemory": "false" if localization else "true",
         "Mem/InitWMWithAllNodes": "true" if localization else "false",
-        "Reg/Strategy": "1",        # 0=Visual, 1=ICP, 2=Visual+ICP
-        "Reg/Force3DoF": "true",
-        "Optimizer/Strategy": "1",  # g2o
-        "RGBD/NeighborLinkRefining": "true",
-        "RGBD/ProximityBySpace": "true",
-        # Conservative defaults work for physical robots. Fast simulators may
-        # opt into a denser profile through config.rtabmap_params.
-        "RGBD/AngularUpdate": "0.1",
-        "RGBD/LinearUpdate": "0.1",
-        "Vis/MinInliers": "12",
-        "Rtabmap/DetectionRate": "1.0",
-        "Icp/MaxCorrespondenceDistance": "0.2",
-        "Icp/MaxTranslation": "0.5",
-        "Icp/MaxRotation": "0.78",  # ~45°
     }
 
     if overrides_file:
@@ -223,11 +234,16 @@ def _make_nodes(context, *args, **kwargs):
         })
         print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
 
+    rtabmap_initialpose_topic = (
+        "/rtabmap/initialpose_bridge"
+        if navigation_odom_bridge
+        else "/initialpose"
+    )
     rtabmap_remappings = [
         # rviz "2D Pose Estimate" → /initialpose: rtabmap defaults to
         # the node-relative ~initialpose, remap to global so the rviz
         # tool reaches us without rviz config gymnastics.
-        ("initialpose", "/initialpose"),
+        ("initialpose", rtabmap_initialpose_topic),
     ]
     if have_scan:
         rtabmap_remappings.append(("scan", scan_topic))
@@ -236,10 +252,13 @@ def _make_nodes(context, *args, **kwargs):
         rtabmap_remappings.append((
             "scan_cloud", deskewed_cloud_topic if deskew_lidar and have_odom else scan_cloud_topic
         ))
+    internal_odom_topic = (
+        "/rtabmap/odom_icp" if navigation_odom_bridge else "/rtabmap/odom"
+    )
     if have_odom:
         rtabmap_remappings.append(("odom", odom_topic))
-    elif have_scan or have_scan_cloud:
-        rtabmap_remappings.append(("odom", "/rtabmap/odom"))
+    elif have_scan or have_scan_cloud or have_rgbd:
+        rtabmap_remappings.append(("odom", internal_odom_topic))
     if have_rgbd:
         rtabmap_remappings += [
             ("rgb/image", rgb_topic),
@@ -274,6 +293,17 @@ def _make_nodes(context, *args, **kwargs):
         parameters=[rtabmap_params],
         arguments=rtabmap_args,
         remappings=rtabmap_remappings,
+    )
+
+    # RTAB-Map is the mapping engine, not an optional sidecar. If it exits,
+    # terminate the launch immediately instead of leaving rtabmap_viz and the
+    # pose adapter alive. Otherwise the package process keeps running and Soma
+    # continues to report Mapping ACTIVE even though /map has no publisher.
+    rtabmap_exit_guard = RegisterEventHandler(
+        OnProcessExit(
+            target_action=rtabmap_node,
+            on_exit=[EmitEvent(event=Shutdown(reason="RTAB-Map engine exited"))],
+        )
     )
 
     nodes = []
@@ -323,14 +353,14 @@ def _make_nodes(context, *args, **kwargs):
             ],
         ))
 
-    nodes.append(rtabmap_node)
+    nodes.extend([rtabmap_node, rtabmap_exit_guard])
 
-    # When the deploy didn't supply external odom, run rtabmap's own
-    # ICP-odometry node off whichever lidar source we have. icp_odometry
-    # consumes either /scan (LaserScan) or /scan_cloud (PointCloud2);
-    # we pick based on what's wired up.
+    # When the deploy didn't supply external odom, run RTAB-Map's own
+    # odometry from the strongest available sensor path. Prefer LiDAR ICP
+    # when a scan is wired; otherwise an RGB-D-only deployment must run
+    # rgbd_odometry or the SLAM node waits forever on /rtabmap/odom.
     if not have_odom and (have_scan or have_scan_cloud):
-        icp_odom_remappings = [("odom", "/rtabmap/odom")]
+        icp_odom_remappings = [("odom", internal_odom_topic)]
         if have_scan_cloud:
             icp_odom_remappings.append(("scan_cloud", scan_cloud_topic))
         elif have_scan:
@@ -339,7 +369,7 @@ def _make_nodes(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "frame_id": base_frame,
             "odom_frame_id": odom_frame,
-            "publish_tf": True,
+            "publish_tf": not navigation_odom_bridge,
             "approx_sync": True,
             "wait_for_transform": 1.5,
             "deskewing": deskew_lidar,
@@ -350,6 +380,9 @@ def _make_nodes(context, *args, **kwargs):
             "Icp/MaxCorrespondenceDistance": "1.0",
             "Odom/ScanKeyFrameThr": "0.4",
         }
+        for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):
+            if key in rtabmap_params:
+                icp_odom_params[key] = rtabmap_params[key]
         if have_imu:
             icp_odom_remappings.append(("imu", filtered_imu_topic))
             icp_odom_params["wait_imu_to_init"] = True
@@ -362,12 +395,56 @@ def _make_nodes(context, *args, **kwargs):
             remappings=icp_odom_remappings,
         )
         nodes.append(icp_odom)
+    elif not have_odom and have_rgbd:
+        rgb_info = (rgb_info_topic if rgb_info_topic != _NONE
+                    else _derive_camera_info(rgb_topic))
+        rgbd_odom = Node(
+            package="rtabmap_odom",
+            executable="rgbd_odometry",
+            name="rgbd_odometry",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "frame_id": base_frame,
+                "odom_frame_id": odom_frame,
+                "publish_tf": not navigation_odom_bridge,
+                "approx_sync": True,
+                "queue_size": 30,
+                "wait_for_transform": 1.5,
+            }],
+            remappings=[
+                ("rgb/image", rgb_topic),
+                ("rgb/camera_info", rgb_info),
+                ("depth/image", depth_topic),
+                ("odom", internal_odom_topic),
+            ],
+        )
+        nodes.append(rgbd_odom)
+
+    if navigation_odom_bridge:
+        nodes.append(ExecuteProcess(
+            cmd=[
+                "python3", "-m", "mapping_rbnx.map_to_odom_bridge",
+                "--ros-args",
+                "-p", f"use_sim_time:={'true' if use_sim_time else 'false'}",
+                "-p", "map_frame:=map",
+                "-p", f"icp_odom_frame:={odom_frame}",
+                "-p", f"nav_odom_frame:={navigation_odom_frame}",
+                "-p", f"base_frame:={base_frame}",
+                "-p", f"icp_odom_topic:={internal_odom_topic}",
+                "-p", f"nav_odom_topic:={navigation_odom_topic}",
+                "-p", "initialpose_topic:=/initialpose",
+                "-p", f"rtabmap_initialpose_topic:={rtabmap_initialpose_topic}",
+            ],
+            name="map_to_odom_bridge",
+            output="screen",
+        ))
 
     if enable_viz:
         viz_params = {
             "use_sim_time": use_sim_time,
             "frame_id": base_frame,
-            "odom_frame_id": odom_frame,
+            "odom_frame_id": rtabmap_odom_frame,
             "subscribe_scan": have_scan,
             "subscribe_scan_cloud": have_scan_cloud,
             "subscribe_rgb": False,

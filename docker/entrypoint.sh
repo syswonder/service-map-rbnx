@@ -18,6 +18,16 @@ if [[ -f /mapping/rbnx-build/codegen/ros2_idl/install/setup.bash ]]; then
     source /mapping/rbnx-build/codegen/ros2_idl/install/setup.bash
 fi
 
+# Robonix ros2_idl overlay (map interface package — the bridge's
+# lifecycle broadcast publishes map/msg/MapLifecycle). Built by
+# scripts/build.sh onto the bind-mounted rbnx-build/; when absent the
+# bridge logs loudly and runs with the broadcast disabled.
+ROS2_IDL_SETUP=/mapping/rbnx-build/codegen/ros2_idl/install/setup.bash
+if [ -f "$ROS2_IDL_SETUP" ]; then
+    # shellcheck disable=SC1090
+    source "$ROS2_IDL_SETUP"
+fi
+
 configure_zenoh_session() {
     if [ "${RMW_IMPLEMENTATION:-}" != "rmw_zenoh_cpp" ] || [ -z "${ROBONIX_ZENOH_ROUTER:-}" ]; then
         return 0
@@ -44,6 +54,17 @@ configure_zenoh_session() {
 configure_zenoh_session
 
 cd /mapping
+
+# Docker start generates these modules with this image and bind-masks the
+# host-generated proto_gen. Emit a focused error before Python's descriptor
+# compatibility traceback obscures the deployment problem.
+PROTO_GEN=/mapping/rbnx-build/codegen/proto_gen
+if [ ! -f "$PROTO_GEN/atlas_pb2.py" ] \
+    || [ ! -f "$PROTO_GEN/map_pb2.py" ] \
+    || [ ! -f "$PROTO_GEN/robonix_contracts_pb2_grpc.py" ]; then
+    echo "[entrypoint] missing runtime-compatible protobuf stubs in $PROTO_GEN; rebuild and restart mapping" >&2
+    exit 1
+fi
 
 # Codegen output lives under <pkg>/rbnx-build/codegen/ per v0.1 (matches
 # `rbnx codegen` default + `robonix_api.codegen.ensure_proto_gen` walks).

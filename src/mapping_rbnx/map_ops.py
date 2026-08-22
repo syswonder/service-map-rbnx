@@ -30,6 +30,8 @@ from typing import Optional
 
 import logging
 
+from mapping_rbnx import lifecycle
+
 log = logging.getLogger("mapping_rbnx.map_ops")
 
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
@@ -294,6 +296,100 @@ def _publish_full_map(node, timeout_s: float = 30.0) -> tuple[bool, str]:
     return True, "published optimized global map"
 
 
+def _load_database(node, runtime_db: str, timeout_s: float) -> tuple[bool, str]:
+    """Load one runtime database, isolated for ordering tests."""
+    try:
+        from rtabmap_msgs.srv import LoadDatabase
+    except Exception as e:  # noqa: BLE001
+        return False, f"rtabmap_msgs/LoadDatabase unavailable: {e}"
+    req = LoadDatabase.Request()
+    req.database_path = runtime_db
+    req.clear = False
+    ok, res = _call_service(
+        node, LoadDatabase, f"{RTABMAP_NS}/load_database", req, timeout_s=timeout_s
+    )
+    return (ok, "load_database completed" if ok else str(res))
+
+
+def _occupancy_sample_ready(msg) -> tuple[bool, str]:
+    """Return whether an occupancy sample is non-empty and structurally valid.
+
+    Map identity comes from the successful database load plus the lifecycle
+    epoch. RTAB-Map may optimize cell boundaries when it republishes a loaded
+    database, so occupancy pixels are readiness data, not an identity hash.
+    """
+    info = msg.info
+    width = int(info.width)
+    height = int(info.height)
+    resolution = float(info.resolution)
+    cells = width * height
+    data = msg.data
+    known = sum(1 for value in data if int(value) >= 0)
+    summary = (
+        f"{width}x{height}@{resolution:.6f} "
+        f"origin=({info.origin.position.x:.3f},{info.origin.position.y:.3f}) "
+        f"cells={len(data)} known={known}"
+    )
+    ready = (
+        width > 0
+        and height > 0
+        and resolution > 0.0
+        and len(data) == cells
+        and known > 0
+    )
+    return ready, summary
+
+
+def _begin_target_map_wait(node) -> dict:
+    """Wait for the latched occupancy published after a successful map load."""
+    from nav_msgs.msg import OccupancyGrid
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+
+    ready = threading.Event()
+    observed = {"summary": "no occupancy sample received"}
+
+    def on_map(msg):
+        try:
+            valid, summary = _occupancy_sample_ready(msg)
+            observed["summary"] = summary
+            if valid:
+                ready.set()
+        except Exception as exc:  # noqa: BLE001
+            observed["summary"] = f"invalid occupancy sample: {exc}"
+
+    qos = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+    topic = os.environ.get("MAPPING_OCCUPANCY_TOPIC", "/map")
+    sub = node.create_subscription(OccupancyGrid, topic, on_map, qos)
+    return {
+        "event": ready,
+        "observed": observed,
+        "subscription": sub,
+        "topic": topic,
+    }
+
+
+def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool, str]:
+    try:
+        matched = barrier["event"].wait(timeout=max(0.0, timeout_s))
+    finally:
+        node.destroy_subscription(barrier["subscription"])
+    if not matched:
+        return False, (
+            f"fresh non-empty occupancy was not observed on {barrier['topic']} "
+            f"within {timeout_s:.1f}s; observed={barrier['observed']['summary']}"
+        )
+    return True, (
+        f"verified fresh occupancy on {barrier['topic']} "
+        f"({barrier['observed']['summary']})"
+    )
+
+
 def load_map_impl(map_id: str, mode: str = "localization",
                   has_initial_pose: bool = False,
                   x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> dict:
@@ -321,29 +417,59 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
 
     try:
-        try:
-            from rtabmap_msgs.srv import LoadDatabase
-        except Exception:  # noqa: BLE001
-            return {"ok": False,
-                    "detail": "rtabmap_msgs/LoadDatabase not available; cannot load saved map"}
+        started = time.monotonic()
+        log.info("load_map[%s] stage=prepare source=%s requested_mode=%s", map_id,
+                 db_path, requested_mode)
         runtime_db = _runtime_db_copy(db_path, map_id)
-        req = LoadDatabase.Request()
-        req.database_path = runtime_db
-        req.clear = False
-        load_timeout_s = float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180"))
-        ok, res = _call_service(node, LoadDatabase, f"{RTABMAP_NS}/load_database", req, timeout_s=load_timeout_s)
-        if not ok:
-            return {"ok": False, "detail": f"load_database failed: {res} after {load_timeout_s:.0f}s"}
 
+        # RTAB-Map only restores the saved 2D occupancy grid when the database
+        # is opened in localization mode. Loading first while still in mapping
+        # mode omits that grid; a second load then appears to fix the UI/RViz.
+        log.info("load_map[%s] stage=switch_mode target=localization", map_id)
         ok2, info2 = _set_mode(node, mode)
         if not ok2:
-            return {"ok": False, "detail": f"loaded runtime db but failed to switch localization mode: {info2}"}
+            return {"ok": False, "detail": f"failed to switch localization before load: {info2}"}
         set_current_mode(mode)
 
+        load_timeout_s = float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180"))
+        log.info("load_map[%s] stage=load_database runtime_db=%s timeout=%.1fs",
+                 map_id, runtime_db, load_timeout_s)
+        ok, load_detail = _load_database(node, runtime_db, load_timeout_s)
+        if not ok:
+            return {"ok": False,
+                    "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
+
+        # The database load is the map-identity authority. Publish that
+        # identity before waiting for occupancy so consumers can bind the
+        # following grid to the correct map epoch without pixel comparison.
+        lifecycle.set_state(map_id, mode, bump=(mode == "mapping"))
+
         publish_timeout_s = float(os.environ.get("MAPPING_PUBLISH_MAP_TIMEOUT_S", "45"))
+        log.info("load_map[%s] stage=publish_map timeout=%.1fs", map_id, publish_timeout_s)
         pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
         if not pub_ok:
-            return {"ok": False, "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
+            # The database swap already happened via _load_database above --
+            # rtabmap is genuinely serving runtime_db now even though the
+            # preview publish failed. Surface it so callers (atlas_bridges
+            # _record_load_result) can sync active-db bookkeeping instead of
+            # leaving save_map pointed at the stale pre-load database.
+            return {"ok": False, "runtime_db_path": runtime_db,
+                    "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
+        # /map is transient-local. Subscribing after publish receives the
+        # latest grid and avoids accepting the previous map's latched sample.
+        barrier = _begin_target_map_wait(node)
+        verify_timeout_s = float(os.environ.get("MAPPING_VERIFY_MAP_TIMEOUT_S", "30"))
+        verified, verify_detail = _finish_target_map_wait(node, barrier, verify_timeout_s)
+        if not verified:
+            log.error("load_map[%s] stage=verify failed: %s", map_id, verify_detail)
+            # Same reasoning as the publish-failure branch above: the
+            # database itself is already switched, only the post-load
+            # verification failed.
+            return {"ok": False, "runtime_db_path": runtime_db,
+                    "detail": f"loaded {map_id}, but {verify_detail}"}
+        elapsed = time.monotonic() - started
+        log.info("load_map[%s] stage=complete elapsed=%.3fs %s", map_id, elapsed,
+                 verify_detail)
 
         seeded = ""
         if has_initial_pose:
@@ -352,7 +478,8 @@ def load_map_impl(map_id: str, mode: str = "localization",
         note = "" if requested_mode == "localization" else f"; requested {requested_mode} coerced to localization"
         return {"ok": True,
                 "runtime_db_path": runtime_db,
-                "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}{seeded}{note}"}
+                "detail": f"loaded immutable map {map_id} via runtime copy; {pub_detail}; "
+                          f"{verify_detail}; elapsed={elapsed:.1f}s{seeded}{note}"}
     except Exception as e:  # noqa: BLE001
         log.exception("load_map failed")
         return {"ok": False, "detail": str(e)}
@@ -452,6 +579,8 @@ def switch_mode_impl(mode: str) -> dict:
             return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
                                            "(fall back to restart with config map_mode)"}
         set_current_mode(mode)
+        # Mode flip only — the live frame does not move, so no generation bump.
+        lifecycle.set_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode"}
     except Exception as e:  # noqa: BLE001
         log.exception("switch_mode failed")
@@ -482,6 +611,10 @@ def reset_map_impl() -> dict:
         if not mode_ok:
             return {"ok": False, "detail": f"map reset, but failed to switch back to mapping mode: {mode_detail}"}
         set_current_mode("mapping")
+        # Same map_id, new origin: bump the frame epoch so consumers know
+        # their stored map-frame coordinates just went stale. Reset resumes
+        # in mapping mode — broadcast that too.
+        lifecycle.mark_reset(mode="mapping")
         return {"ok": True, "detail": "map cleared — rebuilding from current pose "
                                       "(origin reset; new frame won't match the old map); switched to mapping mode"}
     except Exception as e:  # noqa: BLE001

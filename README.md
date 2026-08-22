@@ -102,6 +102,15 @@ maps/lab_3f/rtabmap.db  occupancy.pgm  occupancy.yaml  occupancy.png  cloud.pcd 
 > frame is loaded from the saved db. Without `map_mode: localization` the
 > map origin resets to the robot's boot pose each run.
 
+## RTAB-Map UI
+
+The RTAB-Map viewer starts with every mapping session so the graph, loop
+closures and per-node grids are visible while the robot drives. It needs an X
+server: `scripts/start.sh` forwards the host `DISPLAY` into the container, and
+a session without one logs a line and continues headless. Set
+`MAPPING_ENABLE_VIZ=false` to keep it off on a robot that has a display but no
+operator.
+
 ## Web UI (live map + runtime map ops)
 
 Set `MAPPING_WEBUI_PORT` (e.g. `8091`) to enable a dependency-light operator

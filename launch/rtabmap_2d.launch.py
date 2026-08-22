@@ -57,7 +57,7 @@ def generate_launch_description():
         DeclareLaunchArgument("deskew_lidar", default_value="false"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("odom_frame", default_value="odom"),
-        DeclareLaunchArgument("enable_viz", default_value="false"),
+        DeclareLaunchArgument("enable_viz", default_value="true"),
         # Map persistence (set by atlas_bridge from the deploy's map_id /
         # map_mode config; empty database_path = ephemeral, the legacy
         # behaviour).

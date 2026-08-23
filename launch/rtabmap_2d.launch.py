@@ -73,7 +73,7 @@ def generate_launch_description():
         DeclareLaunchArgument("navigation_odom_bridge", default_value="false"),
         DeclareLaunchArgument("navigation_odom_topic", default_value="/odom"),
         DeclareLaunchArgument("navigation_odom_frame", default_value="odom"),
-        DeclareLaunchArgument("enable_viz", default_value="false"),
+        DeclareLaunchArgument("enable_viz", default_value="true"),
         # Map persistence (set by atlas_bridge from the deploy's map_id /
         # map_mode config; empty database_path = ephemeral, the legacy
         # behaviour).

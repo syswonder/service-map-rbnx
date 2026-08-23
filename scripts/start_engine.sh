@@ -73,7 +73,14 @@ case "$ALGO" in
         NAV_ODOM_TOPIC="${NAV_ODOM_TOPIC:-/odom}"
         NAV_ODOM_FRAME="${NAV_ODOM_FRAME:-odom}"
         USE_SIM_TIME="${USE_SIM_TIME_R:-${MAPPING_USE_SIM_TIME:-true}}"
-        ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-false}"
+        # The RTAB-Map UI is the default view of a mapping session. It needs
+        # an X server, so fall back to headless when the container has none
+        # rather than letting the launch die.
+        ENABLE_VIZ="${MAPPING_ENABLE_VIZ:-true}"
+        if [ "$ENABLE_VIZ" = "true" ] && [ -z "${DISPLAY:-}" ]; then
+            echo "[mapping] no DISPLAY; starting rtabmap without its UI" >&2
+            ENABLE_VIZ=false
+        fi
         # Map persistence (atlas_bridge wrote these from the deploy's
         # map_id / map_mode config). Empty database_path = ephemeral.
         DATABASE_PATH=$(read_y database_path)

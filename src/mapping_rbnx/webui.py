@@ -407,6 +407,11 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  button.alt{background:#3a4150}
  button.active{background:#1f8a44;box-shadow:0 0 0 2px #2bd66f55}
  button.del{background:#7a2d2d;padding:5px 9px}
+ .switch{position:relative;display:inline-flex;background:#0f1115;border:1px solid #2a3140;border-radius:999px;padding:3px;gap:0}
+ .switch .knob{position:absolute;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);border-radius:999px;background:#2d6cdf;transition:transform .18s ease,background .18s ease}
+ .switch.loc .knob{transform:translateX(100%);background:#1f8a44}
+ .switch .swopt{position:relative;z-index:1;background:transparent;color:#9aa3b2;border-radius:999px;padding:6px 16px;font-size:13px;min-width:104px;transition:color .18s ease}
+ .switch .swopt.on{color:#fff;font-weight:600}
  .warn{background:#3a2a12;border:1px solid #6b4a15;border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.5;color:#f0d9a8}
  #modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:50}
  #modal.on{display:flex}
@@ -437,9 +442,10 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <button onclick="doSave()">Save</button>
   </div>
   <h3 style="margin:16px 0 10px">Mode <span id=modebadge class=muted style="font-weight:400">mode: —</span></h3>
-  <div style="display:flex;gap:8px">
-   <button id=btn-mapping onclick="doSwitch('mapping')">Mapping (build)</button>
-   <button id=btn-localization class=alt onclick="doSwitch('localization')">Localization</button>
+  <div class=switch id=modeswitch>
+   <span class=knob id=modeknob></span>
+   <button class=swopt id=btn-mapping onclick="doSwitch('mapping')">Mapping</button>
+   <button class=swopt id=btn-localization onclick="doSwitch('localization')">Localization</button>
   </div>
   <div id=modewarn class=warn style="display:none;margin-top:8px"></div>
   <div style="margin-top:10px">
@@ -633,10 +639,9 @@ async function doDelete(id){
 let CURMODE=null,CURMAP='',RANGE={};
 async function pollRange(){try{let r=await (await fetch('/api/range')).json();RANGE=r;
  let el=document.getElementById('rangebadge');if(!el)return;
- let n=(r.scan&&r.scan.pts?r.scan.pts.length:0),m=(r.cloud&&r.cloud.pts?r.cloud.pts.length:0);
  let bits=[];
- if(r.bound.scan)bits.push('scan '+(n?n+' pts':(r.scan.detail||'waiting')));
- if(r.bound.cloud)bits.push('cloud '+(m?m+' pts':(r.cloud.detail||'waiting')));
+ for(const k of ['scan','cloud']){if(!r[k])continue;
+  let n=r[k].pts?r[k].pts.length:0;bits.push(k+' '+(n?n+' pts':(r[k].detail||'waiting')))}
  el.textContent=bits.length?bits.join(' · '):'no lidar capability bound';
  draw()}catch(e){}}
 setInterval(pollRange,500);pollRange()
@@ -659,7 +664,9 @@ document.getElementById('modal').onclick=e=>{if(e.target.id=='modal')closeModal(
 document.addEventListener('keydown',e=>{if(e.key=='Escape'&&MODALRESOLVE)closeModal(false)});
 function applyMode(){let mp=document.getElementById('btn-mapping'),lo=document.getElementById('btn-localization');
  let bdg=document.getElementById('modebadge');if(bdg)bdg.textContent=CURMODE?('mode: '+CURMODE):'mode: —';
- if(mp&&lo){mp.classList.toggle('active',CURMODE=='mapping');lo.classList.toggle('active',CURMODE=='localization')}
+ let sw=document.getElementById('modeswitch');
+ if(sw)sw.classList.toggle('loc',CURMODE=='localization');
+ if(mp&&lo){mp.classList.toggle('on',CURMODE=='mapping');lo.classList.toggle('on',CURMODE=='localization')}
  let w=document.getElementById('modewarn');if(!w)return;
  if(CURMODE=='localization'){w.style.display='';
   w.textContent='Localized on '+(CURMAP?('map "'+CURMAP+'"'):'a loaded map')+'. Switching to '+
@@ -722,14 +729,16 @@ class _Handler(BaseHTTPRequestHandler):
                                                                 cur[1] - _seed["y"]), 3)
                 return self._json(st)
             if p == "/api/range":
-                # One request for both overlays: the page draws them together
-                # and a second round trip would let them drift apart on screen.
-                return self._json({
-                    "scan": _overlay_in_map("scan"),
-                    "cloud": _overlay_in_map("cloud"),
-                    "bound": {"scan": _sensor_topics.get("scan", ""),
-                              "cloud": _sensor_topics.get("cloud", "")},
-                })
+                # One request for every bound overlay: the page draws them
+                # together and a second round trip would let them drift apart
+                # on screen. A sensor the deployment has not bound is absent
+                # from the payload rather than present and empty, so the page
+                # has nothing to report about a capability that is not there.
+                out = {"bound": {k: v for k, v in _sensor_topics.items() if v}}
+                for kind in ("scan", "cloud"):
+                    if _sensor_topics.get(kind):
+                        out[kind] = _overlay_in_map(kind)
+                return self._json(out)
             if p == "/api/log":
                 with _log_lock:
                     return self._json(list(_LOG))

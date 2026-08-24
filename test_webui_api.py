@@ -142,3 +142,40 @@ class PageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RangeEndpointTest(unittest.TestCase):
+    """A capability the deployment has not bound is absent from the payload,
+    not present and empty: the page then has nothing to say about a sensor that
+    does not exist, instead of reporting it as perpetually waiting."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        cls.base = "http://127.0.0.1:%d" % cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def get(self):
+        with urllib.request.urlopen(self.base + "/api/range", timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_scan_only_deployment_reports_only_scan(self):
+        self.addCleanup(webui.set_sensor_topics, "", "")
+        webui.set_sensor_topics(scan="/scanner_normalized")
+        with patch.object(webui, "_overlay_in_map",
+                          return_value={"pts": [[1.0, 2.0]], "frame": "l", "stale": False}):
+            out = self.get()
+        self.assertIn("scan", out)
+        self.assertNotIn("cloud", out)
+        self.assertEqual(out["bound"], {"scan": "/scanner_normalized"})
+
+    def test_a_deployment_with_no_lidar_reports_nothing_to_draw(self):
+        self.addCleanup(webui.set_sensor_topics, "", "")
+        webui.set_sensor_topics()
+        out = self.get()
+        self.assertEqual(out, {"bound": {}})

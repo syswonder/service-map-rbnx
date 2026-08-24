@@ -412,6 +412,14 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  .switch.loc .knob{transform:translateX(100%);background:#1f8a44}
  .switch .swopt{position:relative;z-index:1;background:transparent;color:#9aa3b2;border-radius:999px;padding:6px 16px;font-size:13px;min-width:104px;transition:color .18s ease}
  .switch .swopt.on{color:#fff;font-weight:600}
+ #posehint{display:none;position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:5;background:#171a21ee;border:1px solid #ffb45455;border-radius:8px;padding:10px 14px;max-width:520px;box-shadow:0 8px 26px #000a}
+ #posehint.on{display:block}
+ #posehint .phrow{display:flex;align-items:center;gap:10px;font-size:13px;color:#ffd9a0}
+ #posehint .phsub{margin-top:5px;font-size:11.5px;line-height:1.5;color:#9aa3b2}
+ #posehint .phdemo{position:relative;flex:0 0 62px;height:16px;border-radius:3px;background:#0f1115;overflow:hidden}
+ #posehint .phdemo:before{content:"";position:absolute;left:6px;top:6px;width:5px;height:5px;border-radius:50%;background:#ffb454}
+ #posehint .phdemo:after{content:"";position:absolute;left:8px;top:7px;height:2px;background:#ffb454;animation:phdrag 1.6s ease-in-out infinite}
+ @keyframes phdrag{0%{width:0;opacity:0}20%{opacity:1}70%{width:46px;opacity:1}100%{width:46px;opacity:0}}
  #busy{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;z-index:60}
  #busy.on{display:flex}
  #busybox{background:#171a21;border:1px solid #3a4150;border-radius:10px;padding:22px 26px;text-align:center;min-width:280px;max-width:480px}
@@ -437,8 +445,12 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <header>Robonix · mapping live map</header>
 <div id=status>connecting…</div>
 <div class=wrap>
- <div class=card>
+ <div class=card style="position:relative">
   <canvas id=mapcv width=720 height=540></canvas>
+  <div id=posehint>
+   <div class=phrow><span class=phdemo></span><b>Press where the robot is, then drag the way it faces.</b></div>
+   <div class=phsub>Release to seed. A short drag will not be accepted — the heading has to be unambiguous. Esc cancels.</div>
+  </div>
   <div class=muted>drag = pan · wheel = zoom · double-click = fit · green dots = live lidar returns
    · <button class=alt style="padding:2px 8px" onclick="fitView()">Fit</button></div>
  </div>
@@ -524,11 +536,23 @@ function draw(){fit();cx.clearRect(0,0,cv.width,cv.height);
   for(const q of RANGE.cloud.pts){let p=w2p(q[0],q[1]);cx.fillRect(p[0]-1,p[1]-1,2,2)}}
  if(RANGE.scan&&RANGE.scan.pts&&RANGE.scan.pts.length){cx.fillStyle='#39d353';
   for(const q of RANGE.scan.pts){let p=w2p(q[0],q[1]);cx.fillRect(p[0]-1.5,p[1]-1.5,3,3)}}
- // pose-estimate arrow being dragged
+ // pose-estimate arrow being dragged. Long enough to be unambiguous is drawn
+ // in amber; too short is drawn in grey with the reason, because releasing
+ // there does nothing and the operator has to know that before letting go.
  if(poseDrag){let a=w2p(poseDrag.x0,poseDrag.y0),b=w2p(poseDrag.x1,poseDrag.y1);
-  cx.strokeStyle='#ffb454';cx.fillStyle='#ffb454';cx.lineWidth=2;
-  cx.beginPath();cx.arc(a[0],a[1],5,0,7);cx.fill();
-  cx.beginPath();cx.moveTo(a[0],a[1]);cx.lineTo(b[0],b[1]);cx.stroke()}
+  let dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy),ok=len>=MIN_POSE_DRAG_PX;
+  let col=ok?'#ffb454':'#6b7280';
+  cx.setLineDash([4,4]);cx.strokeStyle=col+'88';cx.lineWidth=1;
+  cx.beginPath();cx.arc(a[0],a[1],MIN_POSE_DRAG_PX,0,7);cx.stroke();cx.setLineDash([]);
+  cx.strokeStyle=col;cx.fillStyle=col;cx.lineWidth=2.5;
+  cx.beginPath();cx.arc(a[0],a[1],4,0,7);cx.fill();
+  if(len>2){let ux=dx/len,uy=dy/len,hx=b[0]-ux*12,hy=b[1]-uy*12,w=7;
+   cx.beginPath();cx.moveTo(a[0],a[1]);cx.lineTo(hx,hy);cx.stroke();
+   cx.beginPath();cx.moveTo(b[0],b[1]);
+   cx.lineTo(hx-uy*w,hy+ux*w);cx.lineTo(hx+uy*w,hy-ux*w);cx.closePath();cx.fill()}
+  let th=Math.atan2(poseDrag.y1-poseDrag.y0,poseDrag.x1-poseDrag.x0)*180/Math.PI;
+  cx.font='12px system-ui';cx.fillStyle=ok?'#ffd9a0':'#9aa3b2';
+  cx.fillText(ok?(th.toFixed(0)+'\\u00b0'):'drag further to set a heading',b[0]+10,b[1]-8)}
  // live pose marker
  if(MI.pose){let p=w2p(MI.pose.x,MI.pose.y),yaw=MI.pose.theta;
   cx.fillStyle='#e63b3b';cx.strokeStyle='#e63b3b';cx.lineWidth=2;
@@ -555,21 +579,28 @@ cv.addEventListener('dblclick',()=>fitView());
 // is, drag the way it faces, release. A heading matters as much as a position —
 // seeding the right spot facing backwards makes relocalization fail the same
 // way a wrong spot does.
-function togglePose(){POSEMODE=!POSEMODE;poseDrag=null;
- let b=document.getElementById('btn-pose');if(b)b.classList.toggle('active',POSEMODE);
- cv.style.cursor=POSEMODE?'crosshair':'grab';
- setStatus(POSEMODE?'pose estimate armed — press where the robot is, drag the way it faces':'pose estimate cancelled');draw()}
+// A drag shorter than this cannot express a heading anyone meant: the angle
+// swings wildly over a few pixels, and a pose seeded facing the wrong way
+// fails to relocalize exactly like a pose in the wrong place.
+const MIN_POSE_DRAG_PX=45;
+function setPoseArmed(on){POSEMODE=on;poseDrag=null;
+ let b=document.getElementById('btn-pose');if(b)b.classList.toggle('active',on);
+ let h=document.getElementById('posehint');if(h)h.classList.toggle('on',on);
+ cv.style.cursor=on?'crosshair':'grab';draw()}
+function togglePose(){setPoseArmed(!POSEMODE);
+ setStatus(POSEMODE?'press where the robot is, then drag the way it faces':'pose estimate cancelled')}
+document.addEventListener('keydown',e=>{if(e.key=='Escape'&&POSEMODE){setPoseArmed(false);setStatus('pose estimate cancelled')}});
 async function finishPose(){
- let d=poseDrag;poseDrag=null;POSEMODE=false;
- let b=document.getElementById('btn-pose');if(b)b.classList.remove('active');
- cv.style.cursor='grab';
+ let d=poseDrag;poseDrag=null;
  let dx=d.x1-d.x0,dy=d.y1-d.y0;
- let far=Math.hypot(dx,dy)*pxPerM>10;
- let th=far?Math.atan2(dy,dx):(MI&&MI.pose?MI.pose.theta:0);
- draw();
+ if(Math.hypot(dx,dy)*pxPerM<MIN_POSE_DRAG_PX){
+  // Stay armed: the operator meant to set a pose and only fell short, and
+  // dropping out of the mode would make them hunt for the button again.
+  draw();setStatus('too short to read a heading — press and drag further, or Esc to cancel');return}
+ setPoseArmed(false);
+ let th=Math.atan2(dy,dx);
  if(!await askConfirm('Seed pose estimate?',
-  'Position ('+d.x0.toFixed(2)+', '+d.y0.toFixed(2)+'), heading '+(th*180/Math.PI).toFixed(0)+'°'+
-  (far?'':' (kept the current heading — drag further to set one).')+'\\n\\n'+
+  'Position ('+d.x0.toFixed(2)+', '+d.y0.toFixed(2)+'), heading '+(th*180/Math.PI).toFixed(0)+'\\u00b0.'+'\\n\\n'+
   'RTAB-Map relocalizes from this guess by scan matching. Watch the green scan returns: '+
   'once they line up with the walls of the map, the estimate has converged.',
   {yes:'Seed pose'}))return;

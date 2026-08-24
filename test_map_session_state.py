@@ -12,7 +12,9 @@ point shares it.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -124,3 +126,41 @@ class ModeReadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResetEpochTest(unittest.TestCase):
+    """A reset moves the map origin, which invalidates every stored map-frame
+    coordinate. Consumers learn that from the lifecycle generation bump, so the
+    bump has to happen when the reset happens -- not only on the path where
+    everything after it also succeeded."""
+
+    def _reset(self, mode_ok):
+        calls = []
+        # reset_map_impl imports std_srvs lazily; off-robot it is absent.
+        std_srvs = types.ModuleType("std_srvs")
+        srv = types.ModuleType("std_srvs.srv")
+        srv.Empty = type("Empty", (), {"Request": staticmethod(lambda: object())})
+        std_srvs.srv = srv
+        with (
+            patch.dict(sys.modules, {"std_srvs": std_srvs, "std_srvs.srv": srv}),
+            patch.object(map_ops, "_get_node", return_value=object()),
+            patch.object(map_ops, "_call_service", return_value=(True, "ok")),
+            patch.object(map_ops, "_set_mode",
+                         return_value=(mode_ok, "ok" if mode_ok else "no mode service")),
+            patch.object(map_ops.lifecycle, "mark_reset",
+                         side_effect=lambda *a, **k: calls.append("epoch")),
+            patch.object(map_ops.lifecycle, "set_mode",
+                         side_effect=lambda *a, **k: calls.append("mode")),
+        ):
+            return map_ops.reset_map_impl(), calls
+
+    def test_a_successful_reset_bumps_the_epoch_and_reports_mapping(self):
+        out, calls = self._reset(mode_ok=True)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(calls, ["epoch", "mode"])
+
+    def test_the_epoch_is_bumped_even_when_the_mode_switch_fails(self):
+        out, calls = self._reset(mode_ok=False)
+        self.assertFalse(out["ok"])
+        self.assertEqual(calls, ["epoch"])
+        self.assertIn("stale", out["detail"])

@@ -645,13 +645,19 @@ def reset_map_impl() -> dict:
         if not ok:
             return {"ok": False, "detail": f"{res} — rtabmap /reset unavailable "
                                            "(fall back to restart with config)"}
+        # The origin moved the moment the reset succeeded, so bump the frame
+        # epoch here rather than after the mode switch below: consumers holding
+        # map-frame coordinates must be told they are stale even if the rest of
+        # this call fails. Same map_id, new origin.
+        lifecycle.mark_reset()
         mode_ok, mode_detail = _set_mode(node, "mapping")
         if not mode_ok:
-            return {"ok": False, "detail": f"map reset, but failed to switch back to mapping mode: {mode_detail}"}
-        # Same map_id, new origin: bump the frame epoch so consumers know
-        # their stored map-frame coordinates just went stale. Reset resumes
-        # in mapping mode — broadcast that too.
-        lifecycle.mark_reset(mode="mapping")
+            return {"ok": False,
+                    "detail": "map cleared and the frame epoch was bumped (stored "
+                              "map-frame coordinates are stale), but rtabmap did not "
+                              f"switch back to mapping mode: {mode_detail}"}
+        # Reset resumes in mapping mode — broadcast that too.
+        lifecycle.set_mode("mapping")
         return {"ok": True, "detail": "map cleared — rebuilding from current pose "
                                       "(origin reset; new frame won't match the old map); switched to mapping mode"}
     except Exception as e:  # noqa: BLE001

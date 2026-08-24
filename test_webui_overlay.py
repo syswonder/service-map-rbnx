@@ -79,6 +79,8 @@ class MapFrameTest(unittest.TestCase):
     def setUp(self):
         webui._latest["scan"] = {"frame": "lidar", "pts": [(1.0, 0.0)],
                                  "t": 1e12}
+        webui.set_sensor_topics(scan="/scan")
+        self.addCleanup(webui.set_sensor_topics, "", "")
         self.addCleanup(webui._latest.__setitem__, "scan", None)
 
     def test_points_are_placed_using_the_sensor_transform(self):
@@ -94,18 +96,26 @@ class MapFrameTest(unittest.TestCase):
             out = webui._overlay_in_map("scan")
         self.assertEqual(out["pts"], [])
         self.assertEqual(out["frame"], "lidar")
-        self.assertIn("no transform", out["detail"])
+        self.assertIn("transform", out["why"])
+        # The reason has to point at localization, not at the sensor.
+        self.assertIn("map frame", out["why"])
 
     def test_stale_data_is_flagged(self):
         webui._latest["scan"] = {"frame": "lidar", "pts": [(1.0, 0.0)], "t": 0.0}
         with patch.object(webui, "_frame_to_map", return_value=(0.0, 0.0, 0.0)):
             self.assertTrue(webui._overlay_in_map("scan")["stale"])
 
-    def test_no_data_at_all_is_reported_as_stale_and_empty(self):
+    def test_no_data_at_all_names_the_topic_it_is_waiting_on(self):
         webui._latest["scan"] = None
         out = webui._overlay_in_map("scan")
         self.assertEqual(out["pts"], [])
         self.assertTrue(out["stale"])
+        self.assertIn("/scan", out["why"])
+
+    def test_an_unbound_sensor_says_so_rather_than_blaming_the_data(self):
+        webui.set_sensor_topics()
+        out = webui._overlay_in_map("scan")
+        self.assertIn("no capability bound", out["why"])
 
 
 class TopicBindingTest(unittest.TestCase):

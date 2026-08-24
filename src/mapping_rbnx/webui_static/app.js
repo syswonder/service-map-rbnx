@@ -586,7 +586,9 @@ async function pollRange() {
     for (const k of ["scan", "cloud"]) {
       if (!r[k]) continue;
       let n = r[k].pts ? r[k].pts.length : 0;
-      bits.push(k + " " + (n ? n + " pts" : r[k].detail || "waiting"));
+      // Name the reason, not just the absence: "no data on /scan" and "no
+      // transform to map" are opposite faults behind the same empty overlay.
+      bits.push(k + " " + (n ? n + " pts" : r[k].why || "waiting"));
     }
     el.textContent = bits.length ? bits.join(" · ") : "no lidar capability bound";
     draw();

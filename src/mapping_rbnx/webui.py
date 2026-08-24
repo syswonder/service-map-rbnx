@@ -272,23 +272,34 @@ def _frame_to_map(frame: str):
 def _overlay_in_map(kind: str) -> dict:
     """Range points for `kind` ("scan"|"cloud") expressed in the map frame.
 
-    Returns {"pts": [...], "frame": ..., "stale": bool}. An empty list with a
-    named frame means the transform is not available yet, which the page shows
-    rather than silently drawing nothing.
+    Returns {"pts", "frame", "stale", "why"}. When there is nothing to draw the
+    reason is named, because the two reasons call for opposite responses: no
+    messages means the sensor or its topic is wrong, while messages that cannot
+    be transformed means localization is not publishing the map frame -- the
+    robot's problem, not the overlay's. Reading that off the page is the point
+    of the overlay on a robot with no RViz.
     """
+    topic = _sensor_topics.get(kind) or ""
     data = _latest.get(kind)
+    if not topic:
+        return {"pts": [], "frame": "", "stale": True, "why": "no capability bound"}
     if not data or not data.get("pts"):
-        return {"pts": [], "frame": "", "stale": True}
+        return {"pts": [], "frame": "", "stale": True,
+                "why": "no data on %s" % topic}
+    age = time.time() - data.get("t", 0)
     tf = _frame_to_map(data.get("frame", ""))
     if tf is None:
         return {"pts": [], "frame": data.get("frame", ""), "stale": True,
-                "detail": "no transform to %s yet" % MAP_FRAME}
+                "why": "no %s -> %s transform: localization is not publishing "
+                       "the map frame" % (data.get("frame", "?"), MAP_FRAME)}
     tx, ty, yaw = tf
     c, s_ = math.cos(yaw), math.sin(yaw)
     pts = [[round(tx + x * c - y * s_, 3), round(ty + x * s_ + y * c, 3)]
            for x, y in data["pts"]]
-    return {"pts": pts, "frame": data.get("frame", ""),
-            "stale": (time.time() - data.get("t", 0)) > 3.0}
+    stale = age > 3.0
+    return {"pts": pts, "frame": data.get("frame", ""), "stale": stale,
+            "age_s": round(age, 1),
+            "why": "last message %.1fs old" % age if stale else ""}
 
 
 def pick_scan_topic(topics: list[tuple[str, list[str]]]) -> str:
@@ -330,6 +341,32 @@ def _discover_scan_topic(node) -> str:
         log.info("webui overlay: no 2-D scan capability bound; using %s "
                  "found on the graph (set webui_scan_topic to pin one)", found)
     return found
+
+
+_overlay_log = {"why": "", "t": 0.0}
+
+
+def _log_overlay_state(out: dict) -> None:
+    """Log why the overlay is empty, once per distinct reason per minute.
+
+    The page shows this, but the page is not what gets sent back when someone
+    asks for help -- the log is. "no scanner_normalized -> map transform" in a
+    log file is the difference between chasing a sensor and chasing
+    localization.
+    """
+    reasons = [
+        "%s: %s" % (kind, out[kind]["why"])
+        for kind in ("scan", "cloud")
+        if kind in out and out[kind].get("why")
+    ]
+    why = "; ".join(reasons)
+    if why == _overlay_log["why"] and time.time() - _overlay_log["t"] < 60.0:
+        return
+    _overlay_log["why"], _overlay_log["t"] = why, time.time()
+    if why:
+        log.warning("overlay has nothing to draw — %s", why)
+    else:
+        log.info("overlay drawing live returns in the %s frame", MAP_FRAME)
 
 
 def _subscribe_range_sensors(node) -> None:
@@ -556,6 +593,7 @@ class _Handler(BaseHTTPRequestHandler):
                 for kind in ("scan", "cloud"):
                     if _sensor_topics.get(kind):
                         out[kind] = _overlay_in_map(kind)
+                _log_overlay_state(out)
                 return self._json(out)
             if p == "/api/log":
                 with _log_lock:

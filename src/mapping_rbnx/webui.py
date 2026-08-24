@@ -30,7 +30,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import map_ops
+from . import lifecycle, map_ops
 
 log = logging.getLogger("mapping_rbnx.webui")
 
@@ -55,19 +55,6 @@ _log_lock = threading.Lock()
 # Last pose_estimate seed, so convergence can be measured against where the
 # robot actually settled after relocalizing.
 _seed = {"x": None, "y": None, "theta": None, "t": 0.0}
-# Last commanded SLAM mode, surfaced so the UI can show/highlight it. Seeded
-# from the config startup map_mode via set_mode_hint(); updated on switch/load.
-_mode = os.environ.get("MAPPING_STARTUP_MODE", "mapping")
-
-
-def set_mode_hint(mode: str) -> None:
-    """Record the current SLAM mode for the UI (called by atlas_bridge at init
-    with the config's startup map_mode, and by the switch/load handlers)."""
-    global _mode
-    if mode:
-        _mode = mode
-
-
 def _log_add(kind: str, msg: str) -> None:
     """Append one timestamped entry (kind ∈ save|load|switch|pose|info) to the
     UI activity log and mirror it to the service logger."""
@@ -247,6 +234,7 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  button.alt{background:#3a4150}
  button.active{background:#1f8a44;box-shadow:0 0 0 2px #2bd66f55}
  button.del{background:#7a2d2d;padding:5px 9px}
+ .warn{background:#3a2a12;border:1px solid #6b4a15;border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.5;color:#f0d9a8}
  input,select{background:#0f1115;color:#e6e6e6;border:1px solid #2a3140;border-radius:6px;padding:6px}
  .lib{display:flex;flex-direction:column;gap:8px;min-width:240px}
  .mapitem{display:flex;gap:8px;align-items:center;border:1px solid #262b36;border-radius:6px;padding:6px}
@@ -273,6 +261,7 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <button id=btn-mapping onclick="doSwitch('mapping')">Mapping (build)</button>
    <button id=btn-localization class=alt onclick="doSwitch('localization')">Localization</button>
   </div>
+  <div id=modewarn class=warn style="display:none;margin-top:8px"></div>
   <div style="margin-top:10px">
    <button class=del onclick="doReset()">Reset map (clear &amp; rebuild)</button>
    <span class=muted>wipes the live map; origin drifts</span>
@@ -343,7 +332,7 @@ cv.addEventListener('click',async e=>{if(moved>4||!MI)return;
  let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:wp[0],y:wp[1],theta:0})})).json();
  setStatus(r.detail||'seeded')});
 async function poll(){try{let s=await (await fetch('/api/state')).json();MI=s;
-  if(CURMODE==null&&s.mode)CURMODE=s.mode;applyMode();
+  if(s.mode)CURMODE=s.mode;CURMAP=s.map_id||'';applyMode();
   setStatus(s.has_map?('map '+s.width+'×'+s.height+' @'+s.resolution+'m  pose='+(s.pose?('('+s.pose.x.toFixed(2)+', '+s.pose.y.toFixed(2)+', '+s.pose.theta.toFixed(2)+')'):'—')+(s.dist_from_seed!=null?'  Δseed='+s.dist_from_seed+'m':'')):'no map yet');draw()}
   catch(e){setStatus('disconnected')}}
 setInterval(poll,1000);poll()
@@ -369,12 +358,30 @@ async function doSave(){let id=document.getElementById('saveid').value.trim();
  if(!id){alert('enter a map_id');return}setStatus('saving '+id+'…');
  let r=await (await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
  setStatus(r.detail||'saved');loadLib()}
-async function doLoad(id){if(!confirm('Load map '+id+' (localization)?'))return;setStatus('loading '+id+'…');
+async function doLoad(id){
+ if(!confirm('Load map '+id+' in localization mode?\n\n'+
+  'This replaces the live SLAM session. Anything mapped since the last Save is discarded — '+
+  'save the current map first if you still need it.'))return;
+ setStatus('loading '+id+'…');
  let r=await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json();
  setStatus(r.detail||'loaded')}
-async function doSwitch(mode){setStatus('switching to '+mode+'…');
+async function doSwitch(mode){
+ // Switching a running RTAB-Map from localization to mapping is the one
+ // transition that can destroy work: it resumes building from wherever the
+ // robot currently believes it is, so if relocalization has not converged on
+ // the loaded map it opens a new session instead of extending the old one.
+ if(mode=='mapping'&&CURMODE=='localization'){
+  let what=CURMAP?('map "'+CURMAP+'"'):'the loaded map';
+  if(!confirm('Switch to mapping mode while localized on '+what+'?\n\n'+
+   'RTAB-Map will resume building from its current pose estimate. If it has '+
+   'not relocalized against '+what+' yet, it starts a fresh session and the '+
+   'loaded map is dropped from the live session — the saved copy on disk is '+
+   'not affected, but anything mapped after this point will be in a new frame.\n\n'+
+   'Safer: check that the pose has converged on the map first, or restart the '+
+   'service with map_mode: mapping instead of switching at runtime.'))return}
+ setStatus('switching to '+mode+'…');
  let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
- if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}
+ if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}  // poll() re-reads the real mode a second later
 async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch? The new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
  setStatus('resetting map…');
  let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
@@ -383,10 +390,17 @@ async function doDelete(id){if(!confirm('Delete saved map '+id+'? This cannot be
  setStatus('deleting '+id+'…');
  let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
  setStatus(r.detail||'deleted');loadLib()}
-let CURMODE=null;
+let CURMODE=null,CURMAP='';
 function applyMode(){let mp=document.getElementById('btn-mapping'),lo=document.getElementById('btn-localization');
  let bdg=document.getElementById('modebadge');if(bdg)bdg.textContent=CURMODE?('mode: '+CURMODE):'mode: —';
- if(mp&&lo){mp.classList.toggle('active',CURMODE=='mapping');lo.classList.toggle('active',CURMODE=='localization')}}
+ if(mp&&lo){mp.classList.toggle('active',CURMODE=='mapping');lo.classList.toggle('active',CURMODE=='localization')}
+ let w=document.getElementById('modewarn');if(!w)return;
+ if(CURMODE=='localization'){w.style.display='';
+  w.textContent='Localized on '+(CURMAP?('map "'+CURMAP+'"'):'a loaded map')+'. Switching to '+
+   'mapping here resumes building from the current pose estimate — if RTAB-Map has not relocalized '+
+   'yet it starts a new session and this map drops out of the live view. Restarting the service with '+
+   'map_mode: mapping is the reliable way to build a new map.'}
+ else{w.style.display='none';w.textContent=''}}
 </script></body></html>"""
 
 
@@ -420,7 +434,14 @@ class _Handler(BaseHTTPRequestHandler):
             if p == "/api/state":
                 _ensure_subscriptions()
                 g = _latest["grid"]
-                st = {"has_map": g is not None, "mode": _mode}
+                # Read the mode from map_ops rather than remembering one
+                # here: a mode set by config, MCP or gRPC must show up in this
+                # page too, and a load or reset changes it without the page
+                # being involved at all.
+                live = lifecycle.current()
+                st = {"has_map": g is not None,
+                      "mode": map_ops.get_mode_impl().get("mode", ""),
+                      "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
                               resolution=round(g.info.resolution, 4),
@@ -457,8 +478,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/save":
                 mid = body.get("map_id", "")
-                out = map_ops.save_map_impl(mid, body.get("note", ""),
-                                            active_db=_active_db_hint())
+                out = map_ops.save_map_impl(mid, body.get("note", ""))
                 _log_add("save", out.get("detail") or (f"saved {mid}" if out.get("ok") else "save failed"))
                 return self._json(out)
             if p == "/api/load":
@@ -467,8 +487,6 @@ class _Handler(BaseHTTPRequestHandler):
                     mid, mode, bool(body.get("has_initial_pose", False)),
                     float(body.get("x", 0.0)), float(body.get("y", 0.0)),
                     float(body.get("theta", 0.0)))
-                if out.get("ok"):
-                    set_mode_hint(mode)
                 _log_add("load", f"{'✓' if out.get('ok') else '✗'} load {mid} ({mode}): {out.get('detail','')}")
                 return self._json(out)
             if p == "/api/delete":
@@ -495,8 +513,6 @@ class _Handler(BaseHTTPRequestHandler):
             if p == "/api/switch_mode":
                 mode = body.get("mode", "")
                 out = map_ops.switch_mode_impl(mode)
-                if out.get("ok"):
-                    set_mode_hint(mode)
                 _log_add("switch", f"{'✓' if out.get('ok') else '✗'} switch to {mode}: {out.get('detail','')}")
                 return self._json(out)
             return self._send(404, "text/plain", b"not found")
@@ -505,21 +521,6 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "detail": str(e)}, code=500)
 
 
-# Set by atlas_bridge so save_map can checkpoint the live (possibly ephemeral)
-# session's db; webui itself has no session state.
-_active_db_fn = None
-
-
-def set_active_db_hint(fn) -> None:
-    global _active_db_fn
-    _active_db_fn = fn
-
-
-def _active_db_hint() -> str:
-    try:
-        return _active_db_fn() if _active_db_fn else ""
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 _server = None

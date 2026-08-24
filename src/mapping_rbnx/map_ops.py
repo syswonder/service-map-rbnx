@@ -26,7 +26,6 @@ import glob
 import sqlite3
 import threading
 import time
-from typing import Optional
 
 import logging
 
@@ -429,7 +428,10 @@ def load_map_impl(map_id: str, mode: str = "localization",
         ok2, info2 = _set_mode(node, mode)
         if not ok2:
             return {"ok": False, "detail": f"failed to switch localization before load: {info2}"}
-        set_current_mode(mode)
+        # RTAB-Map is in localization from here on, whether or not the rest of
+        # the load succeeds. Publish that before the database swap so a load
+        # that fails half way cannot leave consumers reading the old mode.
+        lifecycle.set_mode(mode)
 
         load_timeout_s = float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180"))
         log.info("load_map[%s] stage=load_database runtime_db=%s timeout=%.1fs",
@@ -438,6 +440,10 @@ def load_map_impl(map_id: str, mode: str = "localization",
         if not ok:
             return {"ok": False,
                     "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
+        # The swap succeeded: runtime_db is the live database now. Record it
+        # here rather than in the callers, so a save_map issued after a web UI
+        # load snapshots this database and not the pre-load one.
+        set_active_db(runtime_db)
 
         # The database load is the map-identity authority. Publish that
         # identity before waiting for occupancy so consumers can bind the
@@ -485,27 +491,60 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": False, "detail": str(e)}
 
 
-# ── mode tracking (get_mode) ──────────────────────────────────────────────────
-# Single source of truth for "which SLAM mode is in effect right now", updated
-# by init (startup map_mode), switch_mode and load_map — so get_mode reflects
-# the real runtime mode regardless of how it changed (config, MCP, or webui).
-_current_mode: str = ""
+# ── runtime session state ─────────────────────────────────────────────────────
+# Two facts describe a live SLAM session: which mode is in effect, and which
+# database RTAB-Map currently holds open. The mode already has an owner —
+# lifecycle, which broadcasts (map_id, mode, generation) to consumers — so
+# get_mode reads it there rather than keeping a second copy that can drift.
+# The live database path has no such owner, so it lives here.
+#
+# Both are updated by the impls in this module, never by their callers. The
+# gRPC servicers, the MCP handlers and the web UI are therefore interchangeable
+# entry points: whichever one an operator uses, the next save_map snapshots the
+# database RTAB-Map is actually writing.
+_active_db: str = ""
+_finalized: bool = False
 
 
-def set_current_mode(mode: str) -> None:
-    """Record the SLAM mode now in effect. Called by atlas_bridge.init with the
-    startup map_mode and by switch_mode_impl / load_map_impl on success."""
-    global _current_mode
-    if mode:
-        _current_mode = mode.strip().lower()
+def set_active_db(path: str) -> None:
+    """Record the database RTAB-Map now holds open and clear the finalized flag.
+
+    A newly opened database has not been published under a map_id yet, so it is
+    a candidate for the shutdown snapshot again. Called by atlas_bridge.init
+    with the resolved startup database_path, and by load_map_impl once
+    RTAB-Map has switched onto a runtime copy.
+    """
+    global _active_db, _finalized
+    _active_db = path or ""
+    _finalized = False
+
+
+def get_active_db() -> str:
+    """Path of the database RTAB-Map holds open; "" before init has run."""
+    return _active_db
+
+
+def _mark_finalized() -> None:
+    """Record that the live database has been published under a map_id, so the
+    shutdown snapshot does not dump the same session a second time."""
+    global _finalized
+    _finalized = True
+
+
+def map_finalized() -> bool:
+    """True once save_map has published the live database under a map_id, so
+    shutdown does not dump the same session a second time."""
+    return _finalized
 
 
 def get_mode_impl() -> dict:
-    """Return the SLAM mode currently in effect (read-only). Returns
-    {ok, mode, detail}; mode is "" with ok=False before init has run."""
-    if not _current_mode:
+    """Return the SLAM mode in effect (read-only), as carried by the lifecycle
+    broadcast — the same value consumers see. Returns {ok, mode, detail}; mode
+    is "" with ok=False before init has seeded it."""
+    mode = str(lifecycle.current().get("mode") or "")
+    if not mode:
         return {"ok": False, "mode": "", "detail": "mode not initialized yet"}
-    return {"ok": True, "mode": _current_mode, "detail": ""}
+    return {"ok": True, "mode": mode, "detail": ""}
 
 
 def get_pose_impl(timeout_s: float = 2.0) -> dict:
@@ -578,7 +617,6 @@ def switch_mode_impl(mode: str) -> dict:
         if not ok:
             return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
                                            "(fall back to restart with config map_mode)"}
-        set_current_mode(mode)
         # Mode flip only — the live frame does not move, so no generation bump.
         lifecycle.set_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode"}
@@ -610,7 +648,6 @@ def reset_map_impl() -> dict:
         mode_ok, mode_detail = _set_mode(node, "mapping")
         if not mode_ok:
             return {"ok": False, "detail": f"map reset, but failed to switch back to mapping mode: {mode_detail}"}
-        set_current_mode("mapping")
         # Same map_id, new origin: bump the frame epoch so consumers know
         # their stored map-frame coordinates just went stale. Reset resumes
         # in mapping mode — broadcast that too.
@@ -732,8 +769,7 @@ def _run_preview_snapshot(map_dir: str) -> bool:
         return False
 
 
-def save_map_impl(map_id: str, note: str = "",
-                  active_db: Optional[str] = None) -> dict:
+def save_map_impl(map_id: str, note: str = "") -> dict:
     """Snapshot the current SLAM map under {MAPS_DIR}/<map_id>/.
 
     A spatial map is immutable once published. User annotations and scene
@@ -756,21 +792,28 @@ def save_map_impl(map_id: str, note: str = "",
                 "detail": f"spatial map {map_id!r} already exists and is immutable; update scene annotations/objects separately ({db_detail})",
             }
 
-        live_db = active_db if (active_db and os.path.isfile(active_db)) else None
-        if live_db is None:
-            for cand in (
-                os.environ.get("RTABMAP_DATABASE_PATH", ""),
-                os.path.expanduser("~/.ros/rtabmap.db"),
-            ):
-                if cand and os.path.isfile(cand):
-                    live_db = cand
-                    break
+        # Resolution order: the database this module recorded when init or
+        # load_map last opened one, then the historical fallbacks. The recorded
+        # path is what makes a save work after a load — the runtime copy
+        # load_map switched to has neither of the fallback names.
+        live_db = ""
+        tried = []
+        for cand in (get_active_db(),
+                     os.environ.get("RTABMAP_DATABASE_PATH", ""),
+                     os.path.expanduser("~/.ros/rtabmap.db")):
+            if not cand:
+                continue
+            tried.append(cand)
+            if os.path.isfile(cand):
+                live_db = cand
+                break
         if not live_db:
             return {
                 "ok": False,
                 "map_id": map_id,
                 "artifact_path": "",
-                "detail": "no live rtabmap database found to snapshot",
+                "detail": "no live rtabmap database found to snapshot (tried: "
+                          + (", ".join(tried) or "no candidate paths") + ")",
             }
 
         node = _get_node()
@@ -875,6 +918,7 @@ def save_map_impl(map_id: str, note: str = "",
 
         _atomic_publish_map_dir(staging_dir, map_dir)
         staging_dir = ""
+        _mark_finalized()
         return {
             "ok": True,
             "map_id": map_id,

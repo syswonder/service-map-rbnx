@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+"""The web UI's HTTP surface, exercised against stub impls.
+
+The page is not a second implementation of the map operations -- it calls the
+same map_ops functions the gRPC servicers and the MCP handlers call. The bug
+this guards against is the page diverging from them: carrying its own copy of
+the session state, or passing arguments the other entry points do not. Each
+test asserts the handler forwards to map_ops and reports back what map_ops (or
+lifecycle) says, rather than anything the page remembered.
+"""
+from __future__ import annotations
+
+import json
+import threading
+import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
+from unittest.mock import patch
+
+from mapping_rbnx import webui
+
+
+class WebUiApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        cls.base = "http://127.0.0.1:%d" % cls.srv.server_address[1]
+        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def call(self, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            self.base + path, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST" if data is not None else "GET")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read() or b"{}")
+
+    def test_save_passes_no_session_state_of_its_own(self):
+        # A page that supplied its own live-database hint here is exactly how
+        # the two entry points drifted apart. It must call the impl the same
+        # way the servicers do: id and note, nothing else.
+        with patch.object(webui.map_ops, "save_map_impl",
+                          return_value={"ok": True, "detail": "saved"}) as save:
+            out = self.call("/api/save", {"map_id": "lab", "note": "n"})
+        self.assertTrue(out["ok"])
+        save.assert_called_once_with("lab", "n")
+
+    def test_load_forwards_the_pose_seed(self):
+        with patch.object(webui.map_ops, "load_map_impl",
+                          return_value={"ok": True, "detail": "loaded"}) as load:
+            self.call("/api/load", {"map_id": "lab", "mode": "localization",
+                                    "has_initial_pose": True,
+                                    "x": 1.5, "y": -2.0, "theta": 0.25})
+        load.assert_called_once_with("lab", "localization", True, 1.5, -2.0, 0.25)
+
+    def test_state_reports_the_service_mode_not_a_local_copy(self):
+        with (
+            patch.object(webui.map_ops, "get_mode_impl",
+                         return_value={"ok": True, "mode": "localization", "detail": ""}),
+            patch.object(webui.lifecycle, "current",
+                         return_value={"map_id": "lab_3f", "mode": "localization"}),
+        ):
+            out = self.call("/api/state")
+        self.assertEqual(out["mode"], "localization")
+        self.assertEqual(out["map_id"], "lab_3f")
+
+    def test_state_mode_follows_a_change_the_page_never_made(self):
+        # A load or a reset issued over MCP changes the mode with the page
+        # uninvolved; the badge has to follow it.
+        for mode in ("mapping", "localization"):
+            with (
+                patch.object(webui.map_ops, "get_mode_impl",
+                             return_value={"ok": True, "mode": mode, "detail": ""}),
+                patch.object(webui.lifecycle, "current",
+                             return_value={"map_id": "", "mode": mode}),
+            ):
+                self.assertEqual(self.call("/api/state")["mode"], mode)
+
+    def test_switch_and_reset_reach_the_impls(self):
+        with patch.object(webui.map_ops, "switch_mode_impl",
+                          return_value={"ok": True, "detail": "switched"}) as sw:
+            self.call("/api/switch_mode", {"mode": "mapping"})
+        sw.assert_called_once_with("mapping")
+        with patch.object(webui.map_ops, "reset_map_impl",
+                          return_value={"ok": True, "detail": "cleared"}) as rs:
+            self.call("/api/reset", {})
+        rs.assert_called_once_with()
+
+    def test_a_failing_impl_is_reported_verbatim(self):
+        # The page must not soften or invent a result: the operator needs the
+        # service's own words to act on.
+        with patch.object(webui.map_ops, "save_map_impl",
+                          return_value={"ok": False, "detail": "no live rtabmap database"}):
+            out = self.call("/api/save", {"map_id": "lab"})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["detail"], "no live rtabmap database")
+
+    def test_every_action_is_recorded_in_the_activity_log(self):
+        with (
+            patch.object(webui.map_ops, "save_map_impl", return_value={"ok": True, "detail": "saved lab"}),
+            patch.object(webui.map_ops, "reset_map_impl", return_value={"ok": True, "detail": "cleared"}),
+        ):
+            self.call("/api/save", {"map_id": "lab"})
+            self.call("/api/reset", {})
+        kinds = {e["kind"] for e in self.call("/api/log")}
+        self.assertTrue({"save", "reset"} <= kinds, kinds)
+
+
+class PageTest(unittest.TestCase):
+    def test_the_page_warns_before_the_switch_that_loses_the_session(self):
+        page = webui.PAGE if hasattr(webui, "PAGE") else webui._PAGE
+        self.assertIn("askConfirm", page)
+        self.assertIn("session id", page)
+        self.assertIn("modewarn", page)
+
+
+if __name__ == "__main__":
+    unittest.main()

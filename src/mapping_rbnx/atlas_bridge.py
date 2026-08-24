@@ -94,7 +94,6 @@ HEARTBEAT_PERIOD_S = 10.0
 # Without map_id the package stays ephemeral — exactly the pre-persistence
 # behaviour (temp db, wiped each boot).
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
-RUNTIME_DB_DIR = os.environ.get("MAPPING_RUNTIME_DB_DIR", "/tmp/robonix-mapping-runtime")
 
 
 def _truthy(s: str) -> bool:
@@ -155,9 +154,9 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
 
     # Mapping is always a new mutable session. Keep a supplied map_id out of
     # the runtime binding: it identifies a saved artifact, not a live session.
-    os.makedirs(RUNTIME_DB_DIR, exist_ok=True)
+    os.makedirs(map_ops.RUNTIME_DB_DIR, exist_ok=True)
     runtime_db = os.path.join(
-        RUNTIME_DB_DIR,
+        map_ops.RUNTIME_DB_DIR,
         f"mapping-{os.getpid()}-{int(time.time() * 1000)}.db",
     )
     log.info("persistence: fresh mapping session runtime_db=%s requested_map_id=%s",

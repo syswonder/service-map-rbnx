@@ -797,10 +797,13 @@ def list_maps(req: McpListMapsReq) -> McpListMapsResp:
 
 @mapping.mcp("robonix/service/map/load_map")
 def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
-    """Switch SLAM onto a previously-saved map. mode='localization' relocalizes
-    against it (stable map frame); mode='mapping' resumes building it. Set
-    has_initial_pose + x/y/theta when you roughly know where the robot is, for
-    fast convergence."""
+    """Switch SLAM onto a previously-saved map and relocalize against it, so the
+    map frame is the saved one. Set has_initial_pose + x/y/theta when you
+    roughly know where the robot is, for fast convergence. mode is accepted for
+    compatibility but a load always enters localization: RTAB-Map only restores
+    the saved occupancy grid when the database is opened that way. To extend a
+    map, load it and then switch_mode('mapping') — and read that capability's
+    caveat first."""
     out = map_ops.load_map_impl(req.map_id, req.mode, req.has_initial_pose,
                                 req.x, req.y, req.theta)
     if not out["ok"]:
@@ -824,7 +827,14 @@ def pose_estimate(req: McpPoseReq) -> McpPoseResp:
 def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     """Flip SLAM between 'mapping' (build/extend the current map) and
     'localization' (relocalize read-only against it) at runtime — no map load,
-    no restart. The config's map_mode is only the startup default."""
+    no restart. The config's map_mode is only the startup default.
+
+    Caveat on localization -> mapping: entering localization opened a new
+    RTAB-Map session, and RTAB-Map only links consecutive nodes sharing a
+    session, so what you build after the switch is a separate graph component
+    and the loaded map leaves the published map until a loop closure joins
+    them. Nothing is deleted. Prefer restarting with map_mode: mapping when the
+    goal is a new map."""
     out = map_ops.switch_mode_impl(req.mode)
     if not out["ok"]:
         raise RuntimeError(out["detail"])

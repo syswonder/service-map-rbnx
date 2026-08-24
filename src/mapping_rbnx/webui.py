@@ -235,6 +235,13 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  button.active{background:#1f8a44;box-shadow:0 0 0 2px #2bd66f55}
  button.del{background:#7a2d2d;padding:5px 9px}
  .warn{background:#3a2a12;border:1px solid #6b4a15;border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.5;color:#f0d9a8}
+ #modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:50}
+ #modal.on{display:flex}
+ #modalbox{background:#171a21;border:1px solid #3a4150;border-radius:10px;max-width:560px;width:calc(100% - 32px);padding:18px 20px;box-shadow:0 18px 50px #000b}
+ #modalbox h4{margin:0 0 10px;font-size:16px}
+ #modalbox.danger h4{color:#ffb454}
+ #modalbody{font-size:13px;line-height:1.6;color:#c8cdd8;white-space:pre-wrap}
+ #modalbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
  input,select{background:#0f1115;color:#e6e6e6;border:1px solid #2a3140;border-radius:6px;padding:6px}
  .lib{display:flex;flex-direction:column;gap:8px;min-width:240px}
  .mapitem{display:flex;gap:8px;align-items:center;border:1px solid #262b36;border-radius:6px;padding:6px}
@@ -274,6 +281,14 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
   <div id=logbox style="height:360px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5"></div>
  </div>
 </div>
+<div id=modal><div id=modalbox>
+ <h4 id=modaltitle></h4>
+ <div id=modalbody></div>
+ <div id=modalbtns>
+  <button class=alt id=modalno>Cancel</button>
+  <button class=del id=modalyes>Continue</button>
+ </div>
+</div></div>
 <script>
 function setStatus(t){document.getElementById('status').textContent=t}
 // ── interactive canvas map: pan (drag) / zoom (wheel) / grid / pose / click-pose
@@ -327,7 +342,10 @@ cv.addEventListener('wheel',e=>{e.preventDefault();let p=pt(e),wp=p2w(p[0],p[1])
 cv.addEventListener('dblclick',()=>fitView());
 cv.addEventListener('click',async e=>{if(moved>4||!MI)return;
  let p=pt(e),wp=p2w(p[0],p[1]);
- if(!confirm('Seed pose estimate at ('+wp[0].toFixed(2)+', '+wp[1].toFixed(2)+')?'))return;
+ if(!await askConfirm('Seed pose estimate?',
+  'RTAB-Map will relocalize from ('+wp[0].toFixed(2)+', '+wp[1].toFixed(2)+'). '+
+  'It refines the guess by scan matching; the activity log shows where it settles.',
+  {yes:'Seed pose'}))return;
  setStatus('seeding pose…');
  let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:wp[0],y:wp[1],theta:0})})).json();
  setStatus(r.detail||'seeded')});
@@ -359,9 +377,10 @@ async function doSave(){let id=document.getElementById('saveid').value.trim();
  let r=await (await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
  setStatus(r.detail||'saved');loadLib()}
 async function doLoad(id){
- if(!confirm('Load map '+id+' in localization mode?\n\n'+
+ if(!await askConfirm('Load map '+id+' in localization mode?',
   'This replaces the live SLAM session. Anything mapped since the last Save is discarded — '+
-  'save the current map first if you still need it.'))return;
+  'save the current map first if you still need it.',
+  {danger:true,yes:'Load '+id}))return;
  setStatus('loading '+id+'…');
  let r=await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json();
  setStatus(r.detail||'loaded')}
@@ -372,34 +391,63 @@ async function doSwitch(mode){
  // the loaded map it opens a new session instead of extending the old one.
  if(mode=='mapping'&&CURMODE=='localization'){
   let what=CURMAP?('map "'+CURMAP+'"'):'the loaded map';
-  if(!confirm('Switch to mapping mode while localized on '+what+'?\n\n'+
-   'RTAB-Map will resume building from its current pose estimate. If it has '+
-   'not relocalized against '+what+' yet, it starts a fresh session and the '+
-   'loaded map is dropped from the live session — the saved copy on disk is '+
-   'not affected, but anything mapped after this point will be in a new frame.\n\n'+
-   'Safer: check that the pose has converged on the map first, or restart the '+
-   'service with map_mode: mapping instead of switching at runtime.'))return}
+  if(!await askConfirm('Switch to mapping while localized on '+what+'?',
+   'Expect '+what+' to disappear from the live view.\n\n'+
+   'Why: entering localization started a new RTAB-Map session id. RTAB-Map only links '+
+   'consecutive nodes that share a session id, so everything built after this switch '+
+   'forms a separate graph component, and the published map is assembled from the '+
+   'component the robot is currently in. '+what+' is still in the database — it comes '+
+   'back the moment a loop closure ties the two sessions together, and the saved copy on '+
+   'disk is never touched.\n\n'+
+   'So this is only safe if RTAB-Map can relocalize where you are standing. To build a '+
+   'genuinely new map, restart the service with map_mode: mapping instead.',
+   {danger:true,yes:'Switch to mapping'}))return}
  setStatus('switching to '+mode+'…');
  let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
  if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}  // poll() re-reads the real mode a second later
-async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch? The new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
+async function doReset(){
+ if(!await askConfirm('Clear the live map and rebuild from scratch?',
+  'The new map origin becomes the robot\'s current position, so the rebuilt map will NOT '+
+  'line up with the old frame — anything recorded against the previous map goes stale. '+
+  'Saved maps on disk are not affected.',
+  {danger:true,yes:'Clear live map'}))return;
  setStatus('resetting map…');
  let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
  setStatus(r.detail||'reset')}
-async function doDelete(id){if(!confirm('Delete saved map '+id+'? This cannot be undone.'))return;
+async function doDelete(id){
+ if(!await askConfirm('Delete saved map '+id+'?',
+  'The saved database and its previews are removed from disk. This cannot be undone.',
+  {danger:true,yes:'Delete '+id}))return;
  setStatus('deleting '+id+'…');
  let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
  setStatus(r.detail||'deleted');loadLib()}
 let CURMODE=null,CURMAP='';
+let MODALRESOLVE=null;
+function askConfirm(title, body, opts){
+ opts=opts||{};
+ let m=document.getElementById('modal');
+ document.getElementById('modaltitle').textContent=title;
+ document.getElementById('modalbody').textContent=body;
+ document.getElementById('modalyes').textContent=opts.yes||'Continue';
+ document.getElementById('modalbox').className=opts.danger?'danger':'';
+ m.classList.add('on');
+ return new Promise(res=>{MODALRESOLVE=res})}
+function closeModal(v){
+ document.getElementById('modal').classList.remove('on');
+ if(MODALRESOLVE){let r=MODALRESOLVE;MODALRESOLVE=null;r(v)}}
+document.getElementById('modalyes').onclick=()=>closeModal(true);
+document.getElementById('modalno').onclick=()=>closeModal(false);
+document.getElementById('modal').onclick=e=>{if(e.target.id=='modal')closeModal(false)};
+document.addEventListener('keydown',e=>{if(e.key=='Escape'&&MODALRESOLVE)closeModal(false)});
 function applyMode(){let mp=document.getElementById('btn-mapping'),lo=document.getElementById('btn-localization');
  let bdg=document.getElementById('modebadge');if(bdg)bdg.textContent=CURMODE?('mode: '+CURMODE):'mode: —';
  if(mp&&lo){mp.classList.toggle('active',CURMODE=='mapping');lo.classList.toggle('active',CURMODE=='localization')}
  let w=document.getElementById('modewarn');if(!w)return;
  if(CURMODE=='localization'){w.style.display='';
   w.textContent='Localized on '+(CURMAP?('map "'+CURMAP+'"'):'a loaded map')+'. Switching to '+
-   'mapping here resumes building from the current pose estimate — if RTAB-Map has not relocalized '+
-   'yet it starts a new session and this map drops out of the live view. Restarting the service with '+
-   'map_mode: mapping is the reliable way to build a new map.'}
+   'mapping starts a separate RTAB-Map session, so this map leaves the live view until a loop '+
+   'closure links the two — it is not deleted, and the saved copy is untouched. Restart with '+
+   'map_mode: mapping to build a new map instead.'}
  else{w.style.display='none';w.textContent=''}}
 </script></body></html>"""
 

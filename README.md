@@ -208,12 +208,34 @@ The config's `map_mode` is only the startup default. `switch_mode` flips the
 running RTAB-Map without touching the database or the frame.
 
 **Prefer a restart over a runtime switch.** Going from localization back to
-mapping is the risky direction: RTAB-Map resumes building from its current
-pose estimate, so if it has not relocalized against the loaded map it opens a
-new session and the loaded map drops out of the live view. The saved copy on
-disk is never at risk, but the session is. The web UI shows a standing warning
-while localized and asks for confirmation before that switch. To build a new
-map reliably, restart the service with `map_mode: mapping`.
+mapping is the risky direction, and the loaded map usually leaves the live view
+when you do it. The web UI shows a standing warning while localized and asks
+for confirmation before that switch. To build a new map, restart the service
+with `map_mode: mapping` instead.
+
+#### Why the loaded map disappears
+
+Nothing is deleted — the map becomes a graph component the published map is
+not assembled from. Four steps, all in RTAB-Map 0.23.x:
+
+1. Entering localization calls `Memory::incrementMapId()`, which opens a new
+   session id and flushes short-term memory. Every load does this, because a
+   load always enters localization.
+2. While localized, each new node is dropped again rather than kept
+   (`moveToTrash(_lastSignature, …)`), so the session id stays put.
+3. Switching back to mapping only flips `Mem/IncrementalMemory` to true.
+   `Memory::addSignatureToStm` links a new node to the previous one **only
+   when their session ids match**, so the first node built after the switch
+   gets no odometry link back into the loaded map. The graph now has two
+   disconnected components.
+4. The published map comes from `Rtabmap::optimizeCurrentMap`, which optimizes
+   the connected component around the current node. The loaded map is in the
+   other component, so it is not in `/map`.
+
+It comes back when RTAB-Map detects a loop closure between the two sessions:
+that link joins the components and the whole map returns. So the switch is
+only safe where relocalization can actually succeed. The database on disk is
+never affected either way.
 
 ### Workflows
 
@@ -312,8 +334,9 @@ mapping_rbnx/
   lists the paths it tried. A service that has been running and mapping always
   has one; if this appears right after a load, the deployment predates the
   shared live-database record and should be updated.
-- **The map "disappeared" after switching to mapping mode** — RTAB-Map had not
-  relocalized on the loaded map, so it started a new session. The saved map on
-  disk is intact: load it again, and build new maps from a restart instead.
+- **The map "disappeared" after switching to mapping mode** — expected, see
+  *Why the loaded map disappears*. It returns on a loop closure with the loaded
+  session; the saved map on disk is intact either way. Build new maps from a
+  restart instead of a runtime switch.
 
 License: MulanPSL-2.0

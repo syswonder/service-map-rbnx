@@ -45,7 +45,7 @@
     onclick="togglePanel('savepanel')"
     title="Save the live map under a name"
   >
-    <svg><use href="#i-save" /></svg>
+    <svg><use href="#i-save" /></svg><span>Save</span>
   </button>
   <button
     class="tool"
@@ -53,7 +53,7 @@
     onclick="togglePanel('libpanel')"
     title="Saved maps: load or delete"
   >
-    <svg><use href="#i-library" /></svg>
+    <svg><use href="#i-library" /></svg><span>Library</span>
   </button>
   <button
     class="tool"
@@ -61,17 +61,17 @@
     onclick="togglePose()"
     title="Set pose estimate: press on the robot, drag its heading"
   >
-    <svg><use href="#i-pose" /></svg>
+    <svg><use href="#i-pose" /></svg><span>Pose estimate</span>
   </button>
   <button class="tool danger" onclick="doReset()" title="Clear the live map and rebuild from here">
-    <svg><use href="#i-reset" /></svg>
+    <svg><use href="#i-reset" /></svg><span>Reset</span>
   </button>
   <span class="tsep"></span>
   <button class="tool" onclick="fitView()" title="Fit the map to the view">
-    <svg><use href="#i-fit" /></svg>
+    <svg><use href="#i-fit" /></svg><span>Fit</span>
   </button>
   <button class="tool" id="tool-log" onclick="togglePanel('logpanel')" title="Activity log">
-    <svg><use href="#i-log" /></svg>
+    <svg><use href="#i-log" /></svg><span>Log</span>
   </button>
 </div>
 

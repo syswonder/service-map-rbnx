@@ -20,7 +20,8 @@ let MI = null,
   mapImg = null;
 let center = [0, 0],
   pxPerM = 40,
-  userMoved = false; // world center + zoom
+  userMoved = false, // world center + zoom
+  AUTOFITTED = false;
 function w2p(x, y) {
   return [cv.width / 2 + (x - center[0]) * pxPerM, cv.height / 2 - (y - center[1]) * pxPerM];
 }
@@ -53,6 +54,13 @@ function draw() {
     cx.fillStyle = "#5a6172";
     cx.font = "13px system-ui";
     cx.fillText("no map yet", 16, 24);
+    return;
+  }
+  // Fit once, when the first map arrives: the canvas is now the whole window,
+  // so a default zoom leaves a real map as a postage stamp in the middle.
+  if (!AUTOFITTED && MI.width) {
+    AUTOFITTED = true;
+    fitView();
     return;
   }
   if (!userMoved && MI.pose) center = [MI.pose.x, MI.pose.y];

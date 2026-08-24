@@ -82,11 +82,16 @@ body {
   background: #2a3140;
   margin: 0 2px;
 }
+/* Icon plus label. An icon alone is a guess -- nobody should have to hover a
+   toolbar to find out which button clears their map. */
 .tool {
-  width: 34px;
   height: 34px;
-  display: grid;
-  place-items: center;
+  padding: 0 10px 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  white-space: nowrap;
   background: #0f1115;
   border: 1px solid #2a3140;
   border-radius: 8px;
@@ -108,9 +113,13 @@ body {
   border-color: #7a2d2d;
   color: #fff;
 }
+.tool span {
+  line-height: 1;
+}
 .tool svg {
-  width: 18px;
-  height: 18px;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.7;

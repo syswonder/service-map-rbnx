@@ -320,6 +320,8 @@ mapping_rbnx/
 ├── package_manifest.jetson-native.yaml   arm64 Jetson + host ROS2
 ├── CAPABILITY.md                         capability surface + config spec
 ├── src/mapping_rbnx/atlas_bridge.py      cap registration, sensor discovery, persistence
+├── src/mapping_rbnx/webui.py             operator page server + ROS subscriptions
+├── src/mapping_rbnx/webui_static/        the page itself (index.html, app.js, style.css)
 ├── src/mapping_rbnx/map_to_odom_bridge.py optional split-odometry TF bridge
 ├── src/mapping_rbnx/odom_bridge_math.py   planar transform and interpolation helpers
 ├── launch/rtabmap_2d.launch.py           sensor-agnostic rtabmap launch

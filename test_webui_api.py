@@ -114,34 +114,40 @@ class WebUiApiTest(unittest.TestCase):
         self.assertTrue({"save", "reset"} <= kinds, kinds)
 
 
-class PageTest(unittest.TestCase):
-    def test_the_page_warns_before_the_switch_that_loses_the_session(self):
-        self.assertIn("askConfirm", webui._PAGE)
-        self.assertIn("session id", webui._PAGE)
-        self.assertIn("modewarn", webui._PAGE)
+class StaticAssetTest(unittest.TestCase):
+    """The page is three files on disk, not a Python string.
 
-    def test_the_rendered_script_has_no_broken_string_literals(self):
-        """_PAGE is a plain triple-quoted string, so "\n" written in the source
-        reaches the browser as a real newline and "\'" reaches it as a bare
-        quote. Either one splits a JS string literal across lines and the whole
-        page stops running -- silently, because the server never parses it.
-        Every string in this script stays on one line, so an unbalanced quote
-        on any line means an escape was eaten."""
-        scripts = re.findall(r"<script>(.*?)</script>", webui._PAGE, re.S)
-        self.assertTrue(scripts, "page has no script block")
-        for block in scripts:
-            for n, line in enumerate(block.splitlines(), 1):
-                code = re.sub(r"\\.", "", line)          # drop escaped chars
-                if code.lstrip().startswith("//"):
-                    continue
-                for quote in ("'", '"'):
-                    self.assertEqual(
-                        code.count(quote) % 2, 0,
-                        "unbalanced %s on script line %d: %s" % (quote, n, line.strip()))
+    It used to be one string holding minified HTML, CSS and JavaScript. That
+    made every change a merge hazard and silently ate escapes: a "\\n" written
+    for a JS string literal became a real newline, split the literal across
+    lines and stopped the entire script -- with nothing in any log, because no
+    server ever parses the page it serves.
+    """
 
+    def test_the_assets_exist_and_carry_the_features_they_should(self):
+        js = (webui.STATIC_DIR / "app.js").read_text()
+        html = (webui.STATIC_DIR / "index.html").read_text()
+        self.assertIn("askConfirm", js)
+        self.assertIn("session id", js)          # the mode-switch explanation
+        self.assertIn("MIN_POSE_DRAG_PX", js)    # the pose drag has a floor
+        self.assertIn("runExclusive", js)        # map ops are single-flight
+        self.assertIn("posehint", html)
+        self.assertIn("/static/app.js", html)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_assets_are_served_with_their_own_content_types(self):
+        for name, kind in (("index.html", "text/html"),
+                           ("app.js", "application/javascript"),
+                           ("style.css", "text/css")):
+            status, ctype, body = webui._static(name)
+            self.assertEqual(status, 200, name)
+            self.assertIn(kind, ctype)
+            self.assertTrue(body)
+
+    def test_only_the_pages_own_assets_are_readable(self):
+        # A fixed set of names, so anything else is a mistake or an attack.
+        for name in ("../webui.py", "/etc/passwd", "app.js.bak", ""):
+            status, _, _ = webui._static(name)
+            self.assertEqual(status, 404, name)
 
 
 class RangeEndpointTest(unittest.TestCase):

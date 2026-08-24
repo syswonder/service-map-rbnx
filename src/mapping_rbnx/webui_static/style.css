@@ -60,8 +60,16 @@ body {
 .mw-status {
   max-width: min(46vw, 640px);
 }
+/* Visibility is a class, not an inline style: Bootstrap's display utilities
+   carry !important, so a d-flex on this element beat style="display:none" and
+   the banner was always on screen -- empty whenever the mode was not
+   localization. */
 #modewarn {
+  display: none;
   max-width: min(680px, calc(100vw - 2rem));
+}
+#modewarn.on {
+  display: flex;
 }
 
 /* ── floating panels ─────────────────────────────────────────────────────── */

@@ -638,14 +638,12 @@ function applyMode() {
   }
   let w = document.getElementById("modewarn");
   if (!w) return;
+  w.classList.toggle("on", CURMODE == "localization");
   if (CURMODE == "localization") {
-    w.style.display = "";
     document.getElementById("modewarntext").textContent =
       "Localized on " +
       (CURMAP ? '"' + CURMAP + '"' : "a loaded map") +
       " — switching to mapping drops it from the live view.";
-  } else {
-    w.style.display = "none";
   }
 }
 

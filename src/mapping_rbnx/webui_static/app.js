@@ -342,14 +342,28 @@ async function loadLib() {
     let d = document.createElement("div");
     d.className = "mapitem";
     d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div style="flex:1"><b>${x.map_id}</b><div class=muted>${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
+   <div class="mi"><b>${x.map_id}</b><div class=muted>${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
    <button class=alt onclick="doLoad('${x.map_id}')">Load</button>
    <button class=del onclick="doDelete('${x.map_id}')">Del</button>`;
     el.appendChild(d);
   }
 }
-setInterval(loadLib, 5000);
-loadLib();
+setInterval(() => {
+  if (document.getElementById("libpanel").classList.contains("on")) loadLib();
+}, 5000);
+
+// The map is the page; everything else is a panel raised over it from the
+// toolbar. Opening one refreshes it immediately rather than waiting for the
+// next poll, and closing it stops that poll.
+function togglePanel(id) {
+  const el = document.getElementById(id);
+  const on = el.classList.toggle("on");
+  const tool = { savepanel: "tool-save", libpanel: "tool-library", logpanel: "tool-log" }[id];
+  if (tool) document.getElementById(tool).classList.toggle("active", on);
+  if (on && id == "libpanel") loadLib();
+  if (on && id == "logpanel") loadLog();
+  if (on && id == "savepanel") document.getElementById("saveid").focus();
+}
 const KCOL = {
   save: "#5bd66f",
   load: "#5aa9ff",
@@ -370,8 +384,9 @@ async function loadLog() {
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (e) {}
 }
-setInterval(loadLog, 1500);
-loadLog();
+setInterval(() => {
+  if (document.getElementById("logpanel").classList.contains("on")) loadLog();
+}, 1500);
 async function doSave() {
   let id = document.getElementById("saveid").value.trim();
   if (!id) {
@@ -393,6 +408,7 @@ async function doSave() {
   if (r) {
     setStatus(r.detail || "saved");
     loadLib();
+    if (r.ok) document.getElementById("saveid").value = "";
   }
 }
 async function doLoad(id) {

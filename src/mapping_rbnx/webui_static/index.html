@@ -1,100 +1,177 @@
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Robonix · mapping</title>
-    <link rel="stylesheet" href="/static/style.css" />
-  </head>
-  <body>
-    <header>Robonix · mapping live map</header>
-    <div id="status">connecting…</div>
-    <div class="wrap">
-      <div class="card" style="position: relative">
-        <canvas id="mapcv" width="720" height="540"></canvas>
-        <div id="posehint">
-          <div class="phrow">
-            <span class="phdemo" aria-hidden="true"
-              ><svg viewBox="0 0 66 16" width="66" height="16">
-                <circle class="phdot" cx="7" cy="8" r="2.5" />
-                <g class="phreveal">
-                  <line class="phline" x1="7" y1="8" x2="52" y2="8" />
-                  <polygon class="phhead" points="52,3.5 62,8 52,12.5" />
-                </g></svg></span
-            ><b>Press where the robot is, then drag the way it faces.</b>
-          </div>
-          <div class="phsub">
-            Release to seed. A short drag will not be accepted — the heading has to be unambiguous.
-            Esc cancels.
-          </div>
-        </div>
-        <div class="muted">
-          drag = pan · wheel = zoom · double-click = fit · green dots = live lidar returns ·
-          <button class="alt" style="padding: 2px 8px" onclick="fitView()">Fit</button>
-        </div>
-      </div>
-      <div class="card" style="min-width: 280px">
-        <h3 style="margin: 4px 0 10px">Save current map</h3>
-        <div style="display: flex; gap: 8px">
-          <input id="saveid" placeholder="map_id e.g. lab_3f" style="flex: 1" />
-          <button onclick="doSave()">Save</button>
-        </div>
-        <h3 style="margin: 16px 0 10px">
-          Mode <span id="modebadge" class="muted" style="font-weight: 400">mode: —</span>
-        </h3>
-        <div class="switch" id="modeswitch">
-          <span class="knob" id="modeknob"></span>
-          <button class="swopt" id="btn-mapping" onclick="doSwitch('mapping')">Mapping</button>
-          <button class="swopt" id="btn-localization" onclick="doSwitch('localization')">
-            Localization
-          </button>
-        </div>
-        <div id="modewarn" class="warn" style="display: none">
-          <span class="warnicon">!</span>
-          <span id="modewarntext"></span>
-          <button class="linkbtn" onclick="explainModeRisk()">Why?</button>
-        </div>
-        <div style="margin-top: 10px">
-          <button id="btn-pose" onclick="togglePose()">Set pose estimate</button>
-          <span class="muted" id="rangebadge" style="margin-left: 8px">lidar overlay: —</span>
-        </div>
-        <div style="margin-top: 10px">
-          <button class="del" onclick="doReset()">Reset map (clear &amp; rebuild)</button>
-          <span class="muted">wipes the live map; origin drifts</span>
-        </div>
-        <h3 style="margin: 16px 0 10px">Library</h3>
-        <div id="lib" class="lib"></div>
-      </div>
-      <div class="card" style="min-width: 340px; flex: 1">
-        <h3 style="margin: 4px 0 10px">Activity log</h3>
-        <div
-          id="logbox"
-          style="
-            height: 360px;
-            overflow: auto;
-            font-family: ui-monospace, monospace;
-            font-size: 12px;
-            line-height: 1.5;
-          "
-        ></div>
-      </div>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Robonix · mapping</title>
+<link rel="stylesheet" href="/static/style.css" />
+
+<!-- Icon set. Inline symbols rather than an icon font or a CDN: this server
+     ships no external dependencies so the page works on a robot with no
+     internet, which is where it is actually used. -->
+<svg class="icons" aria-hidden="true">
+  <symbol id="i-save" viewBox="0 0 24 24">
+    <path d="M5 3h11l3 3v15H5z" />
+    <path d="M8 3v6h8V3M8 21v-7h8v7" />
+  </symbol>
+  <symbol id="i-library" viewBox="0 0 24 24">
+    <path d="M4 5h6v14H4zM14 5h6v14h-6z" />
+  </symbol>
+  <symbol id="i-pose" viewBox="0 0 24 24">
+    <circle cx="6" cy="18" r="2.2" />
+    <path d="M7.6 16.4L18 6" />
+    <path d="M13 6h5v5" />
+  </symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24">
+    <path d="M20 12a8 8 0 1 1-2.3-5.6" />
+    <path d="M20 4v5h-5" />
+  </symbol>
+  <symbol id="i-fit" viewBox="0 0 24 24">
+    <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+  </symbol>
+  <symbol id="i-log" viewBox="0 0 24 24">
+    <path d="M5 5h14M5 10h14M5 15h9M5 20h9" />
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24">
+    <path d="M6 6l12 12M18 6L6 18" />
+  </symbol>
+</svg>
+
+<canvas id="mapcv"></canvas>
+
+<!-- Toolbar: the actions, top left, out of the map's way. -->
+<div id="toolbar">
+  <div class="tbrand">Robonix<span>mapping</span></div>
+  <button
+    class="tool"
+    id="tool-save"
+    onclick="togglePanel('savepanel')"
+    title="Save the live map under a name"
+  >
+    <svg><use href="#i-save" /></svg>
+  </button>
+  <button
+    class="tool"
+    id="tool-library"
+    onclick="togglePanel('libpanel')"
+    title="Saved maps: load or delete"
+  >
+    <svg><use href="#i-library" /></svg>
+  </button>
+  <button
+    class="tool"
+    id="btn-pose"
+    onclick="togglePose()"
+    title="Set pose estimate: press on the robot, drag its heading"
+  >
+    <svg><use href="#i-pose" /></svg>
+  </button>
+  <button class="tool danger" onclick="doReset()" title="Clear the live map and rebuild from here">
+    <svg><use href="#i-reset" /></svg>
+  </button>
+  <span class="tsep"></span>
+  <button class="tool" onclick="fitView()" title="Fit the map to the view">
+    <svg><use href="#i-fit" /></svg>
+  </button>
+  <button class="tool" id="tool-log" onclick="togglePanel('logpanel')" title="Activity log">
+    <svg><use href="#i-log" /></svg>
+  </button>
+</div>
+
+<!-- Mode + live readouts, kept to one strip so nothing reflows the map. -->
+<div id="statusbar">
+  <div class="switch" id="modeswitch">
+    <span class="knob" id="modeknob"></span>
+    <button class="swopt" id="btn-mapping" onclick="doSwitch('mapping')">Mapping</button>
+    <button class="swopt" id="btn-localization" onclick="doSwitch('localization')">
+      Localization
+    </button>
+  </div>
+  <span class="chip" id="modebadge">mode: —</span>
+  <span class="chip" id="rangebadge">lidar: —</span>
+  <span class="chip grow" id="status">connecting…</span>
+</div>
+
+<div id="modewarn" class="warn" style="display: none">
+  <span class="warnicon">!</span>
+  <span id="modewarntext"></span>
+  <button class="linkbtn" onclick="explainModeRisk()">Why?</button>
+</div>
+
+<div id="posehint">
+  <div class="phrow">
+    <span class="phdemo" aria-hidden="true"
+      ><svg viewBox="0 0 66 16" width="66" height="16">
+        <circle class="phdot" cx="7" cy="8" r="2.5" />
+        <g class="phreveal">
+          <line class="phline" x1="7" y1="8" x2="52" y2="8" />
+          <polygon class="phhead" points="52,3.5 62,8 52,12.5" />
+        </g></svg
+    ></span>
+    <b>Press where the robot is, then drag the way it faces.</b>
+  </div>
+  <div class="phsub">
+    Release to seed. A short drag will not be accepted — the heading has to be unambiguous. Esc
+    cancels.
+  </div>
+</div>
+
+<!-- Floating panels. Each one is opened from the toolbar and closes itself. -->
+<div class="panel" id="savepanel">
+  <div class="phead">
+    Save current map
+    <button class="pclose" onclick="togglePanel('savepanel')">
+      <svg><use href="#i-close" /></svg>
+    </button>
+  </div>
+  <div class="pbody">
+    <div class="row">
+      <input id="saveid" placeholder="map_id e.g. lab_3f" />
+      <button class="primary" onclick="doSave()">Save</button>
     </div>
-    <div id="busy">
-      <div id="busybox">
-        <div class="spin"></div>
-        <h4 id="busytitle"></h4>
-        <div id="busybody"></div>
-      </div>
+    <div class="hint">
+      A published map is immutable: saving under a name that exists is refused, and a corrected map
+      goes under a new one.
     </div>
-    <div id="modal">
-      <div id="modalbox">
-        <h4 id="modaltitle"></h4>
-        <div id="modalbody"></div>
-        <div id="modalbtns">
-          <button class="alt" id="modalno">Cancel</button>
-          <button class="del" id="modalyes">Continue</button>
-        </div>
-      </div>
+  </div>
+</div>
+
+<div class="panel" id="libpanel">
+  <div class="phead">
+    Saved maps
+    <button class="pclose" onclick="togglePanel('libpanel')">
+      <svg><use href="#i-close" /></svg>
+    </button>
+  </div>
+  <div class="pbody"><div id="lib" class="lib"></div></div>
+</div>
+
+<div class="panel" id="logpanel">
+  <div class="phead">
+    Activity log
+    <button class="pclose" onclick="togglePanel('logpanel')">
+      <svg><use href="#i-close" /></svg>
+    </button>
+  </div>
+  <div class="pbody"><div id="logbox"></div></div>
+</div>
+
+<div id="maphint">drag = pan · wheel = zoom · double-click = fit · green = live lidar returns</div>
+
+<div id="busy">
+  <div id="busybox">
+    <div class="spin"></div>
+    <h4 id="busytitle"></h4>
+    <div id="busybody"></div>
+  </div>
+</div>
+
+<div id="modal">
+  <div id="modalbox">
+    <h4 id="modaltitle"></h4>
+    <div id="modalbody"></div>
+    <div id="modalbtns">
+      <button class="alt" id="modalno">Cancel</button>
+      <button class="del" id="modalyes">Continue</button>
     </div>
-    <script src="/static/app.js"></script>
-  </body>
-</html>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>

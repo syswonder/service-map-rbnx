@@ -1,67 +1,163 @@
+/* The map is the page. Everything else floats over it, so nothing can reflow
+   the view: a panel opening or a warning appearing must never move the map or
+   push another panel around, which is what a document-flow layout kept doing. */
+* {
+  box-sizing: border-box;
+}
+html,
 body {
-  font-family: system-ui, sans-serif;
+  height: 100%;
+}
+body {
   margin: 0;
   background: #0f1115;
   color: #e6e6e6;
+  font:
+    14px/1.45 system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  overflow: hidden;
 }
-header {
-  padding: 10px 16px;
-  background: #171a21;
-  font-weight: 600;
+.icons {
+  display: none;
 }
-.wrap {
-  display: flex;
-  gap: 16px;
-  padding: 16px;
-  flex-wrap: wrap;
-}
-.card {
-  background: #171a21;
-  border: 1px solid #262b36;
-  border-radius: 8px;
-  padding: 12px;
-}
+
+/* ── map ─────────────────────────────────────────────────────────────────── */
 #mapcv {
-  background: #0a0d12;
-  border-radius: 4px;
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
   display: block;
+  background: #0a0d12;
   cursor: grab;
   touch-action: none;
-  width: 720px;
-  height: 540px;
-  max-width: 100%;
 }
 #mapcv:active {
   cursor: grabbing;
 }
-button {
-  background: #2d6cdf;
-  color: #fff;
-  border: 0;
+#maphint {
+  position: fixed;
+  left: 14px;
+  bottom: 12px;
+  z-index: 3;
+  font-size: 11.5px;
+  color: #5a6172;
+  background: #0f1115cc;
+  padding: 4px 8px;
   border-radius: 6px;
-  padding: 7px 12px;
+}
+
+/* ── toolbar ─────────────────────────────────────────────────────────────── */
+#toolbar {
+  position: fixed;
+  left: 14px;
+  top: 14px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: #171a21e8;
+  border: 1px solid #262b36;
+  border-radius: 10px;
+  box-shadow: 0 8px 26px #0007;
+  backdrop-filter: blur(6px);
+}
+.tbrand {
+  font-weight: 700;
+  font-size: 13px;
+  padding: 0 10px 0 6px;
+  white-space: nowrap;
+}
+.tbrand span {
+  color: #5a6172;
+  font-weight: 500;
+  margin-left: 6px;
+}
+.tsep {
+  width: 1px;
+  height: 22px;
+  background: #2a3140;
+  margin: 0 2px;
+}
+.tool {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  background: #0f1115;
+  border: 1px solid #2a3140;
+  border-radius: 8px;
+  color: #c8cdd8;
   cursor: pointer;
-  font-size: 14px;
+  padding: 0;
 }
-button.alt {
-  background: #3a4150;
+.tool:hover {
+  background: #1c2029;
+  color: #fff;
 }
-button.active {
-  background: #1f8a44;
-  box-shadow: 0 0 0 2px #2bd66f55;
+.tool.active {
+  background: #2d6cdf;
+  border-color: #2d6cdf;
+  color: #fff;
 }
-button.del {
+.tool.danger:hover {
   background: #7a2d2d;
-  padding: 5px 9px;
+  border-color: #7a2d2d;
+  color: #fff;
 }
+.tool svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ── status strip ────────────────────────────────────────────────────────── */
+#statusbar {
+  position: fixed;
+  left: 14px;
+  top: 62px;
+  right: 14px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+#statusbar > * {
+  pointer-events: auto;
+}
+.chip {
+  background: #171a21e8;
+  border: 1px solid #262b36;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 11.5px;
+  color: #9aa3b2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46vw;
+}
+.chip.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── mode switch ─────────────────────────────────────────────────────────── */
 .switch {
   position: relative;
   display: inline-flex;
-  background: #0f1115;
+  background: #0f1115e8;
   border: 1px solid #2a3140;
   border-radius: 999px;
   padding: 3px;
-  gap: 0;
 }
 .switch .knob {
   position: absolute;
@@ -83,25 +179,225 @@ button.del {
   position: relative;
   z-index: 1;
   background: transparent;
+  border: 0;
   color: #9aa3b2;
   border-radius: 999px;
-  padding: 6px 16px;
-  font-size: 13px;
-  min-width: 104px;
+  padding: 4px 14px;
+  font-size: 12px;
+  min-width: 92px;
+  cursor: pointer;
   transition: color 0.18s ease;
 }
 .switch .swopt.on {
   color: #fff;
   font-weight: 600;
 }
+
+/* ── warning strip ───────────────────────────────────────────────────────── */
+.warn {
+  position: fixed;
+  left: 14px;
+  top: 100px;
+  z-index: 5;
+  max-width: min(680px, calc(100vw - 28px));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #3a2a12ee;
+  border: 1px solid #6b4a15;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #f0d9a8;
+}
+.warn .warnicon {
+  flex: 0 0 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ffb454;
+  color: #241a08;
+  font-weight: 700;
+  font-size: 11px;
+  text-align: center;
+  line-height: 16px;
+}
+.warn #modewarntext {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.linkbtn {
+  flex: 0 0 auto;
+  background: transparent;
+  color: #ffd9a0;
+  border: 1px solid #6b4a15;
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+/* ── floating panels ─────────────────────────────────────────────────────── */
+.panel {
+  position: fixed;
+  right: 14px;
+  top: 62px;
+  z-index: 6;
+  display: none;
+  width: 330px;
+  max-height: calc(100vh - 90px);
+  flex-direction: column;
+  background: #171a21f2;
+  border: 1px solid #262b36;
+  border-radius: 10px;
+  box-shadow: 0 12px 34px #0008;
+  backdrop-filter: blur(6px);
+}
+.panel.on {
+  display: flex;
+}
+/* Stacked so two open panels sit under each other instead of on top. */
+#libpanel.on {
+  top: 62px;
+}
+#savepanel.on ~ #libpanel.on {
+  top: 190px;
+}
+#logpanel {
+  width: 420px;
+  right: 14px;
+  bottom: 14px;
+  top: auto;
+  max-height: 45vh;
+}
+.phead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  border-bottom: 1px solid #262b36;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.pclose {
+  background: transparent;
+  border: 0;
+  color: #5a6172;
+  cursor: pointer;
+  padding: 2px;
+  display: grid;
+  place-items: center;
+}
+.pclose:hover {
+  color: #e6e6e6;
+}
+.pclose svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.pbody {
+  padding: 12px;
+  overflow: auto;
+}
+.row {
+  display: flex;
+  gap: 8px;
+}
+.hint {
+  margin-top: 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #5a6172;
+}
+input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #0f1115;
+  color: #e6e6e6;
+  border: 1px solid #2a3140;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+button.primary {
+  background: #2d6cdf;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button.alt {
+  background: #3a4150;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+button.del {
+  background: #7a2d2d;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.lib {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mapitem {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #262b36;
+  border-radius: 6px;
+  padding: 6px;
+}
+.mapitem img {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  background: #000;
+  border-radius: 4px;
+}
+.mapitem .mi {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.mapitem b {
+  display: block;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#logbox {
+  font-family: ui-monospace, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.muted {
+  color: #5a6172;
+}
+
+/* ── pose-estimate hint ──────────────────────────────────────────────────── */
 #posehint {
   display: none;
-  position: absolute;
+  position: fixed;
   left: 50%;
-  top: 14px;
+  top: 108px;
   transform: translateX(-50%);
-  z-index: 5;
-  background: #171a21ee;
+  z-index: 7;
+  background: #171a21f2;
   border: 1px solid #ffb45455;
   border-radius: 8px;
   padding: 10px 14px;
@@ -125,9 +421,8 @@ button.del {
   color: #9aa3b2;
 }
 /* The gesture, animated: a dot where you press, then an arrow drawn out of it.
-   Revealing a finished arrow left to right (rather than growing a bare line)
-   means the head is part of what the operator sees, which is the whole point
-   of the gesture -- the drag sets a heading, not just a position. */
+   Revealing a finished arrow (rather than growing a bare line) keeps the head
+   in view, which is the part that says the drag sets a heading. */
 #posehint .phdemo {
   flex: 0 0 66px;
   height: 16px;
@@ -166,6 +461,8 @@ button.del {
     opacity: 0;
   }
 }
+
+/* ── blocking overlays ───────────────────────────────────────────────────── */
 #busy {
   position: fixed;
   inset: 0;
@@ -210,47 +507,6 @@ button.del {
     transform: rotate(360deg);
   }
 }
-/* One line, always. The detail belongs in a dialog: a paragraph living in the
-   panel pushed everything below it off the screen. */
-.warn {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  background: #3a2a12;
-  border: 1px solid #6b4a15;
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 12px;
-  line-height: 1.4;
-  color: #f0d9a8;
-}
-.warn .warnicon {
-  flex: 0 0 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #ffb454;
-  color: #241a08;
-  font-weight: 700;
-  font-size: 11px;
-  text-align: center;
-  line-height: 16px;
-}
-.warn #modewarntext {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.linkbtn {
-  flex: 0 0 auto;
-  background: transparent;
-  color: #ffd9a0;
-  border: 1px solid #6b4a15;
-  border-radius: 5px;
-  padding: 2px 8px;
-  font-size: 11.5px;
-}
 #modal {
   position: fixed;
   inset: 0;
@@ -290,42 +546,4 @@ button.del {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 16px;
-}
-input,
-select {
-  background: #0f1115;
-  color: #e6e6e6;
-  border: 1px solid #2a3140;
-  border-radius: 6px;
-  padding: 6px;
-}
-.lib {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 240px;
-}
-.mapitem {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  border: 1px solid #262b36;
-  border-radius: 6px;
-  padding: 6px;
-}
-.mapitem img {
-  width: 64px;
-  height: 64px;
-  object-fit: contain;
-  background: #000;
-  border-radius: 4px;
-}
-.muted {
-  color: #8b93a3;
-  font-size: 12px;
-}
-#status {
-  padding: 6px 16px;
-  color: #8b93a3;
-  font-size: 13px;
 }

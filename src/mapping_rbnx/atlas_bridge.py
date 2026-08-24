@@ -625,6 +625,15 @@ def init(cfg: dict):
         # Deployment config is authoritative: an inherited shell value must
         # not silently re-enable this unauthenticated admin plane.
         os.environ.pop("MAPPING_WEBUI_PORT", None)
+    # Hand the UI whatever range sensors Atlas resolved for this deployment, so
+    # the map page can overlay live returns without owning a topic name. These
+    # are the same bindings the SLAM engine consumes, so what the operator sees
+    # is what the map is built from. Empty strings are normal: a deployment
+    # with no lidar capability bound simply gets no overlay.
+    webui.set_sensor_topics(
+        scan=resolved.get("scan_topic", ""),
+        cloud=resolved.get("lidar_topic", ""),
+    )
     webui.maybe_start()
     return Ok()
 

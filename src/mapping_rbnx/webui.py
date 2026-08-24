@@ -36,10 +36,34 @@ log = logging.getLogger("mapping_rbnx.webui")
 
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
 MAP_TOPIC = os.environ.get("MAPPING_MAP_TOPIC", "/map")
+MAP_FRAME = os.environ.get("MAPPING_MAP_FRAME", "map")
+_tf_buffer = None
 POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 
-# Latest map / pose, filled by ROS subscriptions on the webui's own node.
-_latest = {"grid": None, "pose": None}
+# Latest map / pose / range data, filled by ROS subscriptions on the webui's
+# own node. "scan" and "cloud" hold points already projected into the map
+# frame, so the page can draw them straight onto the occupancy canvas and an
+# operator can see whether the live returns line up with the saved map.
+_latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
+# Topics for the range sensors, resolved through Atlas by the bridge and
+# injected with set_sensor_topics(). Empty means the deployment has no such
+# capability bound, and the page simply has nothing to draw.
+_sensor_topics = {"scan": "", "cloud": ""}
+
+
+def set_sensor_topics(scan: str = "", cloud: str = "") -> None:
+    """Bind the range-sensor topics the page overlays on the map.
+
+    Called by atlas_bridge with whatever it resolved from Atlas for
+    robonix/primitive/lidar/lidar (2-D scan) and .../lidar3d (point cloud), so
+    the UI follows the deployment's capability bindings instead of hardcoding
+    topic names. Must be called before the first request creates the
+    subscriptions; later calls are ignored for topics already subscribed.
+    """
+    _sensor_topics["scan"] = scan or ""
+    _sensor_topics["cloud"] = cloud or ""
+    log.info("webui range overlay topics: scan=%s cloud=%s",
+             _sensor_topics["scan"] or "<none>", _sensor_topics["cloud"] or "<none>")
 _subscribed = False
 _sub_lock = threading.Lock()
 # Keep the dedicated node + executor alive for the process lifetime.
@@ -141,6 +165,7 @@ def _ensure_subscriptions() -> None:
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
             node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+            _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
             threading.Thread(target=ex.spin, daemon=True).start()
@@ -149,6 +174,141 @@ def _ensure_subscriptions() -> None:
             log.info("webui subscribed (dedicated node): map=%s pose=%s", MAP_TOPIC, POSE_TOPIC)
         except Exception as e:  # noqa: BLE001
             log.warning("webui subscriptions failed: %s", e)
+
+
+# Cap on points sent to the page. A 2-D scan is a few hundred; a 3-D cloud can
+# be hundreds of thousands, which no browser will draw at 1 Hz. Subsampling is
+# uniform so the shape of the return stays honest.
+MAX_OVERLAY_POINTS = int(os.environ.get("MAPPING_WEBUI_MAX_POINTS", "1200"))
+# Cloud points further than this above or below the sensor are dropped: the
+# overlay exists to be compared against a 2-D occupancy grid, and ceiling or
+# floor returns only obscure that.
+CLOUD_Z_BAND_M = float(os.environ.get("MAPPING_WEBUI_CLOUD_Z_BAND", "0.35"))
+
+
+def _scan_points(msg) -> dict:
+    """Project a LaserScan into (x, y) pairs in the sensor's own frame.
+
+    Range readings outside [range_min, range_max], and the inf/NaN a lidar
+    emits for "no return", are dropped rather than drawn at range_max, which
+    would paint a fake wall around the robot.
+    """
+    pts = []
+    ang = msg.angle_min
+    lo, hi = msg.range_min, msg.range_max
+    step = max(1, len(msg.ranges) // MAX_OVERLAY_POINTS)
+    for i, r in enumerate(msg.ranges):
+        if i % step == 0 and lo <= r <= hi and math.isfinite(r):
+            a = ang + i * msg.angle_increment
+            pts.append((r * math.cos(a), r * math.sin(a)))
+    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+
+
+def _cloud_points(msg) -> dict:
+    """Project a PointCloud2 into (x, y) pairs in the sensor's own frame,
+    keeping only returns within CLOUD_Z_BAND_M of the sensor plane and
+    subsampling to MAX_OVERLAY_POINTS."""
+    try:
+        from sensor_msgs_py import point_cloud2
+    except Exception:  # noqa: BLE001
+        return {"frame": msg.header.frame_id, "pts": [], "t": time.time()}
+    pts = []
+    total = max(1, msg.width * msg.height)
+    step = max(1, total // (MAX_OVERLAY_POINTS * 4))
+    for i, pt in enumerate(point_cloud2.read_points(
+            msg, field_names=("x", "y", "z"), skip_nans=True)):
+        if i % step:
+            continue
+        x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+        if abs(z) <= CLOUD_Z_BAND_M:
+            pts.append((x, y))
+            if len(pts) >= MAX_OVERLAY_POINTS:
+                break
+    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+
+
+def _frame_to_map(frame: str):
+    """Latest (tx, ty, yaw) taking `frame` into the map frame, or None.
+
+    Looked up once per request and applied to every point, rather than
+    transforming each point through tf2 — the overlay is a visual check, and a
+    single planar transform is what the canvas needs anyway.
+    """
+    if not frame or _webui_node is None:
+        return None
+    global _tf_buffer
+    try:
+        import rclpy
+        import tf2_ros
+        if _tf_buffer is None:
+            _tf_buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(_tf_buffer, _webui_node, spin_thread=False)
+            return None  # nothing buffered yet on the very first call
+        tr = _tf_buffer.lookup_transform(
+            MAP_FRAME, frame.lstrip("/"), rclpy.time.Time())
+        t, q = tr.transform.translation, tr.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.x, t.y, yaw
+    except Exception as e:  # noqa: BLE001
+        log.debug("webui overlay: no transform %s -> %s: %s", frame, MAP_FRAME, e)
+        return None
+
+
+def _overlay_in_map(kind: str) -> dict:
+    """Range points for `kind` ("scan"|"cloud") expressed in the map frame.
+
+    Returns {"pts": [...], "frame": ..., "stale": bool}. An empty list with a
+    named frame means the transform is not available yet, which the page shows
+    rather than silently drawing nothing.
+    """
+    data = _latest.get(kind)
+    if not data or not data.get("pts"):
+        return {"pts": [], "frame": "", "stale": True}
+    tf = _frame_to_map(data.get("frame", ""))
+    if tf is None:
+        return {"pts": [], "frame": data.get("frame", ""), "stale": True,
+                "detail": "no transform to %s yet" % MAP_FRAME}
+    tx, ty, yaw = tf
+    c, s_ = math.cos(yaw), math.sin(yaw)
+    pts = [[round(tx + x * c - y * s_, 3), round(ty + x * s_ + y * c, 3)]
+           for x, y in data["pts"]]
+    return {"pts": pts, "frame": data.get("frame", ""),
+            "stale": (time.time() - data.get("t", 0)) > 3.0}
+
+
+def _subscribe_range_sensors(node) -> None:
+    """Subscribe to the range topics Atlas resolved, if any.
+
+    Sensor data is best-effort published, so both use a SENSOR_DATA profile;
+    subscribing RELIABLE to a BEST_EFFORT publisher silently receives nothing.
+    A missing message type or topic disables that overlay and is logged once —
+    the map preview itself must keep working either way.
+    """
+    from rclpy.qos import qos_profile_sensor_data
+
+    scan_topic = _sensor_topics.get("scan") or ""
+    cloud_topic = _sensor_topics.get("cloud") or ""
+    if scan_topic:
+        try:
+            from sensor_msgs.msg import LaserScan
+            node.create_subscription(
+                LaserScan, scan_topic,
+                lambda m: _latest.__setitem__("scan", _scan_points(m)),
+                qos_profile_sensor_data)
+            log.info("webui overlay: subscribed scan %s", scan_topic)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: scan %s unavailable: %s", scan_topic, e)
+    if cloud_topic:
+        try:
+            from sensor_msgs.msg import PointCloud2
+            node.create_subscription(
+                PointCloud2, cloud_topic,
+                lambda m: _latest.__setitem__("cloud", _cloud_points(m)),
+                qos_profile_sensor_data)
+            log.info("webui overlay: subscribed cloud %s", cloud_topic)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: cloud %s unavailable: %s", cloud_topic, e)
 
 
 def _grid_to_png(grid, pose=None) -> bytes:
@@ -256,7 +416,7 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <div class=wrap>
  <div class=card>
   <canvas id=mapcv width=720 height=540></canvas>
-  <div class=muted>drag = pan · wheel = zoom · click = set pose estimate (relocalize)
+  <div class=muted>drag = pan · wheel = zoom · double-click = fit · green dots = live lidar returns
    · <button class=alt style="padding:2px 8px" onclick="fitView()">Fit</button></div>
  </div>
  <div class=card style="min-width:280px">
@@ -271,6 +431,10 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <button id=btn-localization class=alt onclick="doSwitch('localization')">Localization</button>
   </div>
   <div id=modewarn class=warn style="display:none;margin-top:8px"></div>
+  <div style="margin-top:10px">
+   <button id=btn-pose onclick="togglePose()">Set pose estimate</button>
+   <span class=muted id=rangebadge style="margin-left:8px">lidar overlay: —</span>
+  </div>
   <div style="margin-top:10px">
    <button class=del onclick="doReset()">Reset map (clear &amp; rebuild)</button>
    <span class=muted>wipes the live map; origin drifts</span>
@@ -324,6 +488,18 @@ function draw(){fit();cx.clearRect(0,0,cv.width,cv.height);
  for(let x=ox;x<cv.width;x+=step){cx.moveTo(x,0);cx.lineTo(x,cv.height)}
  for(let y=oy;y<cv.height;y+=step){cx.moveTo(0,y);cx.lineTo(cv.width,y)}
  cx.stroke();
+ // range overlay: what the robot sees right now, in map coordinates. If these
+ // returns do not sit on the walls of the underlay, localization is off — which
+ // is the whole reason for drawing them.
+ if(RANGE.cloud&&RANGE.cloud.pts&&RANGE.cloud.pts.length){cx.fillStyle='rgba(80,180,230,0.45)';
+  for(const q of RANGE.cloud.pts){let p=w2p(q[0],q[1]);cx.fillRect(p[0]-1,p[1]-1,2,2)}}
+ if(RANGE.scan&&RANGE.scan.pts&&RANGE.scan.pts.length){cx.fillStyle='#39d353';
+  for(const q of RANGE.scan.pts){let p=w2p(q[0],q[1]);cx.fillRect(p[0]-1.5,p[1]-1.5,3,3)}}
+ // pose-estimate arrow being dragged
+ if(poseDrag){let a=w2p(poseDrag.x0,poseDrag.y0),b=w2p(poseDrag.x1,poseDrag.y1);
+  cx.strokeStyle='#ffb454';cx.fillStyle='#ffb454';cx.lineWidth=2;
+  cx.beginPath();cx.arc(a[0],a[1],5,0,7);cx.fill();
+  cx.beginPath();cx.moveTo(a[0],a[1]);cx.lineTo(b[0],b[1]);cx.stroke()}
  // live pose marker
  if(MI.pose){let p=w2p(MI.pose.x,MI.pose.y),yaw=MI.pose.theta;
   cx.fillStyle='#e63b3b';cx.strokeStyle='#e63b3b';cx.lineWidth=2;
@@ -332,25 +508,45 @@ function draw(){fit();cx.clearRect(0,0,cv.width,cv.height);
 setInterval(reloadMapImg,2000);reloadMapImg()
 // interaction — fit() makes internal==display, so (clientX-rect.left) is canvas px
 function pt(e){let r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top]}
-let drag=null,moved=0;
-cv.addEventListener('mousedown',e=>{drag=pt(e);moved=0});
-window.addEventListener('mouseup',()=>{drag=null});
-window.addEventListener('mousemove',e=>{if(!drag)return;let p=pt(e);
+let drag=null,moved=0,POSEMODE=false,poseDrag=null;
+cv.addEventListener('mousedown',e=>{
+ if(POSEMODE&&MI){let w=p2w(...pt(e));poseDrag={x0:w[0],y0:w[1],x1:w[0],y1:w[1]};draw();return}
+ drag=pt(e);moved=0});
+window.addEventListener('mouseup',()=>{if(poseDrag){finishPose();return}drag=null});
+window.addEventListener('mousemove',e=>{
+ if(poseDrag){let w=p2w(...pt(e));poseDrag.x1=w[0];poseDrag.y1=w[1];draw();return}
+ if(!drag)return;let p=pt(e);
  center[0]-=(p[0]-drag[0])/pxPerM;center[1]+=(p[1]-drag[1])/pxPerM;
  moved+=Math.abs(p[0]-drag[0])+Math.abs(p[1]-drag[1]);userMoved=true;drag=p;draw()});
 cv.addEventListener('wheel',e=>{e.preventDefault();let p=pt(e),wp=p2w(p[0],p[1]);
  pxPerM*=e.deltaY<0?1.15:1/1.15;
  center[0]=wp[0]-(p[0]-cv.width/2)/pxPerM;center[1]=wp[1]+(p[1]-cv.height/2)/pxPerM;userMoved=true;draw()},{passive:false});
 cv.addEventListener('dblclick',()=>fitView());
-cv.addEventListener('click',async e=>{if(moved>4||!MI)return;
- let p=pt(e),wp=p2w(p[0],p[1]);
+// Pose estimate is armed explicitly and set by dragging: press where the robot
+// is, drag the way it faces, release. A heading matters as much as a position —
+// seeding the right spot facing backwards makes relocalization fail the same
+// way a wrong spot does.
+function togglePose(){POSEMODE=!POSEMODE;poseDrag=null;
+ let b=document.getElementById('btn-pose');if(b)b.classList.toggle('active',POSEMODE);
+ cv.style.cursor=POSEMODE?'crosshair':'grab';
+ setStatus(POSEMODE?'pose estimate armed — press where the robot is, drag the way it faces':'pose estimate cancelled');draw()}
+async function finishPose(){
+ let d=poseDrag;poseDrag=null;POSEMODE=false;
+ let b=document.getElementById('btn-pose');if(b)b.classList.remove('active');
+ cv.style.cursor='grab';
+ let dx=d.x1-d.x0,dy=d.y1-d.y0;
+ let far=Math.hypot(dx,dy)*pxPerM>10;
+ let th=far?Math.atan2(dy,dx):(MI&&MI.pose?MI.pose.theta:0);
+ draw();
  if(!await askConfirm('Seed pose estimate?',
-  'RTAB-Map will relocalize from ('+wp[0].toFixed(2)+', '+wp[1].toFixed(2)+'). '+
-  'It refines the guess by scan matching; the activity log shows where it settles.',
+  'Position ('+d.x0.toFixed(2)+', '+d.y0.toFixed(2)+'), heading '+(th*180/Math.PI).toFixed(0)+'°'+
+  (far?'':' (kept the current heading — drag further to set one).')+'\\n\\n'+
+  'RTAB-Map relocalizes from this guess by scan matching. Watch the green scan returns: '+
+  'once they line up with the walls of the map, the estimate has converged.',
   {yes:'Seed pose'}))return;
  setStatus('seeding pose…');
- let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:wp[0],y:wp[1],theta:0})})).json();
- setStatus(r.detail||'seeded')});
+ let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:d.x0,y:d.y0,theta:th})})).json();
+ setStatus(r.detail||'seeded')}
 async function poll(){try{let s=await (await fetch('/api/state')).json();MI=s;
   if(s.mode)CURMODE=s.mode;CURMAP=s.map_id||'';applyMode();
   setStatus(s.has_map?('map '+s.width+'×'+s.height+' @'+s.resolution+'m  pose='+(s.pose?('('+s.pose.x.toFixed(2)+', '+s.pose.y.toFixed(2)+', '+s.pose.theta.toFixed(2)+')'):'—')+(s.dist_from_seed!=null?'  Δseed='+s.dist_from_seed+'m':'')):'no map yet');draw()}
@@ -423,7 +619,16 @@ async function doDelete(id){
  setStatus('deleting '+id+'…');
  let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
  setStatus(r.detail||'deleted');loadLib()}
-let CURMODE=null,CURMAP='';
+let CURMODE=null,CURMAP='',RANGE={};
+async function pollRange(){try{let r=await (await fetch('/api/range')).json();RANGE=r;
+ let el=document.getElementById('rangebadge');if(!el)return;
+ let n=(r.scan&&r.scan.pts?r.scan.pts.length:0),m=(r.cloud&&r.cloud.pts?r.cloud.pts.length:0);
+ let bits=[];
+ if(r.bound.scan)bits.push('scan '+(n?n+' pts':(r.scan.detail||'waiting')));
+ if(r.bound.cloud)bits.push('cloud '+(m?m+' pts':(r.cloud.detail||'waiting')));
+ el.textContent=bits.length?bits.join(' · '):'no lidar capability bound';
+ draw()}catch(e){}}
+setInterval(pollRange,500);pollRange()
 let MODALRESOLVE=null;
 function askConfirm(title, body, opts){
  opts=opts||{};
@@ -505,6 +710,15 @@ class _Handler(BaseHTTPRequestHandler):
                         st["dist_from_seed"] = round(math.hypot(cur[0] - _seed["x"],
                                                                 cur[1] - _seed["y"]), 3)
                 return self._json(st)
+            if p == "/api/range":
+                # One request for both overlays: the page draws them together
+                # and a second round trip would let them drift apart on screen.
+                return self._json({
+                    "scan": _overlay_in_map("scan"),
+                    "cloud": _overlay_in_map("cloud"),
+                    "bound": {"scan": _sensor_topics.get("scan", ""),
+                              "cloud": _sensor_topics.get("cloud", "")},
+                })
             if p == "/api/log":
                 with _log_lock:
                     return self._json(list(_LOG))

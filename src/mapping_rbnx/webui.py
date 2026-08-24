@@ -52,6 +52,23 @@ _latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
 _sensor_topics = {"scan": "", "cloud": ""}
 
 
+# A deployment whose 2-D scan is not an Atlas capability can name it here (or
+# through the deployment config key webui_scan_topic). The Ranger is exactly
+# that case: its mid360 declares only robonix/primitive/lidar/lidar3d, and the
+# 2-D scan is derived downstream by the navigation service, which does not
+# declare it. Without this the overlay could only draw that robot's cloud.
+SCAN_TOPIC_OVERRIDE = os.environ.get("MAPPING_WEBUI_SCAN_TOPIC", "")
+# Names that are a projection someone else already rejected: the raw output of
+# pointcloud_to_laserscan before speckle filtering. Preferring the filtered one
+# keeps the overlay agreeing with what navigation actually consumes.
+_SCAN_NAME_PENALTY = ("_raw", "/raw")
+_scan_discovery_logged = False
+# Which range subscriptions exist. Discovery can call the subscriber a second
+# time once a late-starting scan appears, and subscribing twice to the same
+# topic doubles the callback work for nothing.
+_range_subscribed = {"scan": False, "cloud": False}
+
+
 def set_sensor_topics(scan: str = "", cloud: str = "") -> None:
     """Bind the range-sensor topics the page overlays on the map.
 
@@ -61,7 +78,7 @@ def set_sensor_topics(scan: str = "", cloud: str = "") -> None:
     topic names. Must be called before the first request creates the
     subscriptions; later calls are ignored for topics already subscribed.
     """
-    _sensor_topics["scan"] = scan or ""
+    _sensor_topics["scan"] = SCAN_TOPIC_OVERRIDE or scan or ""
     _sensor_topics["cloud"] = cloud or ""
     log.info("webui range overlay topics: scan=%s cloud=%s",
              _sensor_topics["scan"] or "<none>", _sensor_topics["cloud"] or "<none>")
@@ -274,6 +291,47 @@ def _overlay_in_map(kind: str) -> dict:
             "stale": (time.time() - data.get("t", 0)) > 3.0}
 
 
+def pick_scan_topic(topics: list[tuple[str, list[str]]]) -> str:
+    """Choose a LaserScan topic from a ROS graph listing, or "".
+
+    Used when no 2-D scan capability is bound. A deployment can still have a
+    scan -- the Ranger's is produced by the navigation service from the point
+    cloud and never declared -- and an operator checking localization needs to
+    see it. Prefer the shortest name so a filtered scan wins over a longer
+    intermediate one, and rank raw projections last.
+    """
+    scans = [name for name, types in topics
+             if "sensor_msgs/msg/LaserScan" in types]
+    if not scans:
+        return ""
+    return sorted(scans, key=lambda n: (any(p in n for p in _SCAN_NAME_PENALTY),
+                                        len(n), n))[0]
+
+
+def _discover_scan_topic(node) -> str:
+    """Look for a LaserScan on the graph and subscribe to it if found.
+
+    Retried from the range endpoint rather than done once at startup: the
+    navigation service that publishes the derived scan may come up after
+    mapping does, and an overlay that gave up at boot would stay blank for the
+    rest of the session.
+    """
+    global _scan_discovery_logged
+    try:
+        found = pick_scan_topic(node.get_topic_names_and_types())
+    except Exception as e:  # noqa: BLE001
+        log.debug("webui overlay: scan discovery failed: %s", e)
+        return ""
+    if not found:
+        return ""
+    _sensor_topics["scan"] = found
+    if not _scan_discovery_logged:
+        _scan_discovery_logged = True
+        log.info("webui overlay: no 2-D scan capability bound; using %s "
+                 "found on the graph (set webui_scan_topic to pin one)", found)
+    return found
+
+
 def _subscribe_range_sensors(node) -> None:
     """Subscribe to the range topics Atlas resolved, if any.
 
@@ -301,6 +359,10 @@ def _subscribe_range_sensors(node) -> None:
 
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""
+    if _range_subscribed["scan"]:
+        scan_topic = ""
+    if _range_subscribed["cloud"]:
+        cloud_topic = ""
     if scan_topic:
         try:
             from sensor_msgs.msg import LaserScan
@@ -308,6 +370,7 @@ def _subscribe_range_sensors(node) -> None:
                 LaserScan, scan_topic,
                 lambda m: _latest.__setitem__("scan", _scan_points(m)),
                 qos_profile_sensor_data)
+            _range_subscribed["scan"] = True
             log.info("webui overlay: subscribed scan %s", scan_topic)
         except Exception as e:  # noqa: BLE001
             log.warning("webui overlay: scan %s unavailable: %s", scan_topic, e)
@@ -318,6 +381,7 @@ def _subscribe_range_sensors(node) -> None:
                 PointCloud2, cloud_topic,
                 lambda m: _latest.__setitem__("cloud", _cloud_points(m)),
                 qos_profile_sensor_data)
+            _range_subscribed["cloud"] = True
             log.info("webui overlay: subscribed cloud %s", cloud_topic)
         except Exception as e:  # noqa: BLE001
             log.warning("webui overlay: cloud %s unavailable: %s", cloud_topic, e)
@@ -483,6 +547,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # on screen. A sensor the deployment has not bound is absent
                 # from the payload rather than present and empty, so the page
                 # has nothing to report about a capability that is not there.
+                _ensure_subscriptions()
+                if not _sensor_topics.get("scan") and _webui_node is not None:
+                    if _discover_scan_topic(_webui_node):
+                        _subscribe_range_sensors(_webui_node)
                 out = {"bound": {k: v for k, v in _sensor_topics.items() if v}}
                 for kind in ("scan", "cloud"):
                     if _sensor_topics.get(kind):

@@ -294,7 +294,12 @@ reads the live `/map` + pose straight off the bridge's rclpy node.
   localization right": if the returns do not sit on the walls of the map, the
   pose is wrong. Topics come from whatever Atlas resolved for
   `robonix/primitive/lidar/lidar` and `robonix/primitive/lidar/lidar3d`, so the
-  overlay follows the deployment's capability bindings — a Webots TIAGo shows
+  overlay follows the deployment's capability bindings. When no 2-D scan
+  capability is bound the page looks for a `LaserScan` on the graph instead and
+  says which one it picked — a robot whose scan is projected downstream from a
+  3-D cloud (and therefore never declared) still gets its overlay. Pin one with
+  `webui_scan_topic` in the deployment config, or `MAPPING_WEBUI_SCAN_TOPIC`.
+  This overlay follows the deployment's capability bindings — a Webots TIAGo shows
   its 2-D scan, a Ranger with a mid360 shows its cloud, and a deployment with
   no lidar bound simply has no overlay. Cloud returns are limited to a band
   around the sensor plane (`MAPPING_WEBUI_CLOUD_Z_BAND`, default 0.35 m) so

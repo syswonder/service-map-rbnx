@@ -630,8 +630,13 @@ def init(cfg: dict):
     # are the same bindings the SLAM engine consumes, so what the operator sees
     # is what the map is built from. Empty strings are normal: a deployment
     # with no lidar capability bound simply gets no overlay.
+    # A deployment whose 2-D scan is not an Atlas capability can pin it with
+    # webui_scan_topic. The Ranger is that case: its mid360 declares only
+    # lidar3d and the 2-D scan is derived downstream, so without this the page
+    # would fall back to searching the graph for one.
     webui.set_sensor_topics(
-        scan=resolved.get("scan_topic", ""),
+        scan=str(cfg.get("webui_scan_topic", "")).strip()
+             or resolved.get("scan_topic", ""),
         cloud=resolved.get("lidar_topic", ""),
     )
     webui.maybe_start()

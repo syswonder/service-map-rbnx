@@ -120,3 +120,43 @@ class TopicBindingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanDiscoveryTest(unittest.TestCase):
+    """Finding a 2-D scan when no capability declares one.
+
+    The Ranger's mid360 declares only robonix/primitive/lidar/lidar3d; its 2-D
+    scan is projected from the cloud by the navigation service and never
+    declared. Field deployments update the mapping package alone, so the page
+    has to find that scan itself rather than wait for another repository to
+    declare it.
+    """
+
+    def test_the_filtered_scan_wins_over_the_raw_projection(self):
+        topics = [("/scanner/cloud", ["sensor_msgs/msg/PointCloud2"]),
+                  ("/scanner/scan_raw", ["sensor_msgs/msg/LaserScan"]),
+                  ("/scanner/scan", ["sensor_msgs/msg/LaserScan"])]
+        self.assertEqual(webui.pick_scan_topic(topics), "/scanner/scan")
+
+    def test_a_raw_scan_is_still_better_than_no_scan(self):
+        topics = [("/scanner/scan_raw", ["sensor_msgs/msg/LaserScan"])]
+        self.assertEqual(webui.pick_scan_topic(topics), "/scanner/scan_raw")
+
+    def test_a_graph_with_no_scan_yields_nothing(self):
+        topics = [("/scanner/cloud", ["sensor_msgs/msg/PointCloud2"]),
+                  ("/map", ["nav_msgs/msg/OccupancyGrid"])]
+        self.assertEqual(webui.pick_scan_topic(topics), "")
+
+    def test_the_shortest_name_wins_among_equals(self):
+        topics = [("/robot/front/scan_filtered", ["sensor_msgs/msg/LaserScan"]),
+                  ("/scan", ["sensor_msgs/msg/LaserScan"])]
+        self.assertEqual(webui.pick_scan_topic(topics), "/scan")
+
+    def test_an_explicit_topic_beats_the_resolved_capability(self):
+        # A deployment that pins one must not be second-guessed by discovery.
+        self.addCleanup(setattr, webui, "SCAN_TOPIC_OVERRIDE",
+                        webui.SCAN_TOPIC_OVERRIDE)
+        self.addCleanup(webui.set_sensor_topics, "", "")
+        webui.SCAN_TOPIC_OVERRIDE = "/pinned/scan"
+        webui.set_sensor_topics(scan="/resolved/scan", cloud="")
+        self.assertEqual(webui._sensor_topics["scan"], "/pinned/scan")

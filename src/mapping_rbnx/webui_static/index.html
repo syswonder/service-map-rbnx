@@ -13,7 +13,14 @@
         <canvas id="mapcv" width="720" height="540"></canvas>
         <div id="posehint">
           <div class="phrow">
-            <span class="phdemo"></span><b>Press where the robot is, then drag the way it faces.</b>
+            <span class="phdemo" aria-hidden="true"
+              ><svg viewBox="0 0 66 16" width="66" height="16">
+                <circle class="phdot" cx="7" cy="8" r="2.5" />
+                <g class="phreveal">
+                  <line class="phline" x1="7" y1="8" x2="52" y2="8" />
+                  <polygon class="phhead" points="52,3.5 62,8 52,12.5" />
+                </g></svg></span
+            ><b>Press where the robot is, then drag the way it faces.</b>
           </div>
           <div class="phsub">
             Release to seed. A short drag will not be accepted — the heading has to be unambiguous.
@@ -41,7 +48,11 @@
             Localization
           </button>
         </div>
-        <div id="modewarn" class="warn" style="display: none; margin-top: 8px"></div>
+        <div id="modewarn" class="warn" style="display: none">
+          <span class="warnicon">!</span>
+          <span id="modewarntext"></span>
+          <button class="linkbtn" onclick="explainModeRisk()">Why?</button>
+        </div>
         <div style="margin-top: 10px">
           <button id="btn-pose" onclick="togglePose()">Set pose estimate</button>
           <span class="muted" id="rangebadge" style="margin-left: 8px">lidar overlay: —</span>

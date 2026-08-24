@@ -570,6 +570,8 @@ function askConfirm(title, body, opts) {
   document.getElementById("modalbody").textContent = body;
   document.getElementById("modalyes").textContent = opts.yes || "Continue";
   document.getElementById("modalbox").className = opts.danger ? "danger" : "";
+  // An explanation has nothing to cancel, so it gets one button.
+  document.getElementById("modalno").style.display = opts.info ? "none" : "";
   m.classList.add("on");
   return new Promise((res) => {
     MODALRESOLVE = res;
@@ -606,15 +608,30 @@ function applyMode() {
   if (!w) return;
   if (CURMODE == "localization") {
     w.style.display = "";
-    w.textContent =
+    document.getElementById("modewarntext").textContent =
       "Localized on " +
-      (CURMAP ? 'map "' + CURMAP + '"' : "a loaded map") +
-      ". Switching to " +
-      "mapping starts a separate RTAB-Map session, so this map leaves the live view until a loop " +
-      "closure links the two — it is not deleted, and the saved copy is untouched. Restart with " +
-      "map_mode: mapping to build a new map instead.";
+      (CURMAP ? '"' + CURMAP + '"' : "a loaded map") +
+      " — switching to mapping drops it from the live view.";
   } else {
     w.style.display = "none";
-    w.textContent = "";
   }
+}
+
+// The reason is a paragraph, and a paragraph in the panel pushes everything
+// below it off screen. It lives behind the Why? button instead.
+function explainModeRisk() {
+  let what = CURMAP ? 'map "' + CURMAP + '"' : "the loaded map";
+  askConfirm(
+    "Why does " + what + " disappear?",
+    "Loading a map put RTAB-Map into localization, which starts a new session id. RTAB-Map only " +
+      "links consecutive nodes that share a session id, so anything built after a switch back to " +
+      "mapping forms a separate graph component — and the published map is assembled from the " +
+      "component the robot is currently in.\n\n" +
+      "Nothing is deleted. " +
+      what.charAt(0).toUpperCase() +
+      what.slice(1) +
+      " returns as soon as a loop closure ties the two sessions together, and the copy on disk is " +
+      "never touched. To build a genuinely new map, restart the service with map_mode: mapping.",
+    { info: true, yes: "Got it" },
+  );
 }

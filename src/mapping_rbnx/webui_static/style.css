@@ -124,47 +124,45 @@ button.del {
   line-height: 1.5;
   color: #9aa3b2;
 }
+/* The gesture, animated: a dot where you press, then an arrow drawn out of it.
+   Revealing a finished arrow left to right (rather than growing a bare line)
+   means the head is part of what the operator sees, which is the whole point
+   of the gesture -- the drag sets a heading, not just a position. */
 #posehint .phdemo {
-  position: relative;
-  flex: 0 0 62px;
+  flex: 0 0 66px;
   height: 16px;
-  border-radius: 3px;
-  background: #0f1115;
-  overflow: hidden;
 }
-#posehint .phdemo:before {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 6px;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: #ffb454;
+#posehint .phdot {
+  fill: #ffb454;
 }
-#posehint .phdemo:after {
-  content: "";
-  position: absolute;
-  left: 8px;
-  top: 7px;
-  height: 2px;
-  background: #ffb454;
-  animation: phdrag 1.6s ease-in-out infinite;
+#posehint .phline {
+  stroke: #ffb454;
+  stroke-width: 2;
+}
+#posehint .phhead {
+  fill: #ffb454;
+}
+#posehint .phreveal {
+  animation: phdrag 1.8s ease-in-out infinite;
 }
 @keyframes phdrag {
   0% {
-    width: 0;
+    clip-path: inset(0 100% 0 0);
     opacity: 0;
   }
-  20% {
+  15% {
     opacity: 1;
   }
   70% {
-    width: 46px;
+    clip-path: inset(0 0 0 0);
+    opacity: 1;
+  }
+  92% {
+    clip-path: inset(0 0 0 0);
     opacity: 1;
   }
   100% {
-    width: 46px;
+    clip-path: inset(0 0 0 0);
     opacity: 0;
   }
 }
@@ -212,14 +210,46 @@ button.del {
     transform: rotate(360deg);
   }
 }
+/* One line, always. The detail belongs in a dialog: a paragraph living in the
+   panel pushed everything below it off the screen. */
 .warn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
   background: #3a2a12;
   border: 1px solid #6b4a15;
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.4;
   color: #f0d9a8;
+}
+.warn .warnicon {
+  flex: 0 0 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ffb454;
+  color: #241a08;
+  font-weight: 700;
+  font-size: 11px;
+  text-align: center;
+  line-height: 16px;
+}
+.warn #modewarntext {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.linkbtn {
+  flex: 0 0 auto;
+  background: transparent;
+  color: #ffd9a0;
+  border: 1px solid #6b4a15;
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 11.5px;
 }
 #modal {
   position: fixed;

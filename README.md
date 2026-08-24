@@ -126,28 +126,127 @@ interface package. Standard interfaces such as `sensor_msgs` continue to come
 from the target's ROS 2 Humble installation, preserving its support libraries
 and CMake exports for consumers such as `cv_bridge`.
 
-## Saving & re-using a map
+## Maps, modes and session state
 
-Mapping starts with a fresh runtime database. Call `save_map(map_id)` after
-coverage is complete; the named map lives under `{MAPPING_MAPS_DIR}/{map_id}/`
-(default: the package's `maps/` dir, which survives container restarts):
+### Three databases, kept apart
+
+RTAB-Map never writes a saved map. Knowing which file is which explains every
+rule below.
+
+| database | path | who writes it |
+|---|---|---|
+| saved map | `{MAPPING_MAPS_DIR}/{map_id}/rtabmap.db` | `save_map` only, once — immutable afterwards |
+| runtime database | `{MAPPING_RUNTIME_DB_DIR}/…` (default `/tmp/robonix-mapping-runtime`) | RTAB-Map, continuously. A mapping session gets a fresh empty one; a load gets a copy of the saved map |
+| legacy default | `~/.ros/rtabmap.db` | nothing, in a normal deployment — kept only as a last-resort fallback for `save_map` |
+
+A saved map directory holds the artifacts alongside the database:
 
 ```
 maps/lab_3f/rtabmap.db  occupancy.pgm  occupancy.yaml  occupancy.png  cloud.pcd  meta.yaml
 ```
 
-- **Build a map:** `map_mode: mapping`. Drive the robot around, then call
-  `save_map(map_id)` to publish an immutable database and previews.
-- **Re-use a map:** set `map_id` plus `map_mode: localization`. Mapping copies
-  the saved db to a private runtime path and re-localizes against it; the
-  **map frame is stable across restarts**, so Scene can load semantic state for
-  the same id.
-- **Start fresh:** `map_mode: mapping` (the default). It never writes an
-  existing saved map.
+`map_ops` keeps one record of which database is live and hands it to
+`save_map`. Every entry point — deployment config, gRPC, MCP, the web UI —
+updates the same record, so a map saved after a load snapshots the database
+RTAB-Map actually holds open.
 
-> Localization-mode persistence only re-anchors correctly because the map
-> frame is loaded from the saved db. Without `map_mode: localization` the
-> map origin resets to the robot's boot pose each run.
+### Startup configuration
+
+`map_mode` and `map_id` in the deployment config choose the startup state.
+There are two useful combinations:
+
+```yaml
+# Build a new map. This is the default: omit both keys and you get it.
+mapping:
+  config: {}
+
+# Come up localized on a saved map — the stable-frame form used for tasks.
+mapping:
+  config:
+    map_mode: localization
+    map_id: lab_3f
+```
+
+- `map_mode` defaults to `mapping`, which always opens a **fresh, empty**
+  runtime database. A `map_id` given alongside it is ignored: it names a saved
+  artifact, not a live session, and mapping never reopens one. There is no
+  "start up and keep extending map X" configuration.
+- `map_mode: localization` requires `map_id`, and fails to start if that map
+  is missing — deliberately, rather than silently mapping from the boot pose.
+  It copies the saved database to a runtime path and localizes against the
+  copy, so the **map frame is stable across restarts** and Scene can load
+  semantic state for the same id.
+- `reset_map: true` is only meaningful in mapping mode.
+
+### Runtime operations
+
+| operation | changes the database | changes the mode | changes the frame |
+|---|---|---|---|
+| `save_map(map_id)` | no — snapshots the live database into a new saved map | no | no |
+| `load_map(map_id)` | yes — copies the saved map and switches onto the copy | yes, to localization | yes, to the loaded map's frame |
+| `switch_mode(mode)` | no | yes | no |
+| `reset_map` | no — clears working memory, the file stays | back to mapping | **yes** — origin becomes the robot's current pose |
+| `pose_estimate(x, y, θ)` | no | no | no |
+| `delete_map(map_id)` | removes a saved map from disk | no | no |
+
+Notes that matter in the field:
+
+- **`save_map` publishes once.** Saving under an existing `map_id` is refused;
+  a corrected map goes under a new id.
+- **`load_map` always localizes.** A `mapping` mode argument is accepted and
+  coerced, because RTAB-Map only restores the saved occupancy grid when the
+  database is opened for localization.
+- **`reset_map` invalidates coordinates.** The rebuilt map does not share the
+  old frame, so positions recorded against the previous map are stale. The
+  lifecycle broadcast bumps its generation to say so.
+- **Loading replaces the live session.** Anything mapped since the last save
+  is gone; save first.
+
+### Switching mode at runtime
+
+The config's `map_mode` is only the startup default. `switch_mode` flips the
+running RTAB-Map without touching the database or the frame.
+
+**Prefer a restart over a runtime switch.** Going from localization back to
+mapping is the risky direction, and the loaded map usually leaves the live view
+when you do it. The web UI shows a standing warning while localized and asks
+for confirmation before that switch. To build a new map, restart the service
+with `map_mode: mapping` instead.
+
+#### Why the loaded map disappears
+
+Nothing is deleted — the map becomes a graph component the published map is
+not assembled from. Four steps, all in RTAB-Map 0.23.x:
+
+1. Entering localization calls `Memory::incrementMapId()`, which opens a new
+   session id and flushes short-term memory. Every load does this, because a
+   load always enters localization.
+2. While localized, each new node is dropped again rather than kept
+   (`moveToTrash(_lastSignature, …)`), so the session id stays put.
+3. Switching back to mapping only flips `Mem/IncrementalMemory` to true.
+   `Memory::addSignatureToStm` links a new node to the previous one **only
+   when their session ids match**, so the first node built after the switch
+   gets no odometry link back into the loaded map. The graph now has two
+   disconnected components.
+4. The published map comes from `Rtabmap::optimizeCurrentMap`, which optimizes
+   the connected component around the current node. The loaded map is in the
+   other component, so it is not in `/map`.
+
+It comes back when RTAB-Map detects a loop closure between the two sessions:
+that link joins the components and the whole map returns. So the switch is
+only safe where relocalization can actually succeed. The database on disk is
+never affected either way.
+
+### Workflows
+
+1. **Build the first map** — start with no `map_id` / `map_mode`, drive the
+   space, `save_map("lab_3f")`.
+2. **Build another map** — restart the service, then drive and save under a new
+   id. Do not load an existing map first.
+3. **Run tasks on a saved map** — start with `map_mode: localization` and
+   `map_id`, or `load_map(id)` on a running service.
+4. **Correct a saved map** — build a fresh session and save under a new id; a
+   published map is immutable.
 
 ## RTAB-Map UI
 
@@ -179,13 +278,33 @@ reads the live `/map` + pose straight off the bridge's rclpy node.
 - **Library** — every saved map with a thumbnail; **Load** re-localizes onto
   it, **Del** removes it from disk.
 - **Mode** — flip **Mapping ⇄ Localization** at runtime; a badge + button
-  highlight shows the current mode.
+  highlight shows the mode the service reports, so a mode changed by config,
+  MCP, a load or a reset shows up here too. Localization ⇒ mapping raises a
+  warning first (see *Switching mode at runtime*).
 - **Reset map** — wipe the live SLAM session and rebuild from scratch (for
   when mapping diverges). Note: the origin resets to the robot's *current*
   pose, so the rebuilt frame won't match the old map (origin drift).
-- **Click the map → pose estimate** — seeds `/initialpose` so rtabmap
-  re-localizes; the **activity log** records the seeded pose and, a few
-  seconds later, where it converged + the distance from your estimate.
+- **Set pose estimate** — arm the button, then press where the robot is and
+  drag the way it faces. The heading matters as much as the position: seeding
+  the right spot facing backwards fails to relocalize just as a wrong spot
+  does. The **activity log** records the seeded pose and, a few seconds later,
+  where it converged and how far that is from your estimate.
+- **Live lidar overlay** — the current range returns are drawn on the map in
+  green (2-D scan) and blue (point cloud). This is the check that answers "is
+  localization right": if the returns do not sit on the walls of the map, the
+  pose is wrong. Topics come from whatever Atlas resolved for
+  `robonix/primitive/lidar/lidar` and `robonix/primitive/lidar/lidar3d`, so the
+  overlay follows the deployment's capability bindings. When no 2-D scan
+  capability is bound the page looks for a `LaserScan` on the graph instead and
+  says which one it picked — a robot whose scan is projected downstream from a
+  3-D cloud (and therefore never declared) still gets its overlay. Pin one with
+  `webui_scan_topic` in the deployment config, or `MAPPING_WEBUI_SCAN_TOPIC`.
+  This overlay follows the deployment's capability bindings — a Webots TIAGo shows
+  its 2-D scan, a Ranger with a mid360 shows its cloud, and a deployment with
+  no lidar bound simply has no overlay. Cloud returns are limited to a band
+  around the sensor plane (`MAPPING_WEBUI_CLOUD_Z_BAND`, default 0.35 m) so
+  they can be compared against a 2-D grid, and both are subsampled to
+  `MAPPING_WEBUI_MAX_POINTS` (default 1200).
 
 These are the same operations exposed as runtime **RPC + MCP capabilities**
 (so Pilot can drive them too): `save_map`, `load_map`, `pose_estimate`,
@@ -206,6 +325,8 @@ mapping_rbnx/
 ├── package_manifest.jetson-native.yaml   arm64 Jetson + host ROS2
 ├── CAPABILITY.md                         capability surface + config spec
 ├── src/mapping_rbnx/atlas_bridge.py      cap registration, sensor discovery, persistence
+├── src/mapping_rbnx/webui.py             operator page server + ROS subscriptions
+├── src/mapping_rbnx/webui_static/        the page itself (index.html, app.js, style.css)
 ├── src/mapping_rbnx/map_to_odom_bridge.py optional split-odometry TF bridge
 ├── src/mapping_rbnx/odom_bridge_math.py   planar transform and interpolation helpers
 ├── launch/rtabmap_2d.launch.py           sensor-agnostic rtabmap launch
@@ -228,5 +349,14 @@ mapping_rbnx/
   (mounted) across runs.
 - **Map origin drifts between runs** — you're in `mapping` mode (origin =
   boot pose). Use `localization` to re-anchor to the saved map.
+- **`save_map` says "no live rtabmap database found to snapshot"** — nothing
+  has opened a database yet, or the recorded one was removed. The message
+  lists the paths it tried. A service that has been running and mapping always
+  has one; if this appears right after a load, the deployment predates the
+  shared live-database record and should be updated.
+- **The map "disappeared" after switching to mapping mode** — expected, see
+  *Why the loaded map disappears*. It returns on a loop closure with the loaded
+  session; the saved map on disk is intact either way. Build new maps from a
+  restart instead of a runtime switch.
 
 License: MulanPSL-2.0

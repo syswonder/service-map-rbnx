@@ -94,7 +94,6 @@ HEARTBEAT_PERIOD_S = 10.0
 # Without map_id the package stays ephemeral — exactly the pre-persistence
 # behaviour (temp db, wiped each boot).
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
-RUNTIME_DB_DIR = os.environ.get("MAPPING_RUNTIME_DB_DIR", "/tmp/robonix-mapping-runtime")
 
 
 def _truthy(s: str) -> bool:
@@ -155,9 +154,9 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
 
     # Mapping is always a new mutable session. Keep a supplied map_id out of
     # the runtime binding: it identifies a saved artifact, not a live session.
-    os.makedirs(RUNTIME_DB_DIR, exist_ok=True)
+    os.makedirs(map_ops.RUNTIME_DB_DIR, exist_ok=True)
     runtime_db = os.path.join(
-        RUNTIME_DB_DIR,
+        map_ops.RUNTIME_DB_DIR,
         f"mapping-{os.getpid()}-{int(time.time() * 1000)}.db",
     )
     log.info("persistence: fresh mapping session runtime_db=%s requested_map_id=%s",
@@ -584,12 +583,9 @@ def init(cfg: dict):
     active_db = persist.get("database_path", "") if persist else ""
     _ACTIVE.update({
         "algo": algo,
-        "map_id": persist.get("map_id", ""),
         "map_dir": os.path.dirname(active_db) if active_db else "",
-        "active_db": active_db,
-        "map_mode": active_mode,
-        "finalized": "false",
     })
+    map_ops.set_active_db(active_db)
 
     _write_resolved_yaml(algo, resolved)
 
@@ -618,10 +614,6 @@ def init(cfg: dict):
     # Set the env here rather than relying on an external export that gets
     # lost across reboots, so the UI comes up on every boot. Started here so
     # the SLAM topics it previews exist when an operator opens the page.
-    # Seed the runtime mode tracker (get_mode) with the same startup mode
-    # the lifecycle broadcast above carries — one `active_mode` source so
-    # the two views of "current mode" cannot drift apart under a later edit.
-    map_ops.set_current_mode(active_mode)
     _webui_port = str(cfg.get("webui_port", 8091)).strip()
     _webui_host = str(cfg.get(
         "webui_host", os.environ.get("MAPPING_WEBUI_HOST", "127.0.0.1")
@@ -633,12 +625,28 @@ def init(cfg: dict):
         # Deployment config is authoritative: an inherited shell value must
         # not silently re-enable this unauthenticated admin plane.
         os.environ.pop("MAPPING_WEBUI_PORT", None)
-    webui.set_active_db_hint(_active_db)
+    # Hand the UI whatever range sensors Atlas resolved for this deployment, so
+    # the map page can overlay live returns without owning a topic name. These
+    # are the same bindings the SLAM engine consumes, so what the operator sees
+    # is what the map is built from. Empty strings are normal: a deployment
+    # with no lidar capability bound simply gets no overlay.
+    # A deployment whose 2-D scan is not an Atlas capability can pin it with
+    # webui_scan_topic. The Ranger is that case: its mid360 declares only
+    # lidar3d and the 2-D scan is derived downstream, so without this the page
+    # would fall back to searching the graph for one.
+    webui.set_sensor_topics(
+        scan=str(cfg.get("webui_scan_topic", "")).strip()
+             or resolved.get("scan_topic", ""),
+        cloud=resolved.get("lidar_topic", ""),
+    )
     webui.maybe_start()
     return Ok()
 
 
-# Active-session scratch — set by init, read by on_shutdown / save helpers.
+# Startup facts only (algo, and the directory the startup database sits in),
+# set by init and read by on_shutdown. Everything that changes while the
+# service runs — the live database, the map identity, the mode — is owned by
+# map_ops / lifecycle so that gRPC, MCP and the web UI cannot disagree.
 _ACTIVE: dict[str, str] = {}
 
 
@@ -652,15 +660,16 @@ def shutdown():
     this only adds the portable artifacts. Never fail shutdown on a save
     error — the db is the source of truth."""
     map_dir = _ACTIVE.get("map_dir")
-    map_id = _ACTIVE.get("map_id")
-    active_db = _active_db()
+    live = lifecycle.current()
+    map_id, mode = live.get("map_id"), live.get("mode")
+    active_db = map_ops.get_active_db()
     expected_db = os.path.join(map_dir or "", "rtabmap.db") if map_dir else ""
     if not map_dir or not map_id or _ACTIVE.get("algo") != "rtabmap":
         return Ok()
-    if _ACTIVE.get("map_mode") != "mapping":
-        log.info("skip map snapshot on shutdown: mode=%s", _ACTIVE.get("map_mode"))
+    if mode != "mapping":
+        log.info("skip map snapshot on shutdown: mode=%s", mode)
         return Ok()
-    if _ACTIVE.get("finalized") == "true":
+    if map_ops.map_finalized():
         log.info("skip map snapshot on shutdown: map %s already finalized", map_id)
         return Ok()
     if os.path.abspath(active_db or "") != os.path.abspath(expected_db):
@@ -744,59 +753,14 @@ def _list_maps_contract_response(out: dict) -> dict:
         }
 
 # Exposed as BOTH gRPC (servicer) and MCP (decorated handler), mirroring nav2.
-# Shared impls live in map_ops; these are thin adapters. save_map reads the
-# active session's live db from _ACTIVE so an ephemeral run can still be
-# snapshotted under a name.
-
-def _active_db() -> str:
-    active = _ACTIVE.get("active_db") or ""
-    if active:
-        return active
-    md = _ACTIVE.get("map_dir") or ""
-    return os.path.join(md, "rtabmap.db") if md else ""
-
-
-def _saved_map_dir(map_id: str) -> str:
-    return os.path.join(MAPS_DIR, _sanitize_map_id(map_id))
-
-
-def _record_save_result(map_id: str, out: dict) -> None:
-    if not out.get("ok"):
-        return
-    saved_db = os.path.abspath(str(out.get("artifact_path") or ""))
-    current_db = os.path.abspath(_active_db() or "")
-    if saved_db and current_db and saved_db == current_db:
-        _ACTIVE.update({
-            "map_id": _sanitize_map_id(map_id),
-            "map_dir": os.path.dirname(saved_db),
-            "active_db": saved_db,
-            "map_mode": "mapping",
-            "finalized": "true",
-        })
-
-
-def _record_load_result(map_id: str, out: dict) -> None:
-    # runtime_db_path is present whenever rtabmap.LoadDatabase actually
-    # switched databases -- even on a partial failure where a later stage
-    # (preview publish, verify) failed and out["ok"] is False. Sync active-db
-    # bookkeeping on that signal, not on the RPC overall ok flag: rtabmap is
-    # already serving the new database regardless of what happens after.
-    runtime_db = str(out.get("runtime_db_path") or "")
-    if not runtime_db:
-        return
-    _ACTIVE.update({
-        "map_id": _sanitize_map_id(map_id),
-        "map_dir": _saved_map_dir(map_id),
-        "active_db": runtime_db,
-        "map_mode": "localization",
-        "finalized": "true" if out.get("ok") else "false",
-    })
-
+# Shared impls live in map_ops; these are strictly thin adapters — they marshal
+# arguments and responses and hold no session state of their own. The web UI
+# calls the same impls directly, so anything an adapter remembered here would
+# be missing on that path.
 
 class _SaveMapServicer(contracts_grpc.RobonixServiceMapSaveMapServicer):
     def SaveMap(self, request, context):
-        out = map_ops.save_map_impl(request.map_id, request.note, active_db=_active_db())
-        _record_save_result(request.map_id, out)
+        out = map_ops.save_map_impl(request.map_id, request.note)
         return map_pb2.SaveMap_Response(**_save_map_contract_response(out))
 
 
@@ -809,7 +773,6 @@ class _LoadMapServicer(contracts_grpc.RobonixServiceMapLoadMapServicer):
         out = map_ops.load_map_impl(request.map_id, request.mode,
                                     request.has_initial_pose,
                                     request.x, request.y, request.theta)
-        _record_load_result(request.map_id, out)
         return map_pb2.LoadMap_Response(**_load_map_contract_response(out))
 
 
@@ -823,8 +786,6 @@ class _PoseEstimateServicer(contracts_grpc.RobonixServiceMapPoseEstimateServicer
 class _SwitchModeServicer(contracts_grpc.RobonixServiceMapSwitchModeServicer):
     def SwitchMode(self, request, context):
         out = map_ops.switch_mode_impl(request.mode)
-        if out.get("ok"):
-            _ACTIVE["map_mode"] = str(request.mode).strip().lower()
         return map_pb2.SwitchMode_Response(**out)
 
 
@@ -833,10 +794,9 @@ def save_map(req: McpSaveMapReq) -> McpSaveMapResp:
     """Snapshot the current SLAM map to disk under a stable map_id so it can be
     reloaded later (load_map) and shared with scene's semantic map. Roam the
     space first to build coverage, then call this to checkpoint it."""
-    out = map_ops.save_map_impl(req.map_id, req.note, active_db=_active_db())
+    out = map_ops.save_map_impl(req.map_id, req.note)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
-    _record_save_result(req.map_id, out)
     return McpSaveMapResp(**_save_map_contract_response(out))
 
 
@@ -851,15 +811,17 @@ def list_maps(req: McpListMapsReq) -> McpListMapsResp:
 
 @mapping.mcp("robonix/service/map/load_map")
 def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
-    """Switch SLAM onto a previously-saved map. mode='localization' relocalizes
-    against it (stable map frame); mode='mapping' resumes building it. Set
-    has_initial_pose + x/y/theta when you roughly know where the robot is, for
-    fast convergence."""
+    """Switch SLAM onto a previously-saved map and relocalize against it, so the
+    map frame is the saved one. Set has_initial_pose + x/y/theta when you
+    roughly know where the robot is, for fast convergence. mode is accepted for
+    compatibility but a load always enters localization: RTAB-Map only restores
+    the saved occupancy grid when the database is opened that way. To extend a
+    map, load it and then switch_mode('mapping') — and read that capability's
+    caveat first."""
     out = map_ops.load_map_impl(req.map_id, req.mode, req.has_initial_pose,
                                 req.x, req.y, req.theta)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
-    _record_load_result(req.map_id, out)
     return McpLoadMapResp(**_load_map_contract_response(out))
 
 
@@ -879,11 +841,17 @@ def pose_estimate(req: McpPoseReq) -> McpPoseResp:
 def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     """Flip SLAM between 'mapping' (build/extend the current map) and
     'localization' (relocalize read-only against it) at runtime — no map load,
-    no restart. The config's map_mode is only the startup default."""
+    no restart. The config's map_mode is only the startup default.
+
+    Caveat on localization -> mapping: entering localization opened a new
+    RTAB-Map session, and RTAB-Map only links consecutive nodes sharing a
+    session, so what you build after the switch is a separate graph component
+    and the loaded map leaves the published map until a loop closure joins
+    them. Nothing is deleted. Prefer restarting with map_mode: mapping when the
+    goal is a new map."""
     out = map_ops.switch_mode_impl(req.mode)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
-    _ACTIVE["map_mode"] = str(req.mode).strip().lower()
     return McpSwitchResp(**out)
 
 

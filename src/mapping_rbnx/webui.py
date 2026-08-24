@@ -27,19 +27,61 @@ import math
 import os
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import map_ops
+from . import lifecycle, map_ops
 
 log = logging.getLogger("mapping_rbnx.webui")
 
 MAPS_DIR = os.environ.get("MAPPING_MAPS_DIR", "/mapping/maps")
 MAP_TOPIC = os.environ.get("MAPPING_MAP_TOPIC", "/map")
+MAP_FRAME = os.environ.get("MAPPING_MAP_FRAME", "map")
+_tf_buffer = None
 POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 
-# Latest map / pose, filled by ROS subscriptions on the webui's own node.
-_latest = {"grid": None, "pose": None}
+# Latest map / pose / range data, filled by ROS subscriptions on the webui's
+# own node. "scan" and "cloud" hold points already projected into the map
+# frame, so the page can draw them straight onto the occupancy canvas and an
+# operator can see whether the live returns line up with the saved map.
+_latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
+# Topics for the range sensors, resolved through Atlas by the bridge and
+# injected with set_sensor_topics(). Empty means the deployment has no such
+# capability bound, and the page simply has nothing to draw.
+_sensor_topics = {"scan": "", "cloud": ""}
+
+
+# A deployment whose 2-D scan is not an Atlas capability can name it here (or
+# through the deployment config key webui_scan_topic). The Ranger is exactly
+# that case: its mid360 declares only robonix/primitive/lidar/lidar3d, and the
+# 2-D scan is derived downstream by the navigation service, which does not
+# declare it. Without this the overlay could only draw that robot's cloud.
+SCAN_TOPIC_OVERRIDE = os.environ.get("MAPPING_WEBUI_SCAN_TOPIC", "")
+# Names that are a projection someone else already rejected: the raw output of
+# pointcloud_to_laserscan before speckle filtering. Preferring the filtered one
+# keeps the overlay agreeing with what navigation actually consumes.
+_SCAN_NAME_PENALTY = ("_raw", "/raw")
+_scan_discovery_logged = False
+# Which range subscriptions exist. Discovery can call the subscriber a second
+# time once a late-starting scan appears, and subscribing twice to the same
+# topic doubles the callback work for nothing.
+_range_subscribed = {"scan": False, "cloud": False}
+
+
+def set_sensor_topics(scan: str = "", cloud: str = "") -> None:
+    """Bind the range-sensor topics the page overlays on the map.
+
+    Called by atlas_bridge with whatever it resolved from Atlas for
+    robonix/primitive/lidar/lidar (2-D scan) and .../lidar3d (point cloud), so
+    the UI follows the deployment's capability bindings instead of hardcoding
+    topic names. Must be called before the first request creates the
+    subscriptions; later calls are ignored for topics already subscribed.
+    """
+    _sensor_topics["scan"] = SCAN_TOPIC_OVERRIDE or scan or ""
+    _sensor_topics["cloud"] = cloud or ""
+    log.info("webui range overlay topics: scan=%s cloud=%s",
+             _sensor_topics["scan"] or "<none>", _sensor_topics["cloud"] or "<none>")
 _subscribed = False
 _sub_lock = threading.Lock()
 # Keep the dedicated node + executor alive for the process lifetime.
@@ -55,17 +97,6 @@ _log_lock = threading.Lock()
 # Last pose_estimate seed, so convergence can be measured against where the
 # robot actually settled after relocalizing.
 _seed = {"x": None, "y": None, "theta": None, "t": 0.0}
-# Last commanded SLAM mode, surfaced so the UI can show/highlight it. Seeded
-# from the config startup map_mode via set_mode_hint(); updated on switch/load.
-_mode = os.environ.get("MAPPING_STARTUP_MODE", "mapping")
-
-
-def set_mode_hint(mode: str) -> None:
-    """Record the current SLAM mode for the UI (called by atlas_bridge at init
-    with the config's startup map_mode, and by the switch/load handlers)."""
-    global _mode
-    if mode:
-        _mode = mode
 
 
 def _log_add(kind: str, msg: str) -> None:
@@ -152,6 +183,7 @@ def _ensure_subscriptions() -> None:
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
             node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+            _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
             threading.Thread(target=ex.spin, daemon=True).start()
@@ -160,6 +192,236 @@ def _ensure_subscriptions() -> None:
             log.info("webui subscribed (dedicated node): map=%s pose=%s", MAP_TOPIC, POSE_TOPIC)
         except Exception as e:  # noqa: BLE001
             log.warning("webui subscriptions failed: %s", e)
+
+
+# Cap on points sent to the page. A 2-D scan is a few hundred; a 3-D cloud can
+# be hundreds of thousands, which no browser will draw at 1 Hz. Subsampling is
+# uniform so the shape of the return stays honest.
+MAX_OVERLAY_POINTS = int(os.environ.get("MAPPING_WEBUI_MAX_POINTS", "1200"))
+# Cloud points further than this above or below the sensor are dropped: the
+# overlay exists to be compared against a 2-D occupancy grid, and ceiling or
+# floor returns only obscure that.
+CLOUD_Z_BAND_M = float(os.environ.get("MAPPING_WEBUI_CLOUD_Z_BAND", "0.35"))
+
+
+def _scan_points(msg) -> dict:
+    """Project a LaserScan into (x, y) pairs in the sensor's own frame.
+
+    Range readings outside [range_min, range_max], and the inf/NaN a lidar
+    emits for "no return", are dropped rather than drawn at range_max, which
+    would paint a fake wall around the robot.
+    """
+    pts = []
+    ang = msg.angle_min
+    lo, hi = msg.range_min, msg.range_max
+    step = max(1, math.ceil(len(msg.ranges) / MAX_OVERLAY_POINTS))
+    for i, r in enumerate(msg.ranges):
+        if i % step == 0 and lo <= r <= hi and math.isfinite(r):
+            a = ang + i * msg.angle_increment
+            pts.append((r * math.cos(a), r * math.sin(a)))
+    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+
+
+def _cloud_points(msg) -> dict:
+    """Project a PointCloud2 into (x, y) pairs in the sensor's own frame,
+    keeping only returns within CLOUD_Z_BAND_M of the sensor plane and
+    subsampling to MAX_OVERLAY_POINTS."""
+    try:
+        from sensor_msgs_py import point_cloud2
+    except Exception:  # noqa: BLE001
+        return {"frame": msg.header.frame_id, "pts": [], "t": time.time()}
+    pts = []
+    total = max(1, msg.width * msg.height)
+    step = max(1, total // (MAX_OVERLAY_POINTS * 4))
+    for i, pt in enumerate(point_cloud2.read_points(
+            msg, field_names=("x", "y", "z"), skip_nans=True)):
+        if i % step:
+            continue
+        x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+        if abs(z) <= CLOUD_Z_BAND_M:
+            pts.append((x, y))
+            if len(pts) >= MAX_OVERLAY_POINTS:
+                break
+    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+
+
+def _frame_to_map(frame: str):
+    """Latest (tx, ty, yaw) taking `frame` into the map frame, or None.
+
+    Looked up once per request and applied to every point, rather than
+    transforming each point through tf2 — the overlay is a visual check, and a
+    single planar transform is what the canvas needs anyway.
+    """
+    if not frame or _webui_node is None:
+        return None
+    if _tf_buffer is None:
+        return None
+    try:
+        import rclpy
+        tr = _tf_buffer.lookup_transform(
+            MAP_FRAME, frame.lstrip("/"), rclpy.time.Time())
+        t, q = tr.transform.translation, tr.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.x, t.y, yaw
+    except Exception as e:  # noqa: BLE001
+        log.debug("webui overlay: no transform %s -> %s: %s", frame, MAP_FRAME, e)
+        return None
+
+
+def _overlay_in_map(kind: str) -> dict:
+    """Range points for `kind` ("scan"|"cloud") expressed in the map frame.
+
+    Returns {"pts", "frame", "stale", "why"}. When there is nothing to draw the
+    reason is named, because the two reasons call for opposite responses: no
+    messages means the sensor or its topic is wrong, while messages that cannot
+    be transformed means localization is not publishing the map frame -- the
+    robot's problem, not the overlay's. Reading that off the page is the point
+    of the overlay on a robot with no RViz.
+    """
+    topic = _sensor_topics.get(kind) or ""
+    data = _latest.get(kind)
+    if not topic:
+        return {"pts": [], "frame": "", "stale": True, "why": "no capability bound"}
+    if not data or not data.get("pts"):
+        return {"pts": [], "frame": "", "stale": True,
+                "why": "no data on %s" % topic}
+    age = time.time() - data.get("t", 0)
+    tf = _frame_to_map(data.get("frame", ""))
+    if tf is None:
+        return {"pts": [], "frame": data.get("frame", ""), "stale": True,
+                "why": "no %s -> %s transform: localization is not publishing "
+                       "the map frame" % (data.get("frame", "?"), MAP_FRAME)}
+    tx, ty, yaw = tf
+    c, s_ = math.cos(yaw), math.sin(yaw)
+    pts = [[round(tx + x * c - y * s_, 3), round(ty + x * s_ + y * c, 3)]
+           for x, y in data["pts"]]
+    stale = age > 3.0
+    return {"pts": pts, "frame": data.get("frame", ""), "stale": stale,
+            "age_s": round(age, 1),
+            "why": "last message %.1fs old" % age if stale else ""}
+
+
+def pick_scan_topic(topics: list[tuple[str, list[str]]]) -> str:
+    """Choose a LaserScan topic from a ROS graph listing, or "".
+
+    Used when no 2-D scan capability is bound. A deployment can still have a
+    scan -- the Ranger's is produced by the navigation service from the point
+    cloud and never declared -- and an operator checking localization needs to
+    see it. Prefer the shortest name so a filtered scan wins over a longer
+    intermediate one, and rank raw projections last.
+    """
+    scans = [name for name, types in topics
+             if "sensor_msgs/msg/LaserScan" in types]
+    if not scans:
+        return ""
+    return sorted(scans, key=lambda n: (any(p in n for p in _SCAN_NAME_PENALTY),
+                                        len(n), n))[0]
+
+
+def _discover_scan_topic(node) -> str:
+    """Look for a LaserScan on the graph and subscribe to it if found.
+
+    Retried from the range endpoint rather than done once at startup: the
+    navigation service that publishes the derived scan may come up after
+    mapping does, and an overlay that gave up at boot would stay blank for the
+    rest of the session.
+    """
+    global _scan_discovery_logged
+    try:
+        found = pick_scan_topic(node.get_topic_names_and_types())
+    except Exception as e:  # noqa: BLE001
+        log.debug("webui overlay: scan discovery failed: %s", e)
+        return ""
+    if not found:
+        return ""
+    _sensor_topics["scan"] = found
+    if not _scan_discovery_logged:
+        _scan_discovery_logged = True
+        log.info("webui overlay: no 2-D scan capability bound; using %s "
+                 "found on the graph (set webui_scan_topic to pin one)", found)
+    return found
+
+
+_overlay_log = {"why": "", "t": 0.0}
+
+
+def _log_overlay_state(out: dict) -> None:
+    """Log why the overlay is empty, once per distinct reason per minute.
+
+    The page shows this, but the page is not what gets sent back when someone
+    asks for help -- the log is. "no scanner_normalized -> map transform" in a
+    log file is the difference between chasing a sensor and chasing
+    localization.
+    """
+    reasons = [
+        "%s: %s" % (kind, out[kind]["why"])
+        for kind in ("scan", "cloud")
+        if kind in out and out[kind].get("why")
+    ]
+    why = "; ".join(reasons)
+    if why == _overlay_log["why"] and time.time() - _overlay_log["t"] < 60.0:
+        return
+    _overlay_log["why"], _overlay_log["t"] = why, time.time()
+    if why:
+        log.warning("overlay has nothing to draw — %s", why)
+    else:
+        log.info("overlay drawing live returns in the %s frame", MAP_FRAME)
+
+
+def _subscribe_range_sensors(node) -> None:
+    """Subscribe to the range topics Atlas resolved, if any.
+
+    Sensor data is best-effort published, so both use a SENSOR_DATA profile;
+    subscribing RELIABLE to a BEST_EFFORT publisher silently receives nothing.
+    A missing message type or topic disables that overlay and is logged once —
+    the map preview itself must keep working either way.
+    """
+    from rclpy.qos import qos_profile_sensor_data
+
+    global _tf_buffer
+    if _tf_buffer is None:
+        try:
+            import tf2_ros
+            _tf_buffer = tf2_ros.Buffer()
+            # The listener's /tf subscriptions must exist before this node's
+            # executor starts spinning, for the same reason the map and pose
+            # subscriptions do -- see _ensure_subscriptions. Created here, not
+            # lazily on the first lookup, or they are never serviced and every
+            # transform lookup fails forever.
+            tf2_ros.TransformListener(_tf_buffer, node, spin_thread=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: tf2 unavailable, no range overlay: %s", e)
+            _tf_buffer = None
+
+    scan_topic = _sensor_topics.get("scan") or ""
+    cloud_topic = _sensor_topics.get("cloud") or ""
+    if _range_subscribed["scan"]:
+        scan_topic = ""
+    if _range_subscribed["cloud"]:
+        cloud_topic = ""
+    if scan_topic:
+        try:
+            from sensor_msgs.msg import LaserScan
+            node.create_subscription(
+                LaserScan, scan_topic,
+                lambda m: _latest.__setitem__("scan", _scan_points(m)),
+                qos_profile_sensor_data)
+            _range_subscribed["scan"] = True
+            log.info("webui overlay: subscribed scan %s", scan_topic)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: scan %s unavailable: %s", scan_topic, e)
+    if cloud_topic:
+        try:
+            from sensor_msgs.msg import PointCloud2
+            node.create_subscription(
+                PointCloud2, cloud_topic,
+                lambda m: _latest.__setitem__("cloud", _cloud_points(m)),
+                qos_profile_sensor_data)
+            _range_subscribed["cloud"] = True
+            log.info("webui overlay: subscribed cloud %s", cloud_topic)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: cloud %s unavailable: %s", cloud_topic, e)
 
 
 def _grid_to_png(grid, pose=None) -> bytes:
@@ -234,160 +496,34 @@ def _list_saved_maps() -> list[dict]:
     return out
 
 
-_PAGE = """<!doctype html><html><head><meta charset=utf-8>
-<title>Robonix · mapping</title>
-<style>
- body{font-family:system-ui,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}
- header{padding:10px 16px;background:#171a21;font-weight:600}
- .wrap{display:flex;gap:16px;padding:16px;flex-wrap:wrap}
- .card{background:#171a21;border:1px solid #262b36;border-radius:8px;padding:12px}
- #mapcv{background:#0a0d12;border-radius:4px;display:block;cursor:grab;touch-action:none;width:720px;height:540px;max-width:100%}
- #mapcv:active{cursor:grabbing}
- button{background:#2d6cdf;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:14px}
- button.alt{background:#3a4150}
- button.active{background:#1f8a44;box-shadow:0 0 0 2px #2bd66f55}
- button.del{background:#7a2d2d;padding:5px 9px}
- input,select{background:#0f1115;color:#e6e6e6;border:1px solid #2a3140;border-radius:6px;padding:6px}
- .lib{display:flex;flex-direction:column;gap:8px;min-width:240px}
- .mapitem{display:flex;gap:8px;align-items:center;border:1px solid #262b36;border-radius:6px;padding:6px}
- .mapitem img{width:64px;height:64px;object-fit:contain;background:#000;border-radius:4px}
- .muted{color:#8b93a3;font-size:12px}
- #status{padding:6px 16px;color:#8b93a3;font-size:13px}
-</style></head><body>
-<header>Robonix · mapping live map</header>
-<div id=status>connecting…</div>
-<div class=wrap>
- <div class=card>
-  <canvas id=mapcv width=720 height=540></canvas>
-  <div class=muted>drag = pan · wheel = zoom · click = set pose estimate (relocalize)
-   · <button class=alt style="padding:2px 8px" onclick="fitView()">Fit</button></div>
- </div>
- <div class=card style="min-width:280px">
-  <h3 style="margin:4px 0 10px">Save current map</h3>
-  <div style="display:flex;gap:8px">
-   <input id=saveid placeholder="map_id e.g. lab_3f" style="flex:1">
-   <button onclick="doSave()">Save</button>
-  </div>
-  <h3 style="margin:16px 0 10px">Mode <span id=modebadge class=muted style="font-weight:400">mode: —</span></h3>
-  <div style="display:flex;gap:8px">
-   <button id=btn-mapping onclick="doSwitch('mapping')">Mapping (build)</button>
-   <button id=btn-localization class=alt onclick="doSwitch('localization')">Localization</button>
-  </div>
-  <div style="margin-top:10px">
-   <button class=del onclick="doReset()">Reset map (clear &amp; rebuild)</button>
-   <span class=muted>wipes the live map; origin drifts</span>
-  </div>
-  <h3 style="margin:16px 0 10px">Library</h3>
-  <div id=lib class=lib></div>
- </div>
- <div class=card style="min-width:340px;flex:1">
-  <h3 style="margin:4px 0 10px">Activity log</h3>
-  <div id=logbox style="height:360px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5"></div>
- </div>
-</div>
-<script>
-function setStatus(t){document.getElementById('status').textContent=t}
-// ── interactive canvas map: pan (drag) / zoom (wheel) / grid / pose / click-pose
-// ── scene-style world-centered canvas (proven model from scene webui) ──
-// fit() pins the canvas backing-store resolution to its CSS display size,
-// so pointer coords map 1:1 — this is what kept the click coords honest.
-const cv=document.getElementById('mapcv'),cx=cv.getContext('2d');
-function fit(){if(cv.width!=cv.clientWidth)cv.width=cv.clientWidth;if(cv.height!=cv.clientHeight)cv.height=cv.clientHeight}
-window.addEventListener('resize',()=>{fit();draw()});fit();
-let MI=null, mapImg=null;
-let center=[0,0], pxPerM=40, userMoved=false;   // world center + zoom
-function w2p(x,y){return [cv.width/2+(x-center[0])*pxPerM, cv.height/2-(y-center[1])*pxPerM]}
-function p2w(sx,sy){return [center[0]+(sx-cv.width/2)/pxPerM, center[1]-(sy-cv.height/2)/pxPerM]}
-function reloadMapImg(){let i=new Image();i.onload=()=>{mapImg=i;draw()};i.onerror=()=>{};i.src='/api/map.png?'+Date.now()}
-function fitView(){if(!MI)return;userMoved=false;fit();
- let wM=MI.width*MI.resolution,hM=MI.height*MI.resolution;
- center=MI.pose?[MI.pose.x,MI.pose.y]:[MI.origin_x+wM/2,MI.origin_y+hM/2];
- pxPerM=Math.min(cv.width/wM,cv.height/hM)*0.9;draw()}
-function draw(){fit();cx.clearRect(0,0,cv.width,cv.height);
- if(!MI){cx.fillStyle='#5a6172';cx.font='13px system-ui';cx.fillText('no map yet',16,24);return}
- if(!userMoved&&MI.pose)center=[MI.pose.x,MI.pose.y];
- // occupancy underlay — map.png is already y-flipped (row0 = world max-y),
- // so place top-left at world (origin_x, origin_y+hMeters) and grow down.
- if(mapImg&&MI.resolution>0){let wM=MI.width*MI.resolution,hM=MI.height*MI.resolution;
-  let tl=w2p(MI.origin_x,MI.origin_y+hM);
-  cx.imageSmoothingEnabled=false;cx.drawImage(mapImg,tl[0],tl[1],wM*pxPerM,hM*pxPerM)}
- // 1 m grid aligned to world
- cx.strokeStyle='rgba(90,130,200,0.18)';cx.lineWidth=1;
- let step=pxPerM,ox=((cv.width/2)-center[0]*pxPerM)%step,oy=((cv.height/2)+center[1]*pxPerM)%step;
- cx.beginPath();
- for(let x=ox;x<cv.width;x+=step){cx.moveTo(x,0);cx.lineTo(x,cv.height)}
- for(let y=oy;y<cv.height;y+=step){cx.moveTo(0,y);cx.lineTo(cv.width,y)}
- cx.stroke();
- // live pose marker
- if(MI.pose){let p=w2p(MI.pose.x,MI.pose.y),yaw=MI.pose.theta;
-  cx.fillStyle='#e63b3b';cx.strokeStyle='#e63b3b';cx.lineWidth=2;
-  cx.beginPath();cx.arc(p[0],p[1],5,0,7);cx.fill();
-  cx.beginPath();cx.moveTo(p[0],p[1]);cx.lineTo(p[0]+18*Math.cos(yaw),p[1]-18*Math.sin(yaw));cx.stroke()}}
-setInterval(reloadMapImg,2000);reloadMapImg()
-// interaction — fit() makes internal==display, so (clientX-rect.left) is canvas px
-function pt(e){let r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top]}
-let drag=null,moved=0;
-cv.addEventListener('mousedown',e=>{drag=pt(e);moved=0});
-window.addEventListener('mouseup',()=>{drag=null});
-window.addEventListener('mousemove',e=>{if(!drag)return;let p=pt(e);
- center[0]-=(p[0]-drag[0])/pxPerM;center[1]+=(p[1]-drag[1])/pxPerM;
- moved+=Math.abs(p[0]-drag[0])+Math.abs(p[1]-drag[1]);userMoved=true;drag=p;draw()});
-cv.addEventListener('wheel',e=>{e.preventDefault();let p=pt(e),wp=p2w(p[0],p[1]);
- pxPerM*=e.deltaY<0?1.15:1/1.15;
- center[0]=wp[0]-(p[0]-cv.width/2)/pxPerM;center[1]=wp[1]+(p[1]-cv.height/2)/pxPerM;userMoved=true;draw()},{passive:false});
-cv.addEventListener('dblclick',()=>fitView());
-cv.addEventListener('click',async e=>{if(moved>4||!MI)return;
- let p=pt(e),wp=p2w(p[0],p[1]);
- if(!confirm('Seed pose estimate at ('+wp[0].toFixed(2)+', '+wp[1].toFixed(2)+')?'))return;
- setStatus('seeding pose…');
- let r=await (await fetch('/api/pose_estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:wp[0],y:wp[1],theta:0})})).json();
- setStatus(r.detail||'seeded')});
-async function poll(){try{let s=await (await fetch('/api/state')).json();MI=s;
-  if(CURMODE==null&&s.mode)CURMODE=s.mode;applyMode();
-  setStatus(s.has_map?('map '+s.width+'×'+s.height+' @'+s.resolution+'m  pose='+(s.pose?('('+s.pose.x.toFixed(2)+', '+s.pose.y.toFixed(2)+', '+s.pose.theta.toFixed(2)+')'):'—')+(s.dist_from_seed!=null?'  Δseed='+s.dist_from_seed+'m':'')):'no map yet');draw()}
-  catch(e){setStatus('disconnected')}}
-setInterval(poll,1000);poll()
-async function loadLib(){let m=await (await fetch('/api/maps')).json();
- let el=document.getElementById('lib');el.innerHTML='';
- if(!m.length){el.innerHTML='<div class=muted>no saved maps yet</div>';return}
- for(const x of m){let d=document.createElement('div');d.className='mapitem';
-  d.innerHTML=`<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div style="flex:1"><b>${x.map_id}</b><div class=muted>${(x.db_size/1e6).toFixed(1)} MB${x.has_db?'':' · no db'}</div></div>
-   <button class=alt onclick="doLoad('${x.map_id}')">Load</button>
-   <button class=del onclick="doDelete('${x.map_id}')">Del</button>`;
-  el.appendChild(d)}}
-setInterval(loadLib,5000);loadLib()
-const KCOL={save:'#5bd66f',load:'#5aa9ff',switch:'#d6a85b',pose:'#d65b9a',info:'#8b93a3'};
-async function loadLog(){try{let L=await (await fetch('/api/log')).json();
- let box=document.getElementById('logbox');let atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-20;
- box.innerHTML=L.map(e=>{let t=new Date(e.t*1000).toLocaleTimeString();
-  let c=KCOL[e.kind]||'#8b93a3';
-  return `<div><span class=muted>${t}</span> <b style="color:${c}">${e.kind}</b> ${e.msg.replace(/</g,'&lt;')}</div>`}).join('');
- if(atBottom)box.scrollTop=box.scrollHeight}catch(e){}}
-setInterval(loadLog,1500);loadLog()
-async function doSave(){let id=document.getElementById('saveid').value.trim();
- if(!id){alert('enter a map_id');return}setStatus('saving '+id+'…');
- let r=await (await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
- setStatus(r.detail||'saved');loadLib()}
-async function doLoad(id){if(!confirm('Load map '+id+' (localization)?'))return;setStatus('loading '+id+'…');
- let r=await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json();
- setStatus(r.detail||'loaded')}
-async function doSwitch(mode){setStatus('switching to '+mode+'…');
- let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
- if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}
-async function doReset(){if(!confirm('Clear the LIVE map and rebuild from scratch? The new map origin = robot current position, so it will NOT match the old frame (origin drift). Saved maps on disk are not affected.'))return;
- setStatus('resetting map…');
- let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
- setStatus(r.detail||'reset')}
-async function doDelete(id){if(!confirm('Delete saved map '+id+'? This cannot be undone.'))return;
- setStatus('deleting '+id+'…');
- let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
- setStatus(r.detail||'deleted');loadLib()}
-let CURMODE=null;
-function applyMode(){let mp=document.getElementById('btn-mapping'),lo=document.getElementById('btn-localization');
- let bdg=document.getElementById('modebadge');if(bdg)bdg.textContent=CURMODE?('mode: '+CURMODE):'mode: —';
- if(mp&&lo){mp.classList.toggle('active',CURMODE=='mapping');lo.classList.toggle('active',CURMODE=='localization')}}
-</script></body></html>"""
+# The operator page is three ordinary files under webui_static/. It used to be
+# one Python string holding minified HTML, CSS and JavaScript, which made every
+# change a merge hazard and silently ate escapes -- a "\n" written for a JS
+# string literal became a real newline and broke the whole script. Served from
+# disk, the JavaScript is JavaScript: formatted, diffable, and checkable with
+# any JS tool.
+STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
+_STATIC_TYPES = {".html": "text/html; charset=utf-8",
+                 ".js": "application/javascript; charset=utf-8",
+                 ".css": "text/css; charset=utf-8"}
+
+
+def _static(name: str) -> tuple[int, str, bytes]:
+    """Read one asset. Returns (status, content_type, body).
+
+    Path traversal is refused rather than sanitised: every asset this server
+    has is a fixed name in one directory, so anything else is a mistake or an
+    attack and neither deserves a file.
+    """
+    if name not in {"index.html", "app.js", "style.css",
+                    "vendor/bootstrap.min.css"}:
+        return 404, "text/plain", b"not found"
+    path = STATIC_DIR / name
+    try:
+        return 200, _STATIC_TYPES[path.suffix], path.read_bytes()
+    except OSError as e:
+        log.error("webui asset %s unreadable: %s", path, e)
+        return 500, "text/plain", str(e).encode()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -408,7 +544,9 @@ class _Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         try:
             if p == "/" or p == "/index.html":
-                return self._send(200, "text/html; charset=utf-8", _PAGE.encode())
+                return self._send(*_static("index.html"))
+            if p.startswith("/static/"):
+                return self._send(*_static(p[len("/static/"):]))
             if p == "/api/map.png":
                 _ensure_subscriptions()
                 g = _latest["grid"]
@@ -420,7 +558,14 @@ class _Handler(BaseHTTPRequestHandler):
             if p == "/api/state":
                 _ensure_subscriptions()
                 g = _latest["grid"]
-                st = {"has_map": g is not None, "mode": _mode}
+                # Read the mode from map_ops rather than remembering one
+                # here: a mode set by config, MCP or gRPC must show up in this
+                # page too, and a load or reset changes it without the page
+                # being involved at all.
+                live = lifecycle.current()
+                st = {"has_map": g is not None,
+                      "mode": map_ops.get_mode_impl().get("mode", ""),
+                      "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
                               resolution=round(g.info.resolution, 4),
@@ -434,6 +579,22 @@ class _Handler(BaseHTTPRequestHandler):
                         st["dist_from_seed"] = round(math.hypot(cur[0] - _seed["x"],
                                                                 cur[1] - _seed["y"]), 3)
                 return self._json(st)
+            if p == "/api/range":
+                # One request for every bound overlay: the page draws them
+                # together and a second round trip would let them drift apart
+                # on screen. A sensor the deployment has not bound is absent
+                # from the payload rather than present and empty, so the page
+                # has nothing to report about a capability that is not there.
+                _ensure_subscriptions()
+                if not _sensor_topics.get("scan") and _webui_node is not None:
+                    if _discover_scan_topic(_webui_node):
+                        _subscribe_range_sensors(_webui_node)
+                out = {"bound": {k: v for k, v in _sensor_topics.items() if v}}
+                for kind in ("scan", "cloud"):
+                    if _sensor_topics.get(kind):
+                        out[kind] = _overlay_in_map(kind)
+                _log_overlay_state(out)
+                return self._json(out)
             if p == "/api/log":
                 with _log_lock:
                     return self._json(list(_LOG))
@@ -457,8 +618,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/save":
                 mid = body.get("map_id", "")
-                out = map_ops.save_map_impl(mid, body.get("note", ""),
-                                            active_db=_active_db_hint())
+                out = map_ops.save_map_impl(mid, body.get("note", ""))
                 _log_add("save", out.get("detail") or (f"saved {mid}" if out.get("ok") else "save failed"))
                 return self._json(out)
             if p == "/api/load":
@@ -467,8 +627,6 @@ class _Handler(BaseHTTPRequestHandler):
                     mid, mode, bool(body.get("has_initial_pose", False)),
                     float(body.get("x", 0.0)), float(body.get("y", 0.0)),
                     float(body.get("theta", 0.0)))
-                if out.get("ok"):
-                    set_mode_hint(mode)
                 _log_add("load", f"{'✓' if out.get('ok') else '✗'} load {mid} ({mode}): {out.get('detail','')}")
                 return self._json(out)
             if p == "/api/delete":
@@ -495,8 +653,6 @@ class _Handler(BaseHTTPRequestHandler):
             if p == "/api/switch_mode":
                 mode = body.get("mode", "")
                 out = map_ops.switch_mode_impl(mode)
-                if out.get("ok"):
-                    set_mode_hint(mode)
                 _log_add("switch", f"{'✓' if out.get('ok') else '✗'} switch to {mode}: {out.get('detail','')}")
                 return self._json(out)
             return self._send(404, "text/plain", b"not found")
@@ -505,21 +661,6 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "detail": str(e)}, code=500)
 
 
-# Set by atlas_bridge so save_map can checkpoint the live (possibly ephemeral)
-# session's db; webui itself has no session state.
-_active_db_fn = None
-
-
-def set_active_db_hint(fn) -> None:
-    global _active_db_fn
-    _active_db_fn = fn
-
-
-def _active_db_hint() -> str:
-    try:
-        return _active_db_fn() if _active_db_fn else ""
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 _server = None

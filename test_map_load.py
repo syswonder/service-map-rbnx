@@ -35,7 +35,8 @@ class LoadMapTransactionTest(unittest.TestCase):
             patch.object(
                 map_ops, "_set_mode", side_effect=lambda *_: order.append("mode") or (True, "ok")
             ),
-            patch.object(map_ops, "set_current_mode"),
+            patch.object(map_ops.lifecycle, "set_mode",
+                         side_effect=lambda *_a, **_k: None),
             patch.object(
                 map_ops,
                 "_load_database",

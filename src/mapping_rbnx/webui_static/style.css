@@ -1,8 +1,8 @@
-/* The map is the page. Everything else floats over it, so nothing can reflow
-   the view: a panel opening or a warning appearing must never move the map or
-   push another panel around, which is what a document-flow layout kept doing. */
-* {
-  box-sizing: border-box;
+/* Only what Bootstrap does not do: the full-window map canvas, the overlays
+   that float above it, and the two custom controls (mode switch, pose hint).
+   Spacing, buttons, cards, badges and the dark palette come from Bootstrap. */
+:root {
+  color-scheme: dark;
 }
 html,
 body {
@@ -10,20 +10,11 @@ body {
 }
 body {
   margin: 0;
-  background: #0f1115;
-  color: #e6e6e6;
-  font:
-    14px/1.45 system-ui,
-    -apple-system,
-    "Segoe UI",
-    sans-serif;
   overflow: hidden;
-}
-.icons {
-  display: none;
+  background: #0f1115;
 }
 
-/* ── map ─────────────────────────────────────────────────────────────────── */
+/* ── the map is the page ─────────────────────────────────────────────────── */
 #mapcv {
   position: fixed;
   inset: 0;
@@ -37,134 +28,88 @@ body {
 #mapcv:active {
   cursor: grabbing;
 }
-#maphint {
+/* Toolbar column, floating over the map so nothing can reflow the view. */
+.overlay-tl {
   position: fixed;
-  left: 14px;
-  bottom: 12px;
-  z-index: 3;
-  font-size: 11.5px;
-  color: #5a6172;
-  background: #0f1115cc;
-  padding: 4px 8px;
-  border-radius: 6px;
-}
-
-/* ── toolbar ─────────────────────────────────────────────────────────────── */
-#toolbar {
-  position: fixed;
-  left: 14px;
-  top: 14px;
+  left: 1rem;
+  top: 1rem;
   z-index: 6;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px;
-  background: #171a21e8;
-  border: 1px solid #262b36;
-  border-radius: 10px;
-  box-shadow: 0 8px 26px #0007;
+  max-width: calc(100vw - 2rem);
+}
+.overlay-tl .card,
+.panel {
+  --bs-card-bg: rgba(23, 26, 33, 0.94);
   backdrop-filter: blur(6px);
 }
-.tbrand {
-  font-weight: 700;
-  font-size: 13px;
-  padding: 0 10px 0 6px;
-  white-space: nowrap;
-}
-.tbrand span {
-  color: #5a6172;
-  font-weight: 500;
-  margin-left: 6px;
-}
-.tsep {
-  width: 1px;
-  height: 22px;
-  background: #2a3140;
-  margin: 0 2px;
-}
-/* Icon plus label. An icon alone is a guess -- nobody should have to hover a
-   toolbar to find out which button clears their map. */
 .tool {
-  height: 34px;
-  padding: 0 10px 0 8px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  white-space: nowrap;
-  background: #0f1115;
-  border: 1px solid #2a3140;
-  border-radius: 8px;
-  color: #c8cdd8;
-  cursor: pointer;
-  padding: 0;
+  gap: 0.45rem;
 }
-.tool:hover {
-  background: #1c2029;
-  color: #fff;
-}
-.tool.active {
-  background: #2d6cdf;
-  border-color: #2d6cdf;
-  color: #fff;
-}
-.tool.danger:hover {
-  background: #7a2d2d;
-  border-color: #7a2d2d;
-  color: #fff;
-}
-.tool span {
-  line-height: 1;
-}
-.tool svg {
-  width: 17px;
-  height: 17px;
-  flex: 0 0 17px;
+.tool svg,
+.ico {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+.mw-status {
+  max-width: min(46vw, 640px);
+}
+#modewarn {
+  max-width: min(680px, calc(100vw - 2rem));
+}
 
-/* ── status strip ────────────────────────────────────────────────────────── */
-#statusbar {
+/* ── floating panels ─────────────────────────────────────────────────────── */
+.panel {
   position: fixed;
-  left: 14px;
-  top: 62px;
-  right: 14px;
-  z-index: 5;
+  right: 1rem;
+  top: 1rem;
+  z-index: 6;
+  display: none;
+  width: 22rem;
+  max-height: calc(100vh - 2rem);
+}
+.panel.on {
   display: flex;
+}
+/* Two open panels stack rather than overlap. */
+#savepanel.on ~ #libpanel.on {
+  top: 9.5rem;
+}
+#logpanel {
+  width: 27rem;
+  top: auto;
+  bottom: 1rem;
+  max-height: 45vh;
+}
+.mapitem {
+  display: flex;
+  gap: 0.5rem;
   align-items: center;
-  gap: 8px;
-  pointer-events: none;
 }
-#statusbar > * {
-  pointer-events: auto;
+.mapitem img {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  background: #000;
+  border-radius: 0.25rem;
 }
-.chip {
-  background: #171a21e8;
-  border: 1px solid #262b36;
-  border-radius: 999px;
-  padding: 5px 12px;
-  font-size: 11.5px;
-  color: #9aa3b2;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 46vw;
-}
-.chip.grow {
+.mapitem .mi {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-/* ── mode switch ─────────────────────────────────────────────────────────── */
+/* ── mode switch: one setting, two states ────────────────────────────────── */
 .switch {
   position: relative;
   display: inline-flex;
-  background: #0f1115e8;
-  border: 1px solid #2a3140;
+  background: rgba(15, 17, 21, 0.94);
+  border: 1px solid var(--bs-border-color);
   border-radius: 999px;
   padding: 3px;
 }
@@ -175,25 +120,25 @@ body {
   left: 3px;
   width: calc(50% - 3px);
   border-radius: 999px;
-  background: #2d6cdf;
+  background: var(--bs-primary);
   transition:
     transform 0.18s ease,
     background 0.18s ease;
 }
 .switch.loc .knob {
   transform: translateX(100%);
-  background: #1f8a44;
+  background: var(--bs-success);
 }
 .switch .swopt {
   position: relative;
   z-index: 1;
   background: transparent;
   border: 0;
-  color: #9aa3b2;
+  color: var(--bs-secondary-color);
   border-radius: 999px;
-  padding: 4px 14px;
-  font-size: 12px;
-  min-width: 92px;
+  padding: 0.25rem 0.9rem;
+  font-size: 0.8rem;
+  min-width: 5.75rem;
   cursor: pointer;
   transition: color 0.18s ease;
 }
@@ -202,251 +147,36 @@ body {
   font-weight: 600;
 }
 
-/* ── warning strip ───────────────────────────────────────────────────────── */
-.warn {
-  position: fixed;
-  left: 14px;
-  top: 100px;
-  z-index: 5;
-  max-width: min(680px, calc(100vw - 28px));
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #3a2a12ee;
-  border: 1px solid #6b4a15;
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: #f0d9a8;
-}
-.warn .warnicon {
-  flex: 0 0 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #ffb454;
-  color: #241a08;
-  font-weight: 700;
-  font-size: 11px;
-  text-align: center;
-  line-height: 16px;
-}
-.warn #modewarntext {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.linkbtn {
-  flex: 0 0 auto;
-  background: transparent;
-  color: #ffd9a0;
-  border: 1px solid #6b4a15;
-  border-radius: 5px;
-  padding: 2px 8px;
-  font-size: 11.5px;
-  cursor: pointer;
-}
-
-/* ── floating panels ─────────────────────────────────────────────────────── */
-.panel {
-  position: fixed;
-  right: 14px;
-  top: 62px;
-  z-index: 6;
-  display: none;
-  width: 330px;
-  max-height: calc(100vh - 90px);
-  flex-direction: column;
-  background: #171a21f2;
-  border: 1px solid #262b36;
-  border-radius: 10px;
-  box-shadow: 0 12px 34px #0008;
-  backdrop-filter: blur(6px);
-}
-.panel.on {
-  display: flex;
-}
-/* Stacked so two open panels sit under each other instead of on top. */
-#libpanel.on {
-  top: 62px;
-}
-#savepanel.on ~ #libpanel.on {
-  top: 190px;
-}
-#logpanel {
-  width: 420px;
-  right: 14px;
-  bottom: 14px;
-  top: auto;
-  max-height: 45vh;
-}
-.phead {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 9px 12px;
-  border-bottom: 1px solid #262b36;
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.pclose {
-  background: transparent;
-  border: 0;
-  color: #5a6172;
-  cursor: pointer;
-  padding: 2px;
-  display: grid;
-  place-items: center;
-}
-.pclose:hover {
-  color: #e6e6e6;
-}
-.pclose svg {
-  width: 15px;
-  height: 15px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-}
-.pbody {
-  padding: 12px;
-  overflow: auto;
-}
-.row {
-  display: flex;
-  gap: 8px;
-}
-.hint {
-  margin-top: 8px;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: #5a6172;
-}
-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  background: #0f1115;
-  color: #e6e6e6;
-  border: 1px solid #2a3140;
-  border-radius: 6px;
-  padding: 6px 8px;
-  font-size: 13px;
-}
-button.primary {
-  background: #2d6cdf;
-  color: #fff;
-  border: 0;
-  border-radius: 6px;
-  padding: 6px 14px;
-  font-size: 13px;
-  cursor: pointer;
-}
-button.alt {
-  background: #3a4150;
-  color: #fff;
-  border: 0;
-  border-radius: 6px;
-  padding: 6px 12px;
-  cursor: pointer;
-}
-button.del {
-  background: #7a2d2d;
-  color: #fff;
-  border: 0;
-  border-radius: 6px;
-  padding: 5px 10px;
-  cursor: pointer;
-}
-.lib {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.mapitem {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  border: 1px solid #262b36;
-  border-radius: 6px;
-  padding: 6px;
-}
-.mapitem img {
-  width: 56px;
-  height: 56px;
-  object-fit: contain;
-  background: #000;
-  border-radius: 4px;
-}
-.mapitem .mi {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.mapitem b {
-  display: block;
-  font-size: 12.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-#logbox {
-  font-family: ui-monospace, monospace;
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-.muted {
-  color: #5a6172;
-}
-
 /* ── pose-estimate hint ──────────────────────────────────────────────────── */
 #posehint {
   display: none;
   position: fixed;
   left: 50%;
-  top: 108px;
+  top: 12rem;
   transform: translateX(-50%);
   z-index: 7;
-  background: #171a21f2;
-  border: 1px solid #ffb45455;
-  border-radius: 8px;
-  padding: 10px 14px;
-  max-width: 520px;
-  box-shadow: 0 8px 26px #000a;
+  max-width: 34rem;
+  --bs-card-bg: rgba(23, 26, 33, 0.96);
 }
 #posehint.on {
   display: block;
 }
-#posehint .phrow {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  color: #ffd9a0;
-}
-#posehint .phsub {
-  margin-top: 5px;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: #9aa3b2;
-}
 /* The gesture, animated: a dot where you press, then an arrow drawn out of it.
-   Revealing a finished arrow (rather than growing a bare line) keeps the head
-   in view, which is the part that says the drag sets a heading. */
-#posehint .phdemo {
+   Revealing a finished arrow keeps the head in view, which is the part that
+   says the drag sets a heading. */
+.phdemo {
   flex: 0 0 66px;
   height: 16px;
 }
-#posehint .phdot {
+.phdot,
+.phhead {
   fill: #ffb454;
 }
-#posehint .phline {
+.phline {
   stroke: #ffb454;
   stroke-width: 2;
 }
-#posehint .phhead {
-  fill: #ffb454;
-}
-#posehint .phreveal {
+.phreveal {
   animation: phdrag 1.8s ease-in-out infinite;
 }
 @keyframes phdrag {
@@ -457,10 +187,7 @@ button.del {
   15% {
     opacity: 1;
   }
-  70% {
-    clip-path: inset(0 0 0 0);
-    opacity: 1;
-  }
+  70%,
   92% {
     clip-path: inset(0 0 0 0);
     opacity: 1;
@@ -472,87 +199,28 @@ button.del {
 }
 
 /* ── blocking overlays ───────────────────────────────────────────────────── */
-#busy {
-  position: fixed;
-  inset: 0;
-  background: #000c;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  z-index: 60;
-}
-#busy.on {
-  display: flex;
-}
-#busybox {
-  background: #171a21;
-  border: 1px solid #3a4150;
-  border-radius: 10px;
-  padding: 22px 26px;
-  text-align: center;
-  min-width: 280px;
-  max-width: 480px;
-}
-#busybox h4 {
-  margin: 12px 0 6px;
-  font-size: 15px;
-}
-#busybody {
-  font-size: 12.5px;
-  line-height: 1.55;
-  color: #9aa3b2;
-}
-.spin {
-  width: 26px;
-  height: 26px;
-  margin: 0 auto;
-  border: 3px solid #2a3140;
-  border-top-color: #2d6cdf;
-  border-radius: 50%;
-  animation: sp 0.9s linear infinite;
-}
-@keyframes sp {
-  to {
-    transform: rotate(360deg);
-  }
-}
+#busy,
 #modal {
   position: fixed;
   inset: 0;
-  background: #000a;
   display: none;
   align-items: center;
   justify-content: center;
+  background: rgba(0, 0, 0, 0.72);
   z-index: 50;
 }
+#busy.on,
 #modal.on {
   display: flex;
 }
+#busybox {
+  min-width: 18rem;
+  max-width: 30rem;
+}
 #modalbox {
-  background: #171a21;
-  border: 1px solid #3a4150;
-  border-radius: 10px;
-  max-width: 560px;
-  width: calc(100% - 32px);
-  padding: 18px 20px;
-  box-shadow: 0 18px 50px #000b;
-}
-#modalbox h4 {
-  margin: 0 0 10px;
-  font-size: 16px;
-}
-#modalbox.danger h4 {
-  color: #ffb454;
+  width: min(36rem, calc(100vw - 2rem));
 }
 #modalbody {
-  font-size: 13px;
-  line-height: 1.6;
-  color: #c8cdd8;
   white-space: pre-wrap;
-}
-#modalbtns {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-  margin-top: 16px;
+  line-height: 1.6;
 }

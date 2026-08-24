@@ -1,3 +1,7 @@
+// Bootstrap 5.3 dark theme. The page is served as a fragment with no <html>
+// tag of its own, so the attribute is set here rather than in the markup.
+document.documentElement.setAttribute("data-bs-theme", "dark");
+
 function setStatus(t) {
   document.getElementById("status").textContent = t;
 }
@@ -43,8 +47,12 @@ function fitView() {
   fit();
   let wM = MI.width * MI.resolution,
     hM = MI.height * MI.resolution;
-  center = MI.pose ? [MI.pose.x, MI.pose.y] : [MI.origin_x + wM / 2, MI.origin_y + hM / 2];
-  pxPerM = Math.min(cv.width / wM, cv.height / hM) * 0.9;
+  // Fit means the whole map is on screen, so it centres on the map, not on the
+  // robot: centring on a robot standing at one corner pushed the rest of the
+  // map off the far edge at exactly the zoom that was supposed to reveal it.
+  center = [MI.origin_x + wM / 2, MI.origin_y + hM / 2];
+  // Leave room for the toolbar and status strip along the top.
+  pxPerM = Math.min(cv.width / wM, (cv.height - 150) / hM) * 0.92;
   draw();
 }
 function draw() {
@@ -343,16 +351,16 @@ async function loadLib() {
   let el = document.getElementById("lib");
   el.innerHTML = "";
   if (!m.length) {
-    el.innerHTML = "<div class=muted>no saved maps yet</div>";
+    el.innerHTML = '<div class="text-secondary small">no saved maps yet</div>';
     return;
   }
   for (const x of m) {
     let d = document.createElement("div");
     d.className = "mapitem";
     d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div class="mi"><b>${x.map_id}</b><div class=muted>${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
-   <button class=alt onclick="doLoad('${x.map_id}')">Load</button>
-   <button class=del onclick="doDelete('${x.map_id}')">Del</button>`;
+   <div class="mi"><b>${x.map_id}</b><div class="text-secondary small">${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
+   <button class="btn btn-sm btn-outline-light" onclick="doLoad('${x.map_id}')">Load</button>
+   <button class="btn btn-sm btn-outline-danger" onclick="doDelete('${x.map_id}')">Del</button>`;
     el.appendChild(d);
   }
 }
@@ -387,7 +395,7 @@ async function loadLog() {
     box.innerHTML = L.map((e) => {
       let t = new Date(e.t * 1000).toLocaleTimeString();
       let c = KCOL[e.kind] || "#8b93a3";
-      return `<div><span class=muted>${t}</span> <b style="color:${c}">${e.kind}</b> ${e.msg.replace(/</g, "&lt;")}</div>`;
+      return `<div><span class="text-secondary">${t}</span> <b style="color:${c}">${e.kind}</b> ${e.msg.replace(/</g, "&lt;")}</div>`;
     }).join("");
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (e) {}

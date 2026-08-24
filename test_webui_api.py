@@ -133,11 +133,16 @@ class StaticAssetTest(unittest.TestCase):
         self.assertIn("runExclusive", js)        # map ops are single-flight
         self.assertIn("posehint", html)
         self.assertIn("/static/app.js", html)
+        # Bootstrap is vendored, never fetched: the robot has no internet.
+        self.assertIn("/static/vendor/bootstrap.min.css", html)
+        self.assertNotIn("http://", html)
+        self.assertNotIn("https://", html.replace("https://getbootstrap.com", ""))
 
     def test_assets_are_served_with_their_own_content_types(self):
         for name, kind in (("index.html", "text/html"),
                            ("app.js", "application/javascript"),
-                           ("style.css", "text/css")):
+                           ("style.css", "text/css"),
+                           ("vendor/bootstrap.min.css", "text/css")):
             status, ctype, body = webui._static(name)
             self.assertEqual(status, 200, name)
             self.assertIn(kind, ctype)

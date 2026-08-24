@@ -478,7 +478,8 @@ def _static(name: str) -> tuple[int, str, bytes]:
     has is a fixed name in one directory, so anything else is a mistake or an
     attack and neither deserves a file.
     """
-    if name not in {"index.html", "app.js", "style.css"}:
+    if name not in {"index.html", "app.js", "style.css",
+                    "vendor/bootstrap.min.css"}:
         return 404, "text/plain", b"not found"
     path = STATIC_DIR / name
     try:

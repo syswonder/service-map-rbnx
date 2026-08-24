@@ -11,6 +11,7 @@ lifecycle) says, rather than anything the page remembered.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import unittest
 import urllib.request
@@ -115,10 +116,28 @@ class WebUiApiTest(unittest.TestCase):
 
 class PageTest(unittest.TestCase):
     def test_the_page_warns_before_the_switch_that_loses_the_session(self):
-        page = webui.PAGE if hasattr(webui, "PAGE") else webui._PAGE
-        self.assertIn("askConfirm", page)
-        self.assertIn("session id", page)
-        self.assertIn("modewarn", page)
+        self.assertIn("askConfirm", webui._PAGE)
+        self.assertIn("session id", webui._PAGE)
+        self.assertIn("modewarn", webui._PAGE)
+
+    def test_the_rendered_script_has_no_broken_string_literals(self):
+        """_PAGE is a plain triple-quoted string, so "\n" written in the source
+        reaches the browser as a real newline and "\'" reaches it as a bare
+        quote. Either one splits a JS string literal across lines and the whole
+        page stops running -- silently, because the server never parses it.
+        Every string in this script stays on one line, so an unbalanced quote
+        on any line means an escape was eaten."""
+        scripts = re.findall(r"<script>(.*?)</script>", webui._PAGE, re.S)
+        self.assertTrue(scripts, "page has no script block")
+        for block in scripts:
+            for n, line in enumerate(block.splitlines(), 1):
+                code = re.sub(r"\\.", "", line)          # drop escaped chars
+                if code.lstrip().startswith("//"):
+                    continue
+                for quote in ("'", '"'):
+                    self.assertEqual(
+                        code.count(quote) % 2, 0,
+                        "unbalanced %s on script line %d: %s" % (quote, n, line.strip()))
 
 
 if __name__ == "__main__":

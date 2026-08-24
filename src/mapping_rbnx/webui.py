@@ -55,6 +55,8 @@ _log_lock = threading.Lock()
 # Last pose_estimate seed, so convergence can be measured against where the
 # robot actually settled after relocalizing.
 _seed = {"x": None, "y": None, "theta": None, "t": 0.0}
+
+
 def _log_add(kind: str, msg: str) -> None:
     """Append one timestamped entry (kind ∈ save|load|switch|pose|info) to the
     UI activity log and mirror it to the service logger."""
@@ -392,13 +394,13 @@ async function doSwitch(mode){
  if(mode=='mapping'&&CURMODE=='localization'){
   let what=CURMAP?('map "'+CURMAP+'"'):'the loaded map';
   if(!await askConfirm('Switch to mapping while localized on '+what+'?',
-   'Expect '+what+' to disappear from the live view.\n\n'+
+   'Expect '+what+' to disappear from the live view.\\n\\n'+
    'Why: entering localization started a new RTAB-Map session id. RTAB-Map only links '+
    'consecutive nodes that share a session id, so everything built after this switch '+
    'forms a separate graph component, and the published map is assembled from the '+
    'component the robot is currently in. '+what+' is still in the database — it comes '+
    'back the moment a loop closure ties the two sessions together, and the saved copy on '+
-   'disk is never touched.\n\n'+
+   'disk is never touched.\\n\\n'+
    'So this is only safe if RTAB-Map can relocalize where you are standing. To build a '+
    'genuinely new map, restart the service with map_mode: mapping instead.',
    {danger:true,yes:'Switch to mapping'}))return}
@@ -407,7 +409,7 @@ async function doSwitch(mode){
  if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}  // poll() re-reads the real mode a second later
 async function doReset(){
  if(!await askConfirm('Clear the live map and rebuild from scratch?',
-  'The new map origin becomes the robot\'s current position, so the rebuilt map will NOT '+
+  'The new map origin becomes the current robot position, so the rebuilt map will NOT '+
   'line up with the old frame — anything recorded against the previous map goes stale. '+
   'Saved maps on disk are not affected.',
   {danger:true,yes:'Clear live map'}))return;

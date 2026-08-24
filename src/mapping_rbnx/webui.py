@@ -196,7 +196,7 @@ def _scan_points(msg) -> dict:
     pts = []
     ang = msg.angle_min
     lo, hi = msg.range_min, msg.range_max
-    step = max(1, len(msg.ranges) // MAX_OVERLAY_POINTS)
+    step = max(1, math.ceil(len(msg.ranges) / MAX_OVERLAY_POINTS))
     for i, r in enumerate(msg.ranges):
         if i % step == 0 and lo <= r <= hi and math.isfinite(r):
             a = ang + i * msg.angle_increment

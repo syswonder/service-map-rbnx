@@ -412,6 +412,13 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
  .switch.loc .knob{transform:translateX(100%);background:#1f8a44}
  .switch .swopt{position:relative;z-index:1;background:transparent;color:#9aa3b2;border-radius:999px;padding:6px 16px;font-size:13px;min-width:104px;transition:color .18s ease}
  .switch .swopt.on{color:#fff;font-weight:600}
+ #busy{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;z-index:60}
+ #busy.on{display:flex}
+ #busybox{background:#171a21;border:1px solid #3a4150;border-radius:10px;padding:22px 26px;text-align:center;min-width:280px;max-width:480px}
+ #busybox h4{margin:12px 0 6px;font-size:15px}
+ #busybody{font-size:12.5px;line-height:1.55;color:#9aa3b2}
+ .spin{width:26px;height:26px;margin:0 auto;border:3px solid #2a3140;border-top-color:#2d6cdf;border-radius:50%;animation:sp 0.9s linear infinite}
+ @keyframes sp{to{transform:rotate(360deg)}}
  .warn{background:#3a2a12;border:1px solid #6b4a15;border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.5;color:#f0d9a8}
  #modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:50}
  #modal.on{display:flex}
@@ -464,6 +471,11 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
   <div id=logbox style="height:360px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5"></div>
  </div>
 </div>
+<div id=busy><div id=busybox>
+ <div class=spin></div>
+ <h4 id=busytitle></h4>
+ <div id=busybody></div>
+</div></div>
 <div id=modal><div id=modalbox>
  <h4 id=modaltitle></h4>
  <div id=modalbody></div>
@@ -588,17 +600,20 @@ async function loadLog(){try{let L=await (await fetch('/api/log')).json();
  if(atBottom)box.scrollTop=box.scrollHeight}catch(e){}}
 setInterval(loadLog,1500);loadLog()
 async function doSave(){let id=document.getElementById('saveid').value.trim();
- if(!id){alert('enter a map_id');return}setStatus('saving '+id+'…');
- let r=await (await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
- setStatus(r.detail||'saved');loadLib()}
+ if(!id){setStatus('enter a map_id first');return}
+ let r=await runExclusive('Saving map \u201c'+id+'\u201d\u2026',
+  'RTAB-Map is paused while its database is flushed and copied, then the occupancy preview is rendered. Do not drive the robot until this finishes.',
+  async()=>(await (await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json()));
+ if(r){setStatus(r.detail||'saved');loadLib()}}
 async function doLoad(id){
  if(!await askConfirm('Load map '+id+' in localization mode?',
   'This replaces the live SLAM session. Anything mapped since the last Save is discarded — '+
   'save the current map first if you still need it.',
   {danger:true,yes:'Load '+id}))return;
- setStatus('loading '+id+'…');
- let r=await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json();
- setStatus(r.detail||'loaded')}
+ let r=await runExclusive('Loading map \u201c'+id+'\u201d\u2026',
+  'The saved database is copied to a runtime file, RTAB-Map switches onto it, and the map is republished. Watch the green scan afterwards to see whether it relocalized.',
+  async()=>(await (await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id,mode:'localization'})})).json()));
+ if(r)setStatus(r.detail||'loaded')}
 async function doSwitch(mode){
  // Switching a running RTAB-Map from localization to mapping is the one
  // transition that can destroy work: it resumes building from wherever the
@@ -617,26 +632,45 @@ async function doSwitch(mode){
    'So this is only safe if RTAB-Map can relocalize where you are standing. To build a '+
    'genuinely new map, restart the service with map_mode: mapping instead.',
    {danger:true,yes:'Switch to mapping'}))return}
- setStatus('switching to '+mode+'…');
- let r=await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json();
- if(r.ok)CURMODE=mode;applyMode();setStatus(r.detail||('mode '+mode))}  // poll() re-reads the real mode a second later
+ let r=await runExclusive('Switching to '+mode+'\u2026',
+  'Asking RTAB-Map to change mode. The map itself is not touched.',
+  async()=>(await (await fetch('/api/switch_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})})).json()));
+ if(r&&r.ok)CURMODE=mode;
+ applyMode();if(r)setStatus(r.detail||('mode '+mode))}  // poll() re-reads the real mode a second later
 async function doReset(){
  if(!await askConfirm('Clear the live map and rebuild from scratch?',
   'The new map origin becomes the current robot position, so the rebuilt map will NOT '+
   'line up with the old frame — anything recorded against the previous map goes stale. '+
   'Saved maps on disk are not affected.',
   {danger:true,yes:'Clear live map'}))return;
- setStatus('resetting map…');
- let r=await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
- setStatus(r.detail||'reset')}
+ let r=await runExclusive('Clearing the live map\u2026',
+  'RTAB-Map is resetting and resumes mapping from the current pose. Everything recorded against the old frame is now stale.',
+  async()=>(await (await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json()));
+ if(r)setStatus(r.detail||'reset')}
 async function doDelete(id){
  if(!await askConfirm('Delete saved map '+id+'?',
   'The saved database and its previews are removed from disk. This cannot be undone.',
   {danger:true,yes:'Delete '+id}))return;
- setStatus('deleting '+id+'…');
- let r=await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json();
- setStatus(r.detail||'deleted');loadLib()}
-let CURMODE=null,CURMAP='',RANGE={};
+ let r=await runExclusive('Deleting \u201c'+id+'\u201d\u2026',
+  'Removing the saved database and its previews from disk.',
+  async()=>(await (await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_id:id})})).json()));
+ if(r){setStatus(r.detail||'deleted');loadLib()}}
+let CURMODE=null,CURMAP='',RANGE={},BUSY=false;
+// Save and load take tens of seconds on a real map: rtabmap is paused, the
+// database is flushed and copied, previews are rendered. A second operation
+// issued in the middle of that acts on a half-published map, so the page holds
+// everything back behind one overlay until the first one answers.
+function busyOn(title, body){BUSY=true;
+ document.getElementById('busytitle').textContent=title;
+ document.getElementById('busybody').textContent=body||'';
+ document.getElementById('busy').classList.add('on')}
+function busyOff(){BUSY=false;document.getElementById('busy').classList.remove('on')}
+async function runExclusive(title, body, fn){
+ if(BUSY)return null;
+ busyOn(title, body);
+ try{return await fn()}
+ catch(e){setStatus('failed: '+e);return null}
+ finally{busyOff()}}
 async function pollRange(){try{let r=await (await fetch('/api/range')).json();RANGE=r;
  let el=document.getElementById('rangebadge');if(!el)return;
  let bits=[];

@@ -213,6 +213,14 @@ body {
 #modal.on {
   display: flex;
 }
+/* The dialogs sit on a dimmed backdrop, so they need a surface of their own:
+   inheriting the card default left them frameless against the dark map. */
+#busybox,
+#modalbox {
+  background: #171a21;
+  border: 1px solid #3a4150 !important;
+  border-radius: 0.75rem;
+}
 #busybox {
   min-width: 18rem;
   max-width: 30rem;
@@ -223,4 +231,8 @@ body {
 #modalbody {
   white-space: pre-wrap;
   line-height: 1.6;
+}
+
+.min-w-0 {
+  min-width: 0;
 }

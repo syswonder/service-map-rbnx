@@ -49,34 +49,30 @@
         >Robonix <span class="text-secondary fw-normal">mapping</span></span
       >
       <button
-        class="btn btn-sm btn-outline-light tool"
+        class="btn btn-sm btn-secondary tool"
         id="tool-save"
         onclick="togglePanel('savepanel')"
       >
         <svg><use href="#i-save" /></svg>Save
       </button>
       <button
-        class="btn btn-sm btn-outline-light tool"
+        class="btn btn-sm btn-secondary tool"
         id="tool-library"
         onclick="togglePanel('libpanel')"
       >
         <svg><use href="#i-library" /></svg>Library
       </button>
-      <button class="btn btn-sm btn-outline-light tool" id="btn-pose" onclick="togglePose()">
+      <button class="btn btn-sm btn-secondary tool" id="btn-pose" onclick="togglePose()">
         <svg><use href="#i-pose" /></svg>Pose estimate
       </button>
-      <button class="btn btn-sm btn-outline-danger tool" onclick="doReset()">
+      <button class="btn btn-sm btn-danger tool" onclick="doReset()">
         <svg><use href="#i-reset" /></svg>Reset map
       </button>
       <span class="vr mx-1"></span>
-      <button class="btn btn-sm btn-outline-light tool" onclick="fitView()">
+      <button class="btn btn-sm btn-secondary tool" onclick="fitView()">
         <svg><use href="#i-fit" /></svg>Fit
       </button>
-      <button
-        class="btn btn-sm btn-outline-light tool"
-        id="tool-log"
-        onclick="togglePanel('logpanel')"
-      >
+      <button class="btn btn-sm btn-secondary tool" id="tool-log" onclick="togglePanel('logpanel')">
         <svg><use href="#i-log" /></svg>Log
       </button>
     </div>
@@ -108,7 +104,8 @@
     id="modewarn"
     style="display: none"
   >
-    <span id="modewarntext" class="text-truncate small"></span>
+    <strong class="flex-shrink-0">!</strong>
+    <span id="modewarntext" class="text-truncate small flex-grow-1 min-w-0"></span>
     <button
       class="btn btn-sm btn-outline-warning py-0 px-2 flex-shrink-0"
       onclick="explainModeRisk()"

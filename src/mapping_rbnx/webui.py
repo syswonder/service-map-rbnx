@@ -236,14 +236,10 @@ def _frame_to_map(frame: str):
     """
     if not frame or _webui_node is None:
         return None
-    global _tf_buffer
+    if _tf_buffer is None:
+        return None
     try:
         import rclpy
-        import tf2_ros
-        if _tf_buffer is None:
-            _tf_buffer = tf2_ros.Buffer()
-            tf2_ros.TransformListener(_tf_buffer, _webui_node, spin_thread=False)
-            return None  # nothing buffered yet on the very first call
         tr = _tf_buffer.lookup_transform(
             MAP_FRAME, frame.lstrip("/"), rclpy.time.Time())
         t, q = tr.transform.translation, tr.transform.rotation
@@ -286,6 +282,21 @@ def _subscribe_range_sensors(node) -> None:
     the map preview itself must keep working either way.
     """
     from rclpy.qos import qos_profile_sensor_data
+
+    global _tf_buffer
+    if _tf_buffer is None:
+        try:
+            import tf2_ros
+            _tf_buffer = tf2_ros.Buffer()
+            # The listener's /tf subscriptions must exist before this node's
+            # executor starts spinning, for the same reason the map and pose
+            # subscriptions do -- see _ensure_subscriptions. Created here, not
+            # lazily on the first lookup, or they are never serviced and every
+            # transform lookup fails forever.
+            tf2_ros.TransformListener(_tf_buffer, node, spin_thread=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("webui overlay: tf2 unavailable, no range overlay: %s", e)
+            _tf_buffer = None
 
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""

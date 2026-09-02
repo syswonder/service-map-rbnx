@@ -214,6 +214,8 @@ def _make_nodes(context, *args, **kwargs):
         "Mem/InitWMWithAllNodes": "true" if localization else "false",
     }
 
+    overrides = {}
+    deploy_overrides = {}
     if overrides_file:
         try:
             with open(overrides_file, encoding="utf-8") as f:
@@ -225,13 +227,12 @@ def _make_nodes(context, *args, **kwargs):
             for key, value in overrides.items()
         ):
             raise RuntimeError("rtabmap_overrides_file must contain a JSON object of scalar parameters")
-        # The ROS wrapper forwards RTAB-Map's slash-named parameters as
-        # strings. Preserve that established type boundary even though JSON
-        # decoded booleans/numbers have native Python types.
-        rtabmap_params.update({
+        # RTAB-Map parameters are forwarded by the ROS wrapper as strings.
+        deploy_overrides = {
             key: str(value).lower() if isinstance(value, bool) else str(value)
             for key, value in overrides.items()
-        })
+        }
+        rtabmap_params.update(deploy_overrides)
         print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
 
     rtabmap_initialpose_topic = (
@@ -370,6 +371,7 @@ def _make_nodes(context, *args, **kwargs):
             "frame_id": base_frame,
             "odom_frame_id": odom_frame,
             "publish_tf": not navigation_odom_bridge,
+            "publish_null_when_lost": True,
             "approx_sync": True,
             "wait_for_transform": 1.5,
             "deskewing": deskew_lidar,
@@ -380,12 +382,29 @@ def _make_nodes(context, *args, **kwargs):
             "Icp/MaxCorrespondenceDistance": "1.0",
             "Odom/ScanKeyFrameThr": "0.4",
         }
-        for key in ("Icp/MaxTranslation", "Icp/MaxRotation"):
-            if key in rtabmap_params:
-                icp_odom_params[key] = rtabmap_params[key]
+        if have_imu:
+            icp_odom_params["wait_imu_to_init"] = True
+        if "publish_null_when_lost" in overrides:
+            if not isinstance(overrides["publish_null_when_lost"], bool):
+                raise RuntimeError(
+                    "publish_null_when_lost must be a YAML boolean "
+                    "(true or false, without quotes)"
+                )
+            icp_odom_params["publish_null_when_lost"] = overrides[
+                "publish_null_when_lost"
+            ]
+        # icp_odometry is a separate process, so parameters passed to the SLAM
+        # node above do not reach it automatically. Merge the complete deploy
+        # dictionary after this node's defaults as well: existing keys are
+        # overridden and additional keys are left for RTAB-Map to accept or
+        # ignore according to the version running on the robot.
+        icp_odom_params.update({
+            key: value
+            for key, value in deploy_overrides.items()
+            if key != "publish_null_when_lost"
+        })
         if have_imu:
             icp_odom_remappings.append(("imu", filtered_imu_topic))
-            icp_odom_params["wait_imu_to_init"] = True
         icp_odom = Node(
             package="rtabmap_odom",
             executable="icp_odometry",

@@ -20,6 +20,7 @@ SLAM engine.
 |---|---|---|
 | `rtabmap` *(default, recommended)* | sim + real; 2D/3D/RGBD, sensor-agnostic | any of lidar2d / lidar3d / rgbd (+ odom) |
 | `dlio` | real-robot 3D Livox + IMU | lidar3d + imu, needs a colcon ws at `/ws/install` |
+| `slam_toolbox` | 2D lidar only; CPU-only, no database, pose graph serializes to two files | lidar2d (+ odom via tf) |
 | `fastlio2` | **broken (drift)** — repro only | — |
 
 ## Localization engines (`localizer`)

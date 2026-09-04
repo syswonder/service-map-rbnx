@@ -70,5 +70,26 @@ class LaunchFileTests(unittest.TestCase):
             self.assertIn(f'DeclareLaunchArgument("{arg}"', src, f"{arg} is passed but not declared")
 
 
+
+class EngineRegistryTests(unittest.TestCase):
+    """Every engine that can persist maps must name its artifacts."""
+
+    def test_slam_toolbox_declares_its_graph_files(self):
+        from mapping_rbnx import engines
+        ops = engines.engine_for("slam_toolbox")
+        self.assertIsNotNone(ops)
+        self.assertEqual(set(ops.graph_files), {"posegraph.posegraph", "posegraph.data"})
+
+    def test_missing_graph_is_reported_by_name(self):
+        from mapping_rbnx import engines
+        ok, detail = engines.engine_for("slam_toolbox").graph_ready("/nonexistent")
+        self.assertFalse(ok)
+        self.assertIn("posegraph", detail)
+
+    def test_engines_without_persistence_are_absent_rather_than_broken(self):
+        from mapping_rbnx import engines
+        self.assertIsNone(engines.engine_for("dlio"))
+        self.assertEqual(engines.graph_files_for("dlio"), ())
+
 if __name__ == "__main__":
     unittest.main()

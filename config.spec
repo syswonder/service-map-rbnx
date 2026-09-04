@@ -26,8 +26,11 @@ optional:
   algo:
     type: string
     default: rtabmap
-    allowed: [rtabmap, dlio, fastlio2]
-    description: Mapping engine. fastlio2 is retained only for diagnostics.
+    allowed: [rtabmap, slam_toolbox, dlio, fastlio2]
+    description: >-
+      Mapping engine. rtabmap is sensor-agnostic (2D/3D/RGB-D) and the default;
+      slam_toolbox is 2D-lidar-only, CPU-only, and serializes its pose graph to
+      two files instead of a database. fastlio2 is retained only for diagnostics.
 
   localizer:
     type: string

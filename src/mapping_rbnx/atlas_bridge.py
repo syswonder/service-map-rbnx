@@ -268,6 +268,21 @@ _ALGO_TOPIC_BINDINGS: dict[str, dict[str, str]] = {
         # is running internally, this IS the odom source.
         "robonix/service/map/odom":           "/rtabmap/odom",
     },
+    "slam_toolbox": {
+        # Karto scan matching + pose graph, 2D lidar only. slam_toolbox owns
+        # /map and the map → odom transform itself; there is no 3D cloud, so the
+        # pointcloud contract is backed by the same adapter dlio uses in reverse
+        # — a laser-scan-to-cloud republisher in the launch — rather than left
+        # unbound, because every algo must back the whole exported surface.
+        "robonix/service/map/occupancy_grid": "/map",
+        "robonix/service/map/pointcloud":     "/robonix/map/cloud",
+        # Same tf_to_pose adapter as rtabmap: slam_toolbox publishes /pose only
+        # in localization mode, while map → base_link is always in tf.
+        "robonix/service/map/pose":           "/robonix/map/pose",
+        # No corrected-odometry stream of its own; the chassis odometry with the
+        # map → odom correction in tf is what consumers get.
+        "robonix/service/map/odom":           "/robonix/map/odom",
+    },
     "dlio": {
         # Direct LiDAR-Inertial Odometry: real-robot 3D livox path.
         # No native 2D OccupancyGrid — projected from /dlio's cloud
@@ -570,6 +585,12 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     resolved.update(persist)
+    # Frames and clock reach the launch through the same resolved file the
+    # topics do; slam_toolbox takes them as launch arguments and rtabmap reads
+    # them from its own params, so writing them unconditionally is harmless.
+    resolved.setdefault("base_frame", str(cfg.get("base_frame") or "base_link"))
+    resolved.setdefault("odom_frame", str(cfg.get("odom_frame") or "odom"))
+    resolved.setdefault("use_sim_time", "true" if cfg.get("use_sim_time") else "false")
 
     # Localization engine used by load_map (see localizers.py). Configured once
     # the sensor topics are resolved, because the particle filter subscribes to

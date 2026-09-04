@@ -9,6 +9,8 @@
 #               sensors.* the deploy enabled (lidar2d / lidar3d / rgb /
 #               depth / odom). Webots tiago = lidar2d + rgb + depth; real
 #               robot (mid360) = lidar3d + rgb + depth.
+#   slam_toolbox — Karto scan matching + pose graph, 2D lidar only.
+#               CPU-only, no database, no visual loop closure.
 #   dlio      — Direct LiDAR-Inertial Odometry (3D Livox; real robot)
 #   fastlio2  — [BROKEN: drift] kept for repro/debug only
 #
@@ -174,6 +176,25 @@ PYEOF
         wait $LAUNCH_PID
         ;;
 
+    slam_toolbox)
+        # Karto scan matching + pose graph, 2D lidar only. Needs scan_topic;
+        # everything else has a default. Frames come from the deploy config the
+        # same way rtabmap gets them.
+        SCAN_TOPIC=$(read_y scan_topic)
+        BASE_FRAME=$(read_y base_frame); ODOM_FRAME=$(read_y odom_frame)
+        MAP_MODE=$(read_y map_mode); USE_SIM_TIME=$(read_y use_sim_time)
+        if [ -z "$SCAN_TOPIC" ] || [ "$SCAN_TOPIC" = "<none>" ]; then
+            echo "[start_engine] ERR: slam_toolbox needs a 2D lidar (scan_topic); none resolved" >&2
+            exit 2
+        fi
+        echo "[start_engine] slam_toolbox scan=$SCAN_TOPIC base=${BASE_FRAME:-base_link} odom=${ODOM_FRAME:-odom} mode=${MAP_MODE:-mapping}"
+        exec ros2 launch /mapping/launch/slam_toolbox_2d.launch.py \
+            scan_topic:="$SCAN_TOPIC" \
+            base_frame:="${BASE_FRAME:-base_link}" \
+            odom_frame:="${ODOM_FRAME:-odom}" \
+            map_mode:="${MAP_MODE:-mapping}" \
+            use_sim_time:="${USE_SIM_TIME:-false}"
+        ;;
     dlio)
         # Direct LiDAR-Inertial Odometry — real-robot 3D livox path.
         # Requires the `dlio` ros2 package mounted/installed in the
@@ -203,7 +224,7 @@ PYEOF
         ;;
 
     *)
-        echo "[start_engine] unknown algo: $ALGO (supported: rtabmap | dlio | fastlio2)" >&2
+        echo "[start_engine] unknown algo: $ALGO (supported: rtabmap | slam_toolbox | dlio | fastlio2)" >&2
         exit 2
         ;;
 esac

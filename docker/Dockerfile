@@ -65,6 +65,7 @@ RUN apt-get update \
         ros-humble-pointcloud-to-laserscan \
         ros-humble-rmw-cyclonedds-cpp \
         ros-humble-rmw-zenoh-cpp \
+        ros-humble-slam-toolbox \
         ros-humble-nav2-amcl \
         ros-humble-nav2-map-server \
         ros-humble-nav2-lifecycle-manager \

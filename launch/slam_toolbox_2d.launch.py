@@ -34,6 +34,10 @@ def _launch_setup(context, *args, **kwargs):
     mode = LaunchConfiguration("map_mode").perform(context).strip().lower()
     resolution = float(LaunchConfiguration("resolution").perform(context))
     max_laser_range = float(LaunchConfiguration("max_laser_range").perform(context))
+    travel_distance = float(LaunchConfiguration("minimum_travel_distance").perform(context))
+    travel_heading = float(LaunchConfiguration("minimum_travel_heading").perform(context))
+    scan_buffer = int(float(LaunchConfiguration("scan_buffer_size").perform(context)))
+    loop_distance = float(LaunchConfiguration("loop_search_maximum_distance").perform(context))
 
     common = {"use_sim_time": use_sim_time}
     slam_params = {
@@ -49,15 +53,32 @@ def _launch_setup(context, *args, **kwargs):
         "max_laser_range": max_laser_range,
         "transform_publish_period": 0.02,
         "map_update_interval": 1.0,
-        # Scan matching: the defaults are tuned for a robot that drives, and this
-        # is the part that decides whether the map stays rigid on curves.
-        "minimum_travel_distance": 0.2,
-        "minimum_travel_heading": 0.2,
-        "scan_buffer_size": 20,
+        # Scan matching. slam_toolbox's stock values assume a robot that covers
+        # ground; an indoor platform creeping at ~0.15 m/s adds a node only every
+        # 1.5 s at the stock 0.2 m, and the running window then spans the whole
+        # room, so the defaults here are the deployment's and can be overridden
+        # per robot from the resolved contract (see start_engine.sh).
+        "minimum_travel_distance": travel_distance,
+        "minimum_travel_heading": travel_heading,
+        # The buffer is a sliding window of scans matched against each other:
+        # scan_buffer_size * minimum_travel_distance is the distance it spans,
+        # which should stay near the room scale, not far beyond it.
+        "scan_buffer_size": scan_buffer,
+        "scan_buffer_maximum_scan_distance": max(3.0, scan_buffer * travel_distance),
+        # Loop closure is what fixes accumulated drift, and also the only thing
+        # that can wrench a good map — the failure RTAB-Map showed here. Keeping
+        # the search radius near the room scale and the acceptance response high
+        # means a loop is only closed where the robot has genuinely been before.
         "do_loop_closing": True,
-        "loop_search_maximum_distance": 3.0,
-        "loop_match_minimum_response_fine": 0.45,
+        "loop_search_maximum_distance": loop_distance,
+        "loop_match_minimum_response_fine": 0.5,
+        "loop_match_minimum_response_coarse": 0.4,
+        "loop_match_maximum_variance_coarse": 2.0,
         "minimum_time_interval": 0.2,
+        # Scan-match acceptance for consecutive nodes; below this the odometry
+        # link is kept as-is rather than corrected by a poor match.
+        "link_match_minimum_response_fine": 0.15,
+        "link_scan_maximum_distance": 1.5,
         "stack_size_to_use": 40000000,
     }
     sim_time = "true" if use_sim_time else "false"
@@ -96,5 +117,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("map_mode", default_value="mapping"),
         DeclareLaunchArgument("resolution", default_value="0.05"),
         DeclareLaunchArgument("max_laser_range", default_value="12.0"),
+        # Sized for a slow indoor platform in a room-scale map; start_engine.sh
+        # overrides them from the resolved contract when a deployment sets them.
+        DeclareLaunchArgument("minimum_travel_distance", default_value="0.1"),
+        DeclareLaunchArgument("minimum_travel_heading", default_value="0.15"),
+        DeclareLaunchArgument("scan_buffer_size", default_value="30"),
+        DeclareLaunchArgument("loop_search_maximum_distance", default_value="2.5"),
         OpaqueFunction(function=_launch_setup),
     ])

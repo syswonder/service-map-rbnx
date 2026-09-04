@@ -77,6 +77,7 @@ from mapping_rbnx.profiles import (  # noqa: E402
     choose_provider_record,
     resolve_occupancy_sources,
     resolve_rtabmap_overrides,
+    resolve_slam_toolbox_overrides,
     select_rtabmap_inputs,
 )
 
@@ -608,6 +609,15 @@ def init(cfg: dict):
     if localizer_name != "none":
         log.info("[mapping] localizer=%s on scan=%s (load_map without a pose will "
                  "request global localization)", localizer_name, resolved.get("scan_topic"))
+    if algo == "slam_toolbox":
+        # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
+        # They reach the launch through the resolved file like every other
+        # setting; unset keys keep the launch defaults.
+        try:
+            resolved.update(resolve_slam_toolbox_overrides(
+                cfg.get("slam_toolbox_params")))
+        except RuntimeError as e:
+            return Err(str(e))
     if algo == "rtabmap":
         try:
             overrides_path = _write_rtabmap_overrides(cfg, resolved)

@@ -214,6 +214,7 @@ def list_maps_impl() -> dict:
     so consumers such as scene never depend on debug HTTP or shared volumes.
     """
     maps = []
+    running = active_algo()
     try:
         if not os.path.isdir(MAPS_DIR):
             return {"ok": True, "detail": "", "maps_json": "[]"}
@@ -233,19 +234,36 @@ def list_maps_impl() -> dict:
                                 meta[k.strip()] = v.strip()
                 except Exception:  # noqa: BLE001
                     pass
-            has_artifact = os.path.isfile(db)
-            artifact_ok, artifact_detail = _sqlite_quick_check(db) if has_artifact else (False, "missing spatial artifact")
+            # Which engine wrote this map decides which files are its graph.
+            # Row shape stays the same for every engine so the web UI and the
+            # capability consumers do not branch on it; only `engine` and the
+            # artifact path differ.
+            engine_name = meta.get("engine") or ("rtabmap" if os.path.isfile(db) else running)
+            ops = engines.engine_for(engine_name)
+            graph = [os.path.join(d, f) for f in (ops.graph_files if ops else ("rtabmap.db",))]
+            has_artifact = all(os.path.isfile(f) for f in graph)
+            if not has_artifact:
+                artifact_ok, artifact_detail = False, "missing spatial artifact"
+            elif ops is not None:
+                artifact_ok, artifact_detail = ops.graph_ready(d)
+            else:
+                artifact_ok, artifact_detail = _rtabmap_graph_ready(d)
+            if has_artifact and engine_name != running:
+                artifact_detail = (f"built by {engine_name}; this deployment runs {running}"
+                                   + (f" ({artifact_detail})" if artifact_detail else ""))
             preview = os.path.join(d, "occupancy.png")
             maps.append({
                 "map_id": name,
+                "engine": engine_name,
+                "loadable_here": bool(artifact_ok) and engine_name == running,
                 "has_spatial_artifact": has_artifact,
                 "spatial_ok": bool(artifact_ok),
                 "artifact_detail": artifact_detail,
                 "has_preview": os.path.isfile(preview),
-                "artifact_path": db if has_artifact else "",
+                "artifact_path": graph[0] if has_artifact else "",
                 "preview_path": preview if os.path.isfile(preview) else "",
-                "artifact_size": os.path.getsize(db) if has_artifact else 0,
-                "updated": int(os.path.getmtime(db)) if has_artifact else 0,
+                "artifact_size": sum(os.path.getsize(f) for f in graph) if has_artifact else 0,
+                "updated": int(max(os.path.getmtime(f) for f in graph)) if has_artifact else 0,
                 "meta": meta,
             })
         return {"ok": True, "detail": "", "maps_json": json.dumps(maps, ensure_ascii=False)}
@@ -404,12 +422,24 @@ def load_map_impl(map_id: str, mode: str = "localization",
     if requested_mode not in ("localization", "mapping"):
         return {"ok": False, "detail": f"mode={requested_mode!r} invalid (localization|mapping)"}
     mode = "localization"
-    db_path = os.path.join(MAPS_DIR, map_id, "rtabmap.db")
-    if not os.path.isfile(db_path):
-        return {"ok": False, "detail": f"no saved map at {db_path}"}
-    db_ok, db_detail = _sqlite_quick_check(db_path)
-    if not db_ok:
-        return {"ok": False, "detail": f"saved map database is invalid: {db_detail}"}
+    map_dir = os.path.join(MAPS_DIR, map_id)
+    db_path = os.path.join(map_dir, "rtabmap.db")
+    if not os.path.isdir(map_dir):
+        return {"ok": False, "detail": f"no saved map at {map_dir}"}
+    # A saved map belongs to the engine that built it: the graph file and the
+    # service that reads it are engine-specific, so a mismatch is refused here,
+    # naming both sides, rather than failing obscurely inside the load.
+    algo, saved_engine = active_algo(), map_engine(map_dir)
+    if saved_engine and saved_engine != algo:
+        return {"ok": False,
+                "detail": f"map {map_id!r} was built by {saved_engine}, but this deployment "
+                          f"runs {algo}; load it on a {saved_engine} deployment, or rebuild "
+                          f"the map with {algo}"}
+    ops = _engine()
+    graph_ok, graph_detail = (ops.graph_ready(map_dir) if ops is not None
+                              else _rtabmap_graph_ready(map_dir))
+    if not graph_ok:
+        return {"ok": False, "detail": f"saved {algo} map is not loadable: {graph_detail}"}
 
     node = _get_node()
     if node is None:
@@ -424,7 +454,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
         # prior pose, so `load_map` without a pose stops meaning "hope the scan
         # matcher converges from wherever the robot thinks it is".
         if localizers.enabled():
-            ok_l, detail_l = localizers.start(os.path.dirname(db_path), map_id)
+            ok_l, detail_l = localizers.start(map_dir, map_id)
             if not ok_l:
                 return {"ok": False, "detail": f"localizer failed to start: {detail_l}"}
             ready, detail_r = localizers.wait_ready(node)
@@ -450,6 +480,20 @@ def load_map_impl(map_id: str, mode: str = "localization",
                 "mode": "localization",
                 "localizer": localizers.name(),
             }
+        if algo != "rtabmap":
+            # Engine-owned restore: slam_toolbox deserializes its pose graph and
+            # continues from it. The localizer branch above already returned when
+            # a particle filter is configured, so this is the bare-engine path.
+            ok_e, detail_e = ops.activate(
+                node, map_dir, map_id,
+                float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180")),
+                (x, y, theta) if has_initial_pose else None)
+            if not ok_e:
+                return {"ok": False, "detail": f"{algo} failed to load {map_id!r}: {detail_e}"}
+            lifecycle.set_mode(mode)
+            lifecycle.set_state(map_id, mode, bump=False)
+            return {"ok": True, "detail": detail_e, "map_id": map_id,
+                    "mode": mode, "engine": algo}
         runtime_db = _runtime_db_copy(db_path, map_id)
 
         # RTAB-Map only restores the saved 2D occupancy grid when the database
@@ -535,6 +579,72 @@ def load_map_impl(map_id: str, mode: str = "localization",
 # database RTAB-Map is actually writing.
 _active_db: str = ""
 _finalized: bool = False
+
+
+def _rtabmap_graph_ready(map_dir: str) -> tuple[bool, str]:
+    """A saved RTAB-Map graph is one sqlite database that opens cleanly."""
+    db = os.path.join(map_dir, "rtabmap.db")
+    if not os.path.isfile(db):
+        return False, f"missing rtabmap.db in {map_dir}"
+    return _sqlite_quick_check(db)
+
+
+def _register_engines() -> None:
+    """Give the registry RTAB-Map's implementations (they live in this module,
+    so they are injected rather than imported to keep the import one-way)."""
+    engines.register(engines.RtabmapOps(
+        graph_ready=_rtabmap_graph_ready,
+        snapshot=lambda node, staging_dir, timeout_s: (False, "rtabmap snapshots via save_map_impl"),
+        activate=lambda node, map_dir, map_id, timeout_s, pose=None: (False, "rtabmap activates via load_map_impl"),
+        reset=lambda node, timeout_s: (False, "rtabmap resets via reset_map_impl"),
+    ))
+
+
+def read_meta(map_dir: str) -> dict[str, str]:
+    """Parse `<map_dir>/meta.yaml` into a flat dict (missing file -> {})."""
+    meta: dict[str, str] = {}
+    path = os.path.join(map_dir, "meta.yaml")
+    if not os.path.isfile(path):
+        return meta
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return meta
+
+
+def map_engine(map_dir: str) -> str:
+    """Engine recorded for a saved map. Maps written before the field existed
+    hold an RTAB-Map database, so that is the honest default."""
+    meta = read_meta(map_dir)
+    recorded = (meta.get("engine") or "").strip().lower()
+    if recorded:
+        return recorded
+    return "rtabmap" if os.path.isfile(os.path.join(map_dir, "rtabmap.db")) else ""
+
+
+def _write_meta_fields(map_dir: str, fields: dict[str, str]) -> None:
+    """Add or replace `fields` in `<map_dir>/meta.yaml`, keeping the rest."""
+    path = os.path.join(map_dir, "meta.yaml")
+    lines: list[str] = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = [l for l in fh
+                         if l.split(":", 1)[0].strip() not in fields]
+        except OSError:
+            lines = []
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+            for k, v in fields.items():
+                fh.write(f"{k}: {v}\n")
+    except OSError as e:
+        log.warning("could not record %s in %s: %s", list(fields), path, e)
 
 
 def active_algo() -> str:
@@ -691,7 +801,21 @@ def reset_map_impl() -> dict:
     node = _get_node()
     if node is None:
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
+    algo = active_algo()
     try:
+        if algo != "rtabmap":
+            # Same contract for every engine: clear the live graph, bump the
+            # frame epoch (the origin moves), stay in mapping mode.
+            ops = _engine()
+            if ops is None:
+                return {"ok": False, "detail": f"engine {algo!r} cannot reset its map"}
+            ok_e, detail_e = ops.reset(node, 10.0)
+            if not ok_e:
+                return {"ok": False, "detail": f"{algo} reset failed: {detail_e}"}
+            lifecycle.mark_reset()
+            lifecycle.set_mode("mapping")
+            return {"ok": True, "detail": f"map cleared — rebuilding from current pose "
+                                          f"(origin reset; new frame won't match the old map); {detail_e}"}
         from std_srvs.srv import Empty
         ok, res = _call_service(node, Empty, f"{RTABMAP_NS}/reset", Empty.Request(), timeout_s=10.0)
         if not ok:
@@ -794,6 +918,17 @@ def _atomic_publish_map_dir(staging_dir: str, map_dir: str) -> None:
         raise
 
 
+def _staging_dir(map_id: str) -> str:
+    """Fresh, empty staging directory for one save. Hidden (leading dot) and
+    pid/time stamped so a concurrent save cannot collide, and so `list_maps`
+    never shows a half-written map."""
+    path = os.path.join(MAPS_DIR, f".{map_id}.staging-{os.getpid()}-{int(time.time() * 1000)}")
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
 def _run_preview_snapshot(map_dir: str) -> bool:
     """Write occupancy preview artifacts for the map library UI."""
     import subprocess
@@ -827,6 +962,57 @@ def _run_preview_snapshot(map_dir: str) -> bool:
         return False
 
 
+def _save_map_via_engine(map_id: str, map_dir: str, algo: str, note: str = "") -> dict:
+    """Snapshot the live map for an engine other than RTAB-Map.
+
+    Deliberately the same shape as the RTAB-Map path: refuse to overwrite a
+    published map, stage into a temporary directory, ask the engine for its
+    graph, render the occupancy/cloud preview with the same script, record the
+    metadata (including which engine wrote it) and publish atomically. Consumers
+    and the web UI see one directory layout regardless of engine.
+    """
+    ops = engines.engine_for(algo)
+    if ops is None:
+        return {"ok": False, "map_id": map_id, "artifact_path": "",
+                "detail": f"engine {algo!r} does not implement map persistence"}
+    if os.path.isdir(map_dir) and ops.graph_ready(map_dir)[0]:
+        return {"ok": False, "map_id": map_id, "artifact_path": map_dir,
+                "detail": f"spatial map {map_id!r} already exists and is immutable; "
+                          "update scene annotations/objects separately"}
+    node = _get_node()
+    if node is None:
+        return {"ok": False, "map_id": map_id, "artifact_path": "",
+                "detail": "rclpy node unavailable; cannot ask the engine to save"}
+    staging_dir = ""
+    try:
+        staging_dir = _staging_dir(map_id)
+        timeout_s = float(os.environ.get("MAPPING_SAVE_BACKUP_TIMEOUT_S", "180"))
+        ok, detail = ops.snapshot(node, staging_dir, timeout_s)
+        if not ok:
+            return {"ok": False, "map_id": map_id, "artifact_path": "",
+                    "detail": f"{algo} could not serialize its map: {detail}"}
+        if not _run_preview_snapshot(staging_dir):
+            return {"ok": False, "map_id": map_id, "artifact_path": "",
+                    "detail": "map preview/occupancy snapshot was not produced; "
+                              "refusing to publish an incomplete spatial artifact"}
+        _write_meta_fields(staging_dir, {"map_id": map_id, "engine": algo,
+                                         "note": note or "-"})
+        if not os.path.isfile(os.path.join(staging_dir, "occupancy.png")):
+            return {"ok": False, "map_id": map_id, "artifact_path": "",
+                    "detail": "occupancy preview missing after snapshot"}
+        _atomic_publish_map_dir(staging_dir, map_dir)
+        staging_dir = ""
+        _mark_finalized()
+        return {"ok": True, "map_id": map_id, "artifact_path": map_dir,
+                "detail": f"saved {algo} map: {detail}"}
+    except Exception as e:  # noqa: BLE001
+        log.exception("save_map[%s] failed for engine %s", map_id, algo)
+        return {"ok": False, "map_id": map_id, "artifact_path": "", "detail": str(e)}
+    finally:
+        if staging_dir and os.path.isdir(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+
 def save_map_impl(map_id: str, note: str = "") -> dict:
     """Snapshot the current SLAM map under {MAPS_DIR}/<map_id>/.
 
@@ -838,8 +1024,13 @@ def save_map_impl(map_id: str, note: str = "") -> dict:
     map_dir = os.path.join(MAPS_DIR, map_id)
     db_path = os.path.join(map_dir, "rtabmap.db")
     staging_dir = ""
+    algo = active_algo()
     try:
         os.makedirs(MAPS_DIR, exist_ok=True)
+        if algo != "rtabmap":
+            # Engine-owned snapshot: same directory layout, same preview and
+            # metadata, only the graph file(s) differ (see engines.py).
+            return _save_map_via_engine(map_id, map_dir, algo, note)
 
         if os.path.isfile(db_path):
             db_ok, db_detail = _sqlite_quick_check(db_path)
@@ -897,13 +1088,7 @@ def save_map_impl(map_id: str, note: str = "") -> dict:
                 "detail": f"rtabmap save/flush failed: {flush_detail}",
             }
 
-        staging_dir = os.path.join(
-            MAPS_DIR,
-            f".{map_id}.staging-{os.getpid()}-{int(time.time() * 1000)}",
-        )
-        if os.path.exists(staging_dir):
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        os.makedirs(staging_dir, exist_ok=False)
+        staging_dir = _staging_dir(map_id)
         staged_db = os.path.join(staging_dir, "rtabmap.db")
 
         ok, detail = _sqlite_backup(snapshot_src, staged_db)
@@ -938,6 +1123,11 @@ def save_map_impl(map_id: str, note: str = "") -> dict:
         flush_detail = f"{flush_detail}; {pub_detail}"
 
         preview_ok = _run_preview_snapshot(staging_dir)
+        # The engine that produced the graph is part of the artifact: a map
+        # saved by one SLAM engine cannot be loaded by another (the graph files
+        # and the services that read them differ), and load_map refuses rather
+        # than failing obscurely later.
+        _write_meta_fields(staging_dir, {"engine": active_algo()})
         meta_path = os.path.join(staging_dir, "meta.yaml")
         if os.path.isfile(meta_path):
             try:
@@ -1007,3 +1197,6 @@ def delete_map_impl(map_id: str) -> dict:
     except Exception as e:  # noqa: BLE001
         log.exception("delete_map failed for %s", map_id)
         return {"ok": False, "map_id": map_id, "detail": str(e)}
+
+
+_register_engines()

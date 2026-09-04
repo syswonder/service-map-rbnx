@@ -23,6 +23,27 @@ SLAM engine.
 | `slam_toolbox` | 2D lidar only; CPU-only, no database, pose graph serializes to two files | lidar2d (+ odom via tf) |
 | `fastlio2` | **broken (drift)** — repro only | — |
 
+Saved maps are engine-tagged. `save_map` records the engine in the map's
+`meta.yaml`, `list_maps` reports it, and `load_map` refuses a map built by a
+different engine by name instead of failing somewhere inside the load. The
+directory layout does not change with the engine — `occupancy.{pgm,yaml,png}`,
+`cloud.pcd`, `meta.yaml` plus that engine's graph (`rtabmap.db`, or
+`posegraph.posegraph` + `posegraph.data`) — so scene, the web UI and every other
+consumer read one shape. The web UI names the running backend in its header and
+greys out library entries built by another one.
+
+### Tuning `slam_toolbox`
+
+`slam_toolbox_params` is the counterpart of `rtabmap_params`. The defaults suit
+a slow indoor platform in a room-scale map; an unknown key fails at init.
+
+| key | default | what it does |
+|---|---|---|
+| `min_travel_m` | `0.1` | distance before a new pose-graph node |
+| `min_heading_rad` | `0.15` | rotation before a new pose-graph node |
+| `scan_buffer` | `30` | recent scans matched against each other (`scan_buffer x min_travel_m` should stay near the room scale) |
+| `loop_search_m` | `2.5` | radius searched for a loop closure |
+
 ## Localization engines (`localizer`)
 
 Building a map and localizing in a saved one are separate jobs, and the second

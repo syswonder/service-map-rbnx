@@ -31,7 +31,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import lifecycle, map_ops
+from . import lifecycle, localizers, map_ops
 
 log = logging.getLogger("mapping_rbnx.webui")
 
@@ -467,31 +467,29 @@ def _grid_to_png(grid, pose=None) -> bytes:
 
 
 def _list_saved_maps() -> list[dict]:
+    """Library rows for the page, taken from the capability's own listing.
+
+    `map_ops.list_maps_impl` already knows which engine wrote each map and which
+    files are that engine's graph, so the page reads the same rows every other
+    consumer does instead of re-deriving them from `rtabmap.db`. The `has_db` /
+    `db_size` key names stay as they were so the page's rendering is unchanged.
+    """
     out = []
-    if not os.path.isdir(MAPS_DIR):
+    res = map_ops.list_maps_impl()
+    if not res.get("ok"):
+        log.warning("map library listing failed: %s", res.get("detail", ""))
         return out
-    for name in sorted(os.listdir(MAPS_DIR)):
-        d = os.path.join(MAPS_DIR, name)
-        if not os.path.isdir(d):
-            continue
-        db = os.path.join(d, "rtabmap.db")
-        meta = {}
-        mp = os.path.join(d, "meta.yaml")
-        if os.path.isfile(mp):
-            try:
-                for line in open(mp):
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        meta[k.strip()] = v.strip()
-            except Exception:  # noqa: BLE001
-                pass
+    for row in json.loads(res.get("maps_json") or "[]"):
         out.append({
-            "map_id": name,
-            "has_db": os.path.isfile(db),
-            "has_preview": os.path.isfile(os.path.join(d, "occupancy.png")),
-            "db_size": os.path.getsize(db) if os.path.isfile(db) else 0,
-            "updated": int(os.path.getmtime(db)) if os.path.isfile(db) else 0,
-            "meta": meta,
+            "map_id": row["map_id"],
+            "engine": row.get("engine", ""),
+            "loadable_here": bool(row.get("loadable_here", True)),
+            "detail": row.get("artifact_detail", ""),
+            "has_db": bool(row.get("has_spatial_artifact")),
+            "has_preview": bool(row.get("has_preview")),
+            "db_size": int(row.get("artifact_size", 0)),
+            "updated": int(row.get("updated", 0)),
+            "meta": row.get("meta", {}),
         })
     return out
 
@@ -565,6 +563,11 @@ class _Handler(BaseHTTPRequestHandler):
                 live = lifecycle.current()
                 st = {"has_map": g is not None,
                       "mode": map_ops.get_mode_impl().get("mode", ""),
+                      # Which SLAM engine is running decides what a saved map
+                      # means, so the page names it instead of leaving the
+                      # operator to guess from the deployment config.
+                      "engine": map_ops.active_algo(),
+                      "localizer": localizers.name(),
                       "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,

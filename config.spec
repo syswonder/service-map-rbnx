@@ -50,6 +50,16 @@ optional:
       Optional {min, max} particle counts for the localizer (defaults 500/2000).
       More particles converge from worse guesses and cost proportionally more.
 
+  slam_toolbox_params:
+    type: mapping[string, scalar]
+    description: >-
+      Scan-matching overrides for algo: slam_toolbox, the counterpart of
+      rtabmap_params. Keys: min_travel_m and min_heading_rad (how far the robot
+      moves before a new pose-graph node), scan_buffer (how many recent scans
+      are matched against each other) and loop_search_m (radius searched for a
+      loop closure). Defaults suit a slow indoor platform in a room-scale map:
+      0.1 m, 0.15 rad, 30 scans, 2.5 m. Unset keys keep those defaults.
+
   occupancy_sources:
     type: list[string]
     default: all resolved occupancy-capable inputs

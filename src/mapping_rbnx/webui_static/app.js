@@ -316,6 +316,8 @@ async function poll() {
     let s = await (await fetch("/api/state")).json();
     MI = s;
     if (s.mode) CURMODE = s.mode;
+    CURENGINE = s.engine || "";
+    CURLOCALIZER = s.localizer || "";
     CURMAP = s.map_id || "";
     applyMode();
     setStatus(
@@ -358,8 +360,8 @@ async function loadLib() {
     let d = document.createElement("div");
     d.className = "mapitem";
     d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small">${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
-   <button class="btn btn-sm btn-outline-light" onclick="doLoad('${x.map_id}')">Load</button>
+   <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small" title="${x.detail || ""}">${(x.db_size / 1e6).toFixed(1)} MB · ${x.engine || "?"}${x.has_db ? "" : " · no map data"}${x.loadable_here ? "" : " · other backend"}</div></div>
+   <button class="btn btn-sm btn-outline-light"${x.loadable_here ? "" : " disabled"} onclick="doLoad('${x.map_id}')">Load</button>
    <button class="btn btn-sm btn-outline-danger" onclick="doDelete('${x.map_id}')">Del</button>`;
     el.appendChild(d);
   }
@@ -547,6 +549,8 @@ async function doDelete(id) {
   }
 }
 let CURMODE = null,
+  CURENGINE = "",
+  CURLOCALIZER = "",
   CURMAP = "",
   RANGE = {},
   BUSY = false;
@@ -632,6 +636,14 @@ function applyMode() {
     lo = document.getElementById("btn-localization");
   let bdg = document.getElementById("modebadge");
   if (bdg) bdg.textContent = CURMODE ? "mode: " + CURMODE : "mode: —";
+  // Saved maps belong to the engine that built them, so the running backend is
+  // named on screen next to the mode; the localizer is appended when one is on.
+  let eb = document.getElementById("enginebadge");
+  if (eb)
+    eb.textContent =
+      "backend: " +
+      (CURENGINE || "—") +
+      (CURLOCALIZER && CURLOCALIZER != "none" ? " + " + CURLOCALIZER : "");
   let sw = document.getElementById("modeswitch");
   if (sw) sw.classList.toggle("loc", CURMODE == "localization");
   if (mp && lo) {

@@ -63,8 +63,9 @@ class LaunchFileTests(unittest.TestCase):
                                                     "launch", "localization_2d.launch.py")))
 
     def test_launch_declares_every_argument_the_module_passes(self):
-        src = open(os.path.join(os.path.dirname(__file__), "launch",
-                                "localization_2d.launch.py"), encoding="utf-8").read()
+        with open(os.path.join(os.path.dirname(__file__), "launch",
+                               "localization_2d.launch.py"), encoding="utf-8") as fh:
+            src = fh.read()
         for arg in ("localizer", "map_yaml", "scan_topic", "base_frame", "odom_frame",
                     "global_frame", "use_sim_time", "min_particles", "max_particles"):
             self.assertIn(f'DeclareLaunchArgument("{arg}"', src, f"{arg} is passed but not declared")
@@ -90,6 +91,115 @@ class EngineRegistryTests(unittest.TestCase):
         from mapping_rbnx import engines
         self.assertIsNone(engines.engine_for("dlio"))
         self.assertEqual(engines.graph_files_for("dlio"), ())
+
+class MapPersistenceTests(unittest.TestCase):
+    """Backend tagging: a saved map names its engine, and a map from another
+    engine is refused by name instead of failing inside the load."""
+
+    def setUp(self):
+        import tempfile
+        from mapping_rbnx import map_ops
+        self.map_ops = map_ops
+        self.tmp = tempfile.mkdtemp()
+        self._saved_maps_dir = map_ops.MAPS_DIR
+        map_ops.MAPS_DIR = self.tmp
+        self._saved_algo = os.environ.get("MAPPING_ALGO")
+
+    def tearDown(self):
+        import shutil
+        self.map_ops.MAPS_DIR = self._saved_maps_dir
+        if self._saved_algo is None:
+            os.environ.pop("MAPPING_ALGO", None)
+        else:
+            os.environ["MAPPING_ALGO"] = self._saved_algo
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _map(self, name, files, meta=""):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d, exist_ok=True)
+        for f in files:
+            with open(os.path.join(d, f), "wb") as fh:
+                fh.write(b"x" * 16)
+        if meta:
+            with open(os.path.join(d, "meta.yaml"), "w", encoding="utf-8") as fh:
+                fh.write(meta)
+        return d
+
+    def test_meta_records_the_engine_and_keeps_the_other_fields(self):
+        d = self._map("m", (), "map_id: m\nnote: hallway\n")
+        self.map_ops._write_meta_fields(d, {"engine": "slam_toolbox"})
+        meta = self.map_ops.read_meta(d)
+        self.assertEqual(meta["engine"], "slam_toolbox")
+        self.assertEqual((meta["map_id"], meta["note"]), ("m", "hallway"))
+
+    def test_maps_saved_before_the_field_existed_read_as_rtabmap(self):
+        d = self._map("old", ("rtabmap.db",), "map_id: old\n")
+        self.assertEqual(self.map_ops.map_engine(d), "rtabmap")
+        self.assertEqual(self.map_ops.map_engine(self._map("empty", ())), "")
+
+    def test_load_refuses_a_map_built_by_another_engine(self):
+        self._map("stmap", ("posegraph.posegraph", "posegraph.data"),
+                  "map_id: stmap\nengine: slam_toolbox\n")
+        os.environ["MAPPING_ALGO"] = "rtabmap"
+        out = self.map_ops.load_map_impl("stmap")
+        self.assertFalse(out["ok"])
+        self.assertIn("slam_toolbox", out["detail"])
+        self.assertIn("rtabmap", out["detail"])
+
+    def test_listing_names_the_engine_and_which_maps_load_here(self):
+        self._map("stmap", ("posegraph.posegraph", "posegraph.data"),
+                  "map_id: stmap\nengine: slam_toolbox\n")
+        self._map("rtmap", ("rtabmap.db",), "map_id: rtmap\nengine: rtabmap\n")
+        os.environ["MAPPING_ALGO"] = "slam_toolbox"
+        import json
+        rows = {r["map_id"]: r for r in json.loads(self.map_ops.list_maps_impl()["maps_json"])}
+        self.assertEqual(rows["stmap"]["engine"], "slam_toolbox")
+        self.assertTrue(rows["stmap"]["loadable_here"])
+        self.assertEqual(rows["stmap"]["artifact_size"], 32)   # both graph files
+        self.assertFalse(rows["rtmap"]["loadable_here"])
+        self.assertIn("this deployment runs slam_toolbox", rows["rtmap"]["artifact_detail"])
+
+    def test_missing_graph_file_is_not_advertised_as_loadable(self):
+        self._map("half", ("posegraph.posegraph",), "map_id: half\nengine: slam_toolbox\n")
+        os.environ["MAPPING_ALGO"] = "slam_toolbox"
+        import json
+        row = json.loads(self.map_ops.list_maps_impl()["maps_json"])[0]
+        self.assertFalse(row["has_spatial_artifact"])
+        self.assertFalse(row["loadable_here"])
+
+
+class SlamToolboxParamTests(unittest.TestCase):
+    """A mistyped scan-matching knob must fail at init, not at map time."""
+
+    def setUp(self):
+        from mapping_rbnx import profiles
+        self.bridge = profiles
+
+    def test_unset_params_keep_the_launch_defaults(self):
+        self.assertEqual(self.bridge.resolve_slam_toolbox_overrides(None), {})
+        self.assertEqual(self.bridge.resolve_slam_toolbox_overrides({}), {})
+
+    def test_known_keys_reach_the_resolved_file(self):
+        out = self.bridge.resolve_slam_toolbox_overrides({"min_travel_m": 0.15, "scan_buffer": 40})
+        self.assertEqual(out, {"slam_toolbox_min_travel_m": "0.15",
+                               "slam_toolbox_scan_buffer": "40.0"})
+
+    def test_typo_and_bad_values_are_refused_by_name(self):
+        for bad, expect in (({"min_travel": 0.1}, "unknown slam_toolbox_params"),
+                            ({"scan_buffer": "many"}, "is not a number"),
+                            ({"min_travel_m": 0}, "must be positive"),
+                            ([("min_travel_m", 1)], "must be a mapping")):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.bridge.resolve_slam_toolbox_overrides(bad)
+            self.assertIn(expect, str(ctx.exception))
+
+    def test_start_engine_forwards_every_key_the_bridge_writes(self):
+        with open(os.path.join(os.path.dirname(__file__), "scripts", "start_engine.sh"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        for key in self.bridge.SLAM_TOOLBOX_KEYS.values():
+            self.assertIn(key, src, f"{key} is written but start_engine.sh never reads it")
+
 
 if __name__ == "__main__":
     unittest.main()

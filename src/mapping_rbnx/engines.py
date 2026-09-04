@@ -40,8 +40,10 @@ class EngineOps(Protocol):
     def snapshot(self, node, staging_dir: str, timeout_s: float) -> tuple[bool, str]:
         """Write the live graph into `staging_dir` (engine artifact names)."""
 
-    def activate(self, node, map_dir: str, map_id: str, timeout_s: float) -> tuple[bool, str]:
-        """Put the saved graph back and switch to localization."""
+    def activate(self, node, map_dir: str, map_id: str, timeout_s: float,
+                 pose: Optional[tuple[float, float, float]] = None) -> tuple[bool, str]:
+        """Put the saved graph back and switch to localization, at `pose` when
+        one is given and at the graph's first node otherwise."""
 
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Discard the live graph and start a fresh mapping session."""

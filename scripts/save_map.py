@@ -38,7 +38,10 @@ from nav_msgs.msg import OccupancyGrid
 # what consumers see; the engine-native ones (/map, /rtabmap/cloud_map) are
 # what rtabmap actually publishes inside the container.
 OCC_TOPICS = ["/map", "/robonix/map/occupancy_grid"]
-CLOUD_TOPICS = ["/rtabmap/cloud_map", "/robonix/map/cloud_accumulated"]
+CLOUD_TOPICS = ["/rtabmap/cloud_map", "/robonix/map/cloud_accumulated",
+                # slam_toolbox has no cloud of its own; the scan adapter
+                # publishes the accumulated one under the contract topic.
+                "/robonix/map/cloud"]
 
 
 def write_pcd(path, xyz):

@@ -17,7 +17,7 @@ arguments; `start_engine.sh` fills them from the resolved contract topics.
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -60,15 +60,28 @@ def _launch_setup(context, *args, **kwargs):
         "minimum_time_interval": 0.2,
         "stack_size_to_use": 40000000,
     }
+    sim_time = "true" if use_sim_time else "false"
+    # The two adapters are standalone scripts under scripts/, not ros2
+    # entrypoints registered in a setup.py, so they are run the same way
+    # rtabmap_2d.launch.py runs tf_to_pose: ExecuteProcess with python3.
     return [
         Node(package="slam_toolbox", executable="async_slam_toolbox_node",
              name="slam_toolbox", output="screen", parameters=[slam_params]),
-        Node(executable=os.path.join(_PKG_DIR, "scripts", "tf_to_pose.py"),
-             name="tf_to_pose", output="screen", parameters=[common]),
-        Node(executable=os.path.join(_PKG_DIR, "scripts", "scan_to_map_outputs.py"),
-             name="scan_to_map_outputs", output="screen", parameters=[common],
-             arguments=["--scan-topic", scan_topic, "--map-frame", map_frame,
-                        "--base-frame", base_frame]),
+        ExecuteProcess(
+            cmd=["python3", os.path.join(_PKG_DIR, "scripts", "tf_to_pose.py"),
+                 "--ros-args",
+                 "-p", f"use_sim_time:={sim_time}",
+                 "-p", f"map_frame:={map_frame}",
+                 "-p", f"base_frame:={base_frame}",
+                 "-p", "publish_rate_hz:=10.0",
+                 "-p", "topic:=/robonix/map/pose"],
+            name="tf_to_pose", output="screen"),
+        ExecuteProcess(
+            cmd=["python3", os.path.join(_PKG_DIR, "scripts", "scan_to_map_outputs.py"),
+                 "--scan-topic", scan_topic, "--map-frame", map_frame,
+                 "--base-frame", base_frame,
+                 "--ros-args", "-p", f"use_sim_time:={sim_time}"],
+            name="scan_to_map_outputs", output="screen"),
     ]
 
 

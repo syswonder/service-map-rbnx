@@ -59,6 +59,10 @@ def _launch_setup(context, *args, **kwargs):
         # room, so the defaults here are the deployment's and can be overridden
         # per robot from the resolved contract (see start_engine.sh).
         "minimum_travel_distance": travel_distance,
+        # Turning in place does not move the robot, so the distance trigger adds
+        # no nodes through a turn and the heading trigger is the only one that
+        # does; it is the parameter that decides yaw error on a robot that
+        # pivots as much as it drives.
         "minimum_travel_heading": travel_heading,
         # The buffer is a sliding window of scans matched against each other:
         # scan_buffer_size * minimum_travel_distance is the distance it spans,
@@ -120,7 +124,7 @@ def generate_launch_description() -> LaunchDescription:
         # Sized for a slow indoor platform in a room-scale map; start_engine.sh
         # overrides them from the resolved contract when a deployment sets them.
         DeclareLaunchArgument("minimum_travel_distance", default_value="0.1"),
-        DeclareLaunchArgument("minimum_travel_heading", default_value="0.15"),
+        DeclareLaunchArgument("minimum_travel_heading", default_value="0.1"),
         DeclareLaunchArgument("scan_buffer_size", default_value="30"),
         DeclareLaunchArgument("loop_search_maximum_distance", default_value="2.5"),
         OpaqueFunction(function=_launch_setup),

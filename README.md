@@ -40,7 +40,7 @@ a slow indoor platform in a room-scale map; an unknown key fails at init.
 | key | default | what it does |
 |---|---|---|
 | `min_travel_m` | `0.1` | distance before a new pose-graph node |
-| `min_heading_rad` | `0.15` | rotation before a new pose-graph node |
+| `min_heading_rad` | `0.1` | rotation before a new pose-graph node |
 | `scan_buffer` | `30` | recent scans matched against each other (`scan_buffer x min_travel_m` should stay near the room scale) |
 | `loop_search_m` | `2.5` | radius searched for a loop closure |
 

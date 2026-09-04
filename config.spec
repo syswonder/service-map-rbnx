@@ -58,7 +58,7 @@ optional:
       moves before a new pose-graph node), scan_buffer (how many recent scans
       are matched against each other) and loop_search_m (radius searched for a
       loop closure). Defaults suit a slow indoor platform in a room-scale map:
-      0.1 m, 0.15 rad, 30 scans, 2.5 m. Unset keys keep those defaults.
+      0.1 m, 0.1 rad, 30 scans, 2.5 m. Unset keys keep those defaults.
 
   occupancy_sources:
     type: list[string]

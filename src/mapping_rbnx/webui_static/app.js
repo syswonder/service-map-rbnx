@@ -361,7 +361,7 @@ async function loadLib() {
     d.className = "mapitem";
     d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
    <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small" title="${x.detail || ""}">${(x.db_size / 1e6).toFixed(1)} MB · ${x.engine || "?"}${x.has_db ? "" : " · no map data"}${x.loadable_here ? "" : " · other backend"}</div></div>
-   <button class="btn btn-sm btn-outline-light"${x.loadable_here ? "" : " disabled"} onclick="doLoad('${x.map_id}')">Load</button>
+   <button class="btn btn-sm btn-outline-light"${x.loadable_here ? "" : ` disabled title="${x.detail || "cannot be loaded here"}"`} onclick="doLoad('${x.map_id}')">Load</button>
    <button class="btn btn-sm btn-outline-danger" onclick="doDelete('${x.map_id}')">Del</button>`;
     el.appendChild(d);
   }

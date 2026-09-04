@@ -29,7 +29,7 @@ import time
 
 import logging
 
-from mapping_rbnx import lifecycle
+from mapping_rbnx import engines, lifecycle, localizers
 
 log = logging.getLogger("mapping_rbnx.map_ops")
 
@@ -419,6 +419,37 @@ def load_map_impl(map_id: str, mode: str = "localization",
         started = time.monotonic()
         log.info("load_map[%s] stage=prepare source=%s requested_mode=%s", map_id,
                  db_path, requested_mode)
+        # Particle-filter localization on the saved occupancy grid, when the
+        # deployment asked for it: it is the path that can relocalize with no
+        # prior pose, so `load_map` without a pose stops meaning "hope the scan
+        # matcher converges from wherever the robot thinks it is".
+        if localizers.enabled():
+            ok_l, detail_l = localizers.start(os.path.dirname(db_path), map_id)
+            if not ok_l:
+                return {"ok": False, "detail": f"localizer failed to start: {detail_l}"}
+            ready, detail_r = localizers.wait_ready(node)
+            if not ready:
+                localizers.stop()
+                return {"ok": False, "detail": f"localizer did not come up: {detail_r}"}
+            lifecycle.set_mode("localization")
+            if has_initial_pose:
+                seed = pose_estimate_impl(x, y, theta)
+                seed_detail = seed.get("detail", "")
+            else:
+                ok_g, seed_detail = localizers.global_localize(node)
+                if not ok_g:
+                    localizers.stop()
+                    return {"ok": False, "detail": f"global localization failed: {seed_detail}"}
+            # A saved map's frame is the artifact's own, not the previous live
+            # session's: consumers holding map-frame coordinates must be told.
+            lifecycle.mark_reset("localization")
+            return {
+                "ok": True,
+                "detail": f"{detail_l}; {seed_detail}",
+                "map_id": map_id,
+                "mode": "localization",
+                "localizer": localizers.name(),
+            }
         runtime_db = _runtime_db_copy(db_path, map_id)
 
         # RTAB-Map only restores the saved 2D occupancy grid when the database
@@ -504,6 +535,27 @@ def load_map_impl(map_id: str, mode: str = "localization",
 # database RTAB-Map is actually writing.
 _active_db: str = ""
 _finalized: bool = False
+
+
+def active_algo() -> str:
+    """The engine this process is running, as `atlas_bridge` recorded it.
+
+    `MAPPING_ALGO` is set in-process at init; `/tmp/mapping_algo` is the copy
+    `start_engine.sh` reads, and is used here as the fallback so a map operation
+    issued from a helper process still routes to the right engine.
+    """
+    algo = (os.environ.get("MAPPING_ALGO") or "").strip().lower()
+    if not algo:
+        try:
+            algo = open("/tmp/mapping_algo", encoding="utf-8").read().strip().lower()
+        except OSError:
+            algo = ""
+    return algo or "rtabmap"
+
+
+def _engine():
+    """Map operations for the running engine, or None when it has none."""
+    return engines.engine_for(active_algo())
 
 
 def set_active_db(path: str) -> None:

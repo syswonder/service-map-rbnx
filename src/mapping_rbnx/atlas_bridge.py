@@ -70,6 +70,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
     GetPose_Response as McpGetPoseResp,
 )
 from mapping_rbnx import lifecycle  # noqa: E402
+from mapping_rbnx import localizers  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
@@ -569,6 +570,23 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     resolved.update(persist)
+
+    # Localization engine used by load_map (see localizers.py). Configured once
+    # the sensor topics are resolved, because the particle filter subscribes to
+    # the same scan the SLAM engine does. A bad name raises here, at init.
+    particles = cfg.get("localizer_particles") or {}
+    localizer_name = localizers.configure({
+        "localizer": cfg.get("localizer"),
+        "scan_topic": resolved.get("scan_topic"),
+        "base_frame": cfg.get("base_frame") or "base_link",
+        "odom_frame": cfg.get("odom_frame") or "odom",
+        "use_sim_time": bool(cfg.get("use_sim_time", False)),
+        "min_particles": particles.get("min"),
+        "max_particles": particles.get("max"),
+    })
+    if localizer_name != "none":
+        log.info("[mapping] localizer=%s on scan=%s (load_map without a pose will "
+                 "request global localization)", localizer_name, resolved.get("scan_topic"))
     if algo == "rtabmap":
         try:
             overrides_path = _write_rtabmap_overrides(cfg, resolved)

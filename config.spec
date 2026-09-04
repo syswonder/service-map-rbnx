@@ -29,6 +29,24 @@ optional:
     allowed: [rtabmap, dlio, fastlio2]
     description: Mapping engine. fastlio2 is retained only for diagnostics.
 
+  localizer:
+    type: string
+    default: none
+    allowed: [none, amcl, beluga]
+    description: >-
+      Localization engine used by load_map on a saved map. `none` keeps the SLAM
+      engine's own localization (needs a pose seed close enough to converge).
+      `amcl` (nav2) and `beluga` (beluga_amcl, interface-compatible) run a
+      particle filter over the saved occupancy grid and can relocalize with no
+      prior pose at all — load_map without an initial pose then triggers global
+      localization instead of guessing. CPU only, a few tens of MB.
+
+  localizer_particles:
+    type: mapping[string, scalar]
+    description: >-
+      Optional {min, max} particle counts for the localizer (defaults 500/2000).
+      More particles converge from worse guesses and cost proportionally more.
+
   occupancy_sources:
     type: list[string]
     default: all resolved occupancy-capable inputs

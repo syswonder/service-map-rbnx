@@ -22,6 +22,31 @@ SLAM engine.
 | `dlio` | real-robot 3D Livox + IMU | lidar3d + imu, needs a colcon ws at `/ws/install` |
 | `fastlio2` | **broken (drift)** — repro only | — |
 
+## Localization engines (`localizer`)
+
+Building a map and localizing in a saved one are separate jobs, and the second
+one is where "click 2D Pose Estimate, then click again" comes from: a scan
+matcher can only refine a guess it is already given. A particle filter over the
+saved occupancy grid can start from no guess at all.
+
+| localizer | what `load_map` does | cost |
+|---|---|---|
+| `none` *(default)* | the SLAM engine localizes in its own map; a pose seed is effectively required | engine-dependent |
+| `amcl` | `map_server` serves the saved grid, `nav2_amcl` owns `map → odom`; **no initial pose → global localization** (particles over the whole map) | CPU only, tens of MB |
+| `beluga` | same interfaces via `beluga_amcl` (drop-in), plus NDT variants | same |
+
+```yaml
+service:
+  - name: mapping
+    config:
+      algo: rtabmap          # unchanged: mapping still runs on the SLAM engine
+      localizer: amcl        # localization on saved maps, global relocalization
+      localizer_particles: {min: 500, max: 2000}
+```
+
+`pose_estimate` still seeds `/initialpose` when you do have a guess; the
+difference is that you no longer need one.
+
 The launch branches on the provider roles bound by the deployment, so the same
 service supports 2D lidar, 3D lidar, RGB-D, and external odometry without
 robot-specific branches.

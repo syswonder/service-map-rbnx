@@ -487,6 +487,10 @@ def _localization_state() -> dict:
     """
     if not localizers.enabled():
         return {"state": "off"}
+    # Configured is not running: in mapping mode the SLAM engine owns the pose
+    # and the particle filter is not up, so there is nothing to wait for.
+    if map_ops.get_mode_impl().get("mode", "") != "localization":
+        return {"state": "off"}
     msg = _latest.get("localizer_pose")
     if msg is None:
         return {"state": "waiting", "localizer": localizers.name()}

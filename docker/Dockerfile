@@ -8,7 +8,9 @@
 #
 # Algorithms shipped (selected via manifest config.algo):
 #   rtabmap   — default. 2D lidar + RGBD fusion. Fully apt-installable
-#               (ros-humble-rtabmap-ros), no extra colcon build.
+#               (ros-humble-rtabmap-ros), no extra colcon build. nav2's
+#               amcl + map_server provide localization on a saved grid,
+#               including global relocalization with no prior pose.
 #   dlio      — Direct LiDAR-Inertial Odometry. Real-robot 3D Livox
 #               path; expects the dlio package mounted at /ws/install
 #               (separate slam_alt_ws colcon build), so this image
@@ -63,6 +65,10 @@ RUN apt-get update \
         ros-humble-pointcloud-to-laserscan \
         ros-humble-rmw-cyclonedds-cpp \
         ros-humble-rmw-zenoh-cpp \
+        ros-humble-slam-toolbox \
+        ros-humble-nav2-amcl \
+        ros-humble-nav2-map-server \
+        ros-humble-nav2-lifecycle-manager \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

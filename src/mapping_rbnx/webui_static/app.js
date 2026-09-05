@@ -316,6 +316,9 @@ async function poll() {
     let s = await (await fetch("/api/state")).json();
     MI = s;
     if (s.mode) CURMODE = s.mode;
+    CURENGINE = s.engine || "";
+    CURLOCALIZER = s.localizer || "";
+    CURLOC = s.localization || null;
     CURMAP = s.map_id || "";
     applyMode();
     setStatus(
@@ -358,8 +361,8 @@ async function loadLib() {
     let d = document.createElement("div");
     d.className = "mapitem";
     d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small">${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
-   <button class="btn btn-sm btn-outline-light" onclick="doLoad('${x.map_id}')">Load</button>
+   <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small" title="${x.detail || ""}">${(x.db_size / 1e6).toFixed(1)} MB · ${x.engine || "?"}${x.has_db ? "" : " · no map data"}${x.loadable_here ? "" : " · other backend"}</div></div>
+   <button class="btn btn-sm btn-outline-light"${x.loadable_here ? "" : ` disabled title="${x.detail || "cannot be loaded here"}"`} onclick="doLoad('${x.map_id}')">Load</button>
    <button class="btn btn-sm btn-outline-danger" onclick="doDelete('${x.map_id}')">Del</button>`;
     el.appendChild(d);
   }
@@ -450,6 +453,9 @@ async function doLoad(id) {
       ).json(),
   );
   if (r) setStatus(r.detail || "loaded");
+  if (r && r.ok && /global localization/i.test(r.detail || "")) {
+    setStatus("relocalizing — particles scattered over the map; drive to converge");
+  }
 }
 async function doSwitch(mode) {
   // Switching a running RTAB-Map from localization to mapping is the one
@@ -547,6 +553,9 @@ async function doDelete(id) {
   }
 }
 let CURMODE = null,
+  CURENGINE = "",
+  CURLOC = null,
+  CURLOCALIZER = "",
   CURMAP = "",
   RANGE = {},
   BUSY = false;
@@ -632,6 +641,40 @@ function applyMode() {
     lo = document.getElementById("btn-localization");
   let bdg = document.getElementById("modebadge");
   if (bdg) bdg.textContent = CURMODE ? "mode: " + CURMODE : "mode: —";
+  // Saved maps belong to the engine that built them, so the running backend is
+  // named on screen next to the mode; the localizer is appended when one is on.
+  // Relocalization is the one thing on this page that is in flight rather than
+  // simply true or false: after a load with no pose the filter is spread over
+  // the whole map and the arrow is a guess. Say so, and show the spread
+  // shrinking, instead of leaving the operator to wonder.
+  let lb = document.getElementById("locbadge");
+  if (lb) {
+    let st = (CURLOC || {}).state || "off";
+    lb.classList.toggle("d-none", st == "off");
+    lb.classList.toggle("loc-converging", st == "converging" || st == "waiting");
+    lb.classList.toggle("loc-converged", st == "converged");
+    if (st == "waiting") {
+      lb.textContent = "relocalizing — waiting for the filter";
+      lb.title = "The localizer has been asked to relocalize but has not published an estimate yet.";
+    } else if (st == "converging") {
+      lb.textContent = "relocalizing… ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title =
+        "Particles are still spread over the map (position ±" +
+        (CURLOC.position_stddev_m ?? 0).toFixed(2) +
+        " m, heading ±" +
+        (((CURLOC.yaw_stddev_rad ?? 0) * 180) / Math.PI).toFixed(0) +
+        "°). Drive the robot to help it converge — the pose shown is not settled yet.";
+    } else if (st == "converged") {
+      lb.textContent = "localized ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title = "The particle filter has converged; the pose shown is the filter's estimate.";
+    }
+  }
+  let eb = document.getElementById("enginebadge");
+  if (eb)
+    eb.textContent =
+      "backend: " +
+      (CURENGINE || "—") +
+      (CURLOCALIZER && CURLOCALIZER != "none" ? " + " + CURLOCALIZER : "");
   let sw = document.getElementById("modeswitch");
   if (sw) sw.classList.toggle("loc", CURMODE == "localization");
   if (mp && lo) {

@@ -177,3 +177,43 @@ def resolve_rtabmap_overrides(
     normalized.update(load_deployment_params_file(params_file))
     normalized.update(validate_scalar_params(raw, "rtabmap_params"))
     return normalized
+
+
+# The scan-matching settings a deployment may override, and the resolved-file
+# key each one is written under. Anything else under `slam_toolbox_params` is a
+# typo and is refused at init rather than silently ignored.
+SLAM_TOOLBOX_KEYS = {
+    "min_travel_m": "slam_toolbox_min_travel_m",
+    "min_heading_rad": "slam_toolbox_min_heading_rad",
+    "scan_buffer": "slam_toolbox_scan_buffer",
+    "loop_search_m": "slam_toolbox_loop_search_m",
+}
+
+
+def resolve_slam_toolbox_overrides(raw: object | None) -> dict[str, str]:
+    """Validate `slam_toolbox_params` and return the resolved-file entries.
+
+    Raises RuntimeError on a non-mapping value, an unknown key, or a
+    non-numeric one, so a mistyped knob fails at init instead of producing a
+    map that is quietly built with the default.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise RuntimeError("slam_toolbox_params must be a mapping of "
+                           f"{sorted(SLAM_TOOLBOX_KEYS)} to numbers")
+    unknown = sorted(set(raw) - set(SLAM_TOOLBOX_KEYS))
+    if unknown:
+        raise RuntimeError(f"unknown slam_toolbox_params key(s) {unknown}; "
+                           f"known: {sorted(SLAM_TOOLBOX_KEYS)}")
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"slam_toolbox_params.{key}={value!r} is not a number") from None
+        if number <= 0:
+            raise RuntimeError(f"slam_toolbox_params.{key} must be positive, got {number}")
+        out[SLAM_TOOLBOX_KEYS[key]] = str(number)
+    return out

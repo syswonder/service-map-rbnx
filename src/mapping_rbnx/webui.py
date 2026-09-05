@@ -31,7 +31,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import lifecycle, map_ops
+from . import lifecycle, localizers, map_ops
 
 log = logging.getLogger("mapping_rbnx.webui")
 
@@ -45,7 +45,8 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 # own node. "scan" and "cloud" hold points already projected into the map
 # frame, so the page can draw them straight onto the occupancy canvas and an
 # operator can see whether the live returns line up with the saved map.
-_latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
+_latest = {"grid": None, "pose": None, "scan": None, "cloud": None,
+           "localizer_pose": None, "localizer_pose_at": 0.0}
 # Topics for the range sensors, resolved through Atlas by the bridge and
 # injected with set_sensor_topics(). Empty means the deployment has no such
 # capability bound, and the page simply has nothing to draw.
@@ -180,9 +181,18 @@ def _ensure_subscriptions() -> None:
             def _on_pose(msg):
                 _latest["pose"] = msg
 
+            def _on_localizer_pose(msg):
+                # The particle filter's own estimate, kept for its covariance:
+                # that is what says whether it has converged yet.
+                _latest["localizer_pose"] = msg
+                _latest["localizer_pose_at"] = time.time()
+
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
             node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+            if localizers.enabled():
+                node.create_subscription(PoseWithCovarianceStamped, localizers.POSE_TOPIC,
+                                         _on_localizer_pose, 10)
             _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
@@ -466,32 +476,58 @@ def _grid_to_png(grid, pose=None) -> bytes:
     return buf.getvalue()
 
 
+def _localization_state() -> dict:
+    """How the particle filter is doing, for the page to say so.
+
+    `off` when no localizer is configured, `waiting` when one is running but has
+    not published an estimate yet (it has just been asked to relocalize), then
+    `converging` while the particle cloud is still spread out and `converged`
+    once it is tight enough to act on. The spread is reported too, so the page
+    can show it shrinking rather than just flipping between two words.
+    """
+    if not localizers.enabled():
+        return {"state": "off"}
+    # Configured is not running: in mapping mode the SLAM engine owns the pose
+    # and the particle filter is not up, so there is nothing to wait for.
+    if map_ops.get_mode_impl().get("mode", "") != "localization":
+        return {"state": "off"}
+    msg = _latest.get("localizer_pose")
+    if msg is None:
+        return {"state": "waiting", "localizer": localizers.name()}
+    position_stddev, yaw_stddev = localizers.spread(msg)
+    return {
+        "state": localizers.convergence_state(position_stddev, yaw_stddev),
+        "localizer": localizers.name(),
+        "position_stddev_m": round(position_stddev, 3),
+        "yaw_stddev_rad": round(yaw_stddev, 3),
+        "age_s": round(time.time() - float(_latest.get("localizer_pose_at") or 0.0), 1),
+    }
+
+
 def _list_saved_maps() -> list[dict]:
+    """Library rows for the page, taken from the capability's own listing.
+
+    `map_ops.list_maps_impl` already knows which engine wrote each map and which
+    files are that engine's graph, so the page reads the same rows every other
+    consumer does instead of re-deriving them from `rtabmap.db`. The `has_db` /
+    `db_size` key names stay as they were so the page's rendering is unchanged.
+    """
     out = []
-    if not os.path.isdir(MAPS_DIR):
+    res = map_ops.list_maps_impl()
+    if not res.get("ok"):
+        log.warning("map library listing failed: %s", res.get("detail", ""))
         return out
-    for name in sorted(os.listdir(MAPS_DIR)):
-        d = os.path.join(MAPS_DIR, name)
-        if not os.path.isdir(d):
-            continue
-        db = os.path.join(d, "rtabmap.db")
-        meta = {}
-        mp = os.path.join(d, "meta.yaml")
-        if os.path.isfile(mp):
-            try:
-                for line in open(mp):
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        meta[k.strip()] = v.strip()
-            except Exception:  # noqa: BLE001
-                pass
+    for row in json.loads(res.get("maps_json") or "[]"):
         out.append({
-            "map_id": name,
-            "has_db": os.path.isfile(db),
-            "has_preview": os.path.isfile(os.path.join(d, "occupancy.png")),
-            "db_size": os.path.getsize(db) if os.path.isfile(db) else 0,
-            "updated": int(os.path.getmtime(db)) if os.path.isfile(db) else 0,
-            "meta": meta,
+            "map_id": row["map_id"],
+            "engine": row.get("engine", ""),
+            "loadable_here": bool(row.get("loadable_here", True)),
+            "detail": row.get("artifact_detail", ""),
+            "has_db": bool(row.get("has_spatial_artifact")),
+            "has_preview": bool(row.get("has_preview")),
+            "db_size": int(row.get("artifact_size", 0)),
+            "updated": int(row.get("updated", 0)),
+            "meta": row.get("meta", {}),
         })
     return out
 
@@ -565,6 +601,12 @@ class _Handler(BaseHTTPRequestHandler):
                 live = lifecycle.current()
                 st = {"has_map": g is not None,
                       "mode": map_ops.get_mode_impl().get("mode", ""),
+                      # Which SLAM engine is running decides what a saved map
+                      # means, so the page names it instead of leaving the
+                      # operator to guess from the deployment config.
+                      "engine": map_ops.active_algo(),
+                      "localizer": localizers.name(),
+                      "localization": _localization_state(),
                       "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,

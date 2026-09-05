@@ -74,11 +74,24 @@ class MapFrameOwnershipTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("localization mode", detail)
 
-    def test_slam_toolbox_reports_a_missing_pause_service_rather_than_pretending(self):
+    def test_no_slam_toolbox_process_means_the_frame_is_already_free(self):
         from mapping_rbnx import engines
-        ok, detail = engines.engine_for("slam_toolbox").yield_map_frame(None, 0.1)
-        self.assertFalse(ok)                      # no ROS here: the import fails
-        self.assertIn("slam_toolbox", detail)
+        ok, detail = engines.engine_for("slam_toolbox").yield_map_frame(None, 1.0)
+        self.assertTrue(ok)                       # nothing is running here
+        self.assertIn("was not running", detail)
+
+    def test_a_process_that_will_not_die_is_reported_rather_than_assumed_gone(self):
+        from unittest import mock
+        from mapping_rbnx import engines
+        ops = engines.engine_for("slam_toolbox")
+        found = mock.Mock(stdout="4242\n")
+        with mock.patch("subprocess.run", return_value=found), \
+             mock.patch("os.kill"), \
+             mock.patch.object(engines, "_pid_alive", return_value=True):
+            ok, detail = ops.yield_map_frame(None, 1.0)
+        self.assertFalse(ok)
+        self.assertIn("4242", detail)
+        self.assertIn("fight", detail)
 
 
 class ConvergenceTests(unittest.TestCase):

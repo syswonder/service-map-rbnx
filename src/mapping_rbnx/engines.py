@@ -52,6 +52,17 @@ class EngineOps(Protocol):
         """Stop publishing `map -> odom` so a localizer can own it."""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is the process still there? (signal 0 tests without delivering.)"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _call_service(node, srv_type, name: str, request, timeout_s: float):
     """Call a ROS service, returning (ok, response_or_detail). Kept local so
     this module does not import map_ops (which imports this one)."""
@@ -159,15 +170,37 @@ class SlamToolboxOps:
         graph updates (`pause_new_measurements`) so it stops emitting the
         transform.
         """
+        import signal
+        import subprocess
+        # `pause_new_measurements` stops it consuming scans but it keeps
+        # publishing the transform on `transform_publish_period`, and there is
+        # no service or parameter to stop that — so the node has to go. Its pose
+        # graph is already on disk (load_map serialized it before this point),
+        # and the localizer is about to own the frame. Returning to mapping mode
+        # needs the mapping service restarted, which `switch_mode` says.
+        node_name = "async_slam" + "_toolbox_node"   # split: a pgrep of our own cmdline must not match
         try:
-            from slam_toolbox.srv import Pause
-        except Exception as e:  # noqa: BLE001
-            return False, f"slam_toolbox Pause service type unavailable ({e})"
-        ok, resp = _call_service(node, Pause, self._srv("pause_new_measurements"),
-                                 Pause.Request(), timeout_s)
-        if not ok:
-            return False, str(resp)
-        return True, "slam_toolbox paused; the localizer owns map -> odom"
+            found = subprocess.run(["pgrep", "-f", node_name], capture_output=True, text=True)
+        except OSError as e:
+            return False, f"cannot look for the slam_toolbox process: {e}"
+        pids = [int(x) for x in found.stdout.split() if x.isdigit()]
+        if not pids:
+            return True, "slam_toolbox was not running; the localizer owns map -> odom"
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError as e:
+                return False, f"cannot stop slam_toolbox (pid {pid}): {e}"
+        deadline = time.monotonic() + max(5.0, timeout_s / 4.0)
+        while time.monotonic() < deadline:
+            alive = [p for p in pids if _pid_alive(p)]
+            if not alive:
+                return True, ("slam_toolbox stopped; the localizer owns map -> odom "
+                              "(restart the mapping service to map again)")
+            time.sleep(0.2)
+        return False, f"slam_toolbox (pid {pids}) did not exit; two publishers would fight over map -> odom"
 
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Clear the live graph. `Reset` exists from slam_toolbox 2.6; older

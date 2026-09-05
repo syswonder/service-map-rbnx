@@ -787,6 +787,14 @@ def switch_mode_impl(mode: str) -> dict:
     node = _get_node()
     if node is None:
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
+    # Engines other than RTAB-Map have no in-place mode switch: load_map stopped
+    # the SLAM node so the localizer could own map -> odom, and there is nothing
+    # left to flip back. Say so instead of reporting a missing service.
+    algo = active_algo()
+    if algo != "rtabmap":
+        return {"ok": False,
+                "detail": f"{algo} has no in-place mode switch; restart the mapping "
+                          f"service (map_mode: {mode}) to change mode"}
     try:
         ok, info = _set_mode(node, mode)
         if not ok:

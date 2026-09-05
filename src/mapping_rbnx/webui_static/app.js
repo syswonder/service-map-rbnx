@@ -318,6 +318,7 @@ async function poll() {
     if (s.mode) CURMODE = s.mode;
     CURENGINE = s.engine || "";
     CURLOCALIZER = s.localizer || "";
+    CURLOC = s.localization || null;
     CURMAP = s.map_id || "";
     applyMode();
     setStatus(
@@ -452,6 +453,9 @@ async function doLoad(id) {
       ).json(),
   );
   if (r) setStatus(r.detail || "loaded");
+  if (r && r.ok && /global localization/i.test(r.detail || "")) {
+    setStatus("relocalizing — particles scattered over the map; drive to converge");
+  }
 }
 async function doSwitch(mode) {
   // Switching a running RTAB-Map from localization to mapping is the one
@@ -550,6 +554,7 @@ async function doDelete(id) {
 }
 let CURMODE = null,
   CURENGINE = "",
+  CURLOC = null,
   CURLOCALIZER = "",
   CURMAP = "",
   RANGE = {},
@@ -638,6 +643,32 @@ function applyMode() {
   if (bdg) bdg.textContent = CURMODE ? "mode: " + CURMODE : "mode: —";
   // Saved maps belong to the engine that built them, so the running backend is
   // named on screen next to the mode; the localizer is appended when one is on.
+  // Relocalization is the one thing on this page that is in flight rather than
+  // simply true or false: after a load with no pose the filter is spread over
+  // the whole map and the arrow is a guess. Say so, and show the spread
+  // shrinking, instead of leaving the operator to wonder.
+  let lb = document.getElementById("locbadge");
+  if (lb) {
+    let st = (CURLOC || {}).state || "off";
+    lb.classList.toggle("d-none", st == "off");
+    lb.classList.toggle("loc-converging", st == "converging" || st == "waiting");
+    lb.classList.toggle("loc-converged", st == "converged");
+    if (st == "waiting") {
+      lb.textContent = "relocalizing — waiting for the filter";
+      lb.title = "The localizer has been asked to relocalize but has not published an estimate yet.";
+    } else if (st == "converging") {
+      lb.textContent = "relocalizing… ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title =
+        "Particles are still spread over the map (position ±" +
+        (CURLOC.position_stddev_m ?? 0).toFixed(2) +
+        " m, heading ±" +
+        (((CURLOC.yaw_stddev_rad ?? 0) * 180) / Math.PI).toFixed(0) +
+        "°). Drive the robot to help it converge — the pose shown is not settled yet.";
+    } else if (st == "converged") {
+      lb.textContent = "localized ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title = "The particle filter has converged; the pose shown is the filter's estimate.";
+    }
+  }
   let eb = document.getElementById("enginebadge");
   if (eb)
     eb.textContent =

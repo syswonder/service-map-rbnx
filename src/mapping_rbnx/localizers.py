@@ -20,6 +20,7 @@ percent of one core — no GPU, no database.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shlex
 import signal
@@ -180,3 +181,35 @@ def global_localize(node, timeout_s: float = 15.0) -> tuple[bool, str]:
     if not future.done():
         return False, f"global localization request timed out after {timeout_s:.0f}s"
     return True, "global localization requested (particles scattered over the map)"
+
+
+# ── convergence, as the operator sees it ─────────────────────────────────────
+# A particle filter that has just been told to relocalize globally is spread
+# over the whole map, and it narrows down as the robot moves and scans. The
+# spread is the covariance AMCL publishes on its pose, so the UI can say
+# "still relocalizing" instead of showing a confident-looking arrow that is a
+# guess. Thresholds are the point where the estimate is good enough to plan
+# with; they are deliberately loose, because the alternative to a converging
+# filter is no localization at all.
+POSE_TOPIC = os.environ.get("MAPPING_LOCALIZER_POSE_TOPIC", "/amcl_pose")
+CONVERGED_POSITION_M = 0.25
+CONVERGED_YAW_RAD = 0.15
+
+
+def spread(msg) -> tuple[float, float]:
+    """(position stddev in metres, yaw stddev in radians) from a
+    PoseWithCovarianceStamped. The 6x6 row-major covariance holds x at 0,
+    y at 7 and yaw at 35."""
+    cov = list(getattr(msg, "pose", msg).covariance)
+    var_x, var_y, var_yaw = cov[0], cov[7], cov[35]
+    position = math.sqrt(max(var_x, 0.0) + max(var_y, 0.0))
+    return position, math.sqrt(max(var_yaw, 0.0))
+
+
+def convergence_state(position_stddev_m: float, yaw_stddev_rad: float) -> str:
+    """`converged` once the filter is tight enough to act on, else
+    `converging`."""
+    if (position_stddev_m <= CONVERGED_POSITION_M
+            and yaw_stddev_rad <= CONVERGED_YAW_RAD):
+        return "converged"
+    return "converging"

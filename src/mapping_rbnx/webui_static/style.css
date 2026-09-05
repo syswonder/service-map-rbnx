@@ -244,3 +244,22 @@ body {
 .min-w-0 {
   min-width: 0;
 }
+
+/* Relocalization: the particle filter is spread over the map until it has seen
+   enough to narrow down, and the robot's arrow is a guess until then. The badge
+   pulses while that is true so the pose on screen is not read as fact. */
+#locbadge.loc-converging {
+  background: #7a5b00;
+  color: #ffe08a;
+  border: 1px solid #b98900;
+  animation: locpulse 1.2s ease-in-out infinite;
+}
+#locbadge.loc-converged {
+  background: #14351d;
+  color: #7ee2a8;
+  border: 1px solid #2c7a4b;
+}
+@keyframes locpulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}

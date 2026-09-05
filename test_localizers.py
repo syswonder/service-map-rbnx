@@ -57,6 +57,43 @@ class LocalizerConfigTests(unittest.TestCase):
         self.assertIn("localizer: none", detail)
 
 
+class ConvergenceTests(unittest.TestCase):
+    """The spread the UI reports, read straight off AMCL's covariance."""
+
+    @staticmethod
+    def _msg(var_x, var_y, var_yaw):
+        cov = [0.0] * 36
+        cov[0], cov[7], cov[35] = var_x, var_y, var_yaw
+
+        class Msg:
+            class pose:
+                covariance = cov
+        return Msg()
+
+    def test_spread_reads_position_and_heading_from_the_covariance(self):
+        pos, yaw = localizers.spread(self._msg(0.09, 0.16, 0.04))
+        self.assertAlmostEqual(pos, 0.5)        # sqrt(0.09 + 0.16)
+        self.assertAlmostEqual(yaw, 0.2)
+
+    def test_a_filter_spread_over_the_map_is_not_converged(self):
+        pos, yaw = localizers.spread(self._msg(9.0, 9.0, 1.0))
+        self.assertEqual(localizers.convergence_state(pos, yaw), "converging")
+
+    def test_a_tight_filter_is_converged(self):
+        pos, yaw = localizers.spread(self._msg(0.01, 0.01, 0.004))
+        self.assertEqual(localizers.convergence_state(pos, yaw), "converged")
+
+    def test_heading_alone_can_hold_it_back(self):
+        # Position is tight but the robot does not know which way it faces —
+        # driving on that is how you end up mapping into a wall.
+        self.assertEqual(localizers.convergence_state(0.05, 0.9), "converging")
+
+    def test_negative_variance_does_not_raise(self):
+        pos, yaw = localizers.spread(self._msg(-1.0, 0.04, -1.0))
+        self.assertAlmostEqual(pos, 0.2)
+        self.assertAlmostEqual(yaw, 0.0)
+
+
 class LaunchFileTests(unittest.TestCase):
     def test_launch_file_ships_with_the_package(self):
         self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(__file__),

@@ -45,7 +45,8 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 # own node. "scan" and "cloud" hold points already projected into the map
 # frame, so the page can draw them straight onto the occupancy canvas and an
 # operator can see whether the live returns line up with the saved map.
-_latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
+_latest = {"grid": None, "pose": None, "scan": None, "cloud": None,
+           "localizer_pose": None, "localizer_pose_at": 0.0}
 # Topics for the range sensors, resolved through Atlas by the bridge and
 # injected with set_sensor_topics(). Empty means the deployment has no such
 # capability bound, and the page simply has nothing to draw.
@@ -180,9 +181,18 @@ def _ensure_subscriptions() -> None:
             def _on_pose(msg):
                 _latest["pose"] = msg
 
+            def _on_localizer_pose(msg):
+                # The particle filter's own estimate, kept for its covariance:
+                # that is what says whether it has converged yet.
+                _latest["localizer_pose"] = msg
+                _latest["localizer_pose_at"] = time.time()
+
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
             node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+            if localizers.enabled():
+                node.create_subscription(PoseWithCovarianceStamped, localizers.POSE_TOPIC,
+                                         _on_localizer_pose, 10)
             _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
@@ -466,6 +476,30 @@ def _grid_to_png(grid, pose=None) -> bytes:
     return buf.getvalue()
 
 
+def _localization_state() -> dict:
+    """How the particle filter is doing, for the page to say so.
+
+    `off` when no localizer is configured, `waiting` when one is running but has
+    not published an estimate yet (it has just been asked to relocalize), then
+    `converging` while the particle cloud is still spread out and `converged`
+    once it is tight enough to act on. The spread is reported too, so the page
+    can show it shrinking rather than just flipping between two words.
+    """
+    if not localizers.enabled():
+        return {"state": "off"}
+    msg = _latest.get("localizer_pose")
+    if msg is None:
+        return {"state": "waiting", "localizer": localizers.name()}
+    position_stddev, yaw_stddev = localizers.spread(msg)
+    return {
+        "state": localizers.convergence_state(position_stddev, yaw_stddev),
+        "localizer": localizers.name(),
+        "position_stddev_m": round(position_stddev, 3),
+        "yaw_stddev_rad": round(yaw_stddev, 3),
+        "age_s": round(time.time() - float(_latest.get("localizer_pose_at") or 0.0), 1),
+    }
+
+
 def _list_saved_maps() -> list[dict]:
     """Library rows for the page, taken from the capability's own listing.
 
@@ -568,6 +602,7 @@ class _Handler(BaseHTTPRequestHandler):
                       # operator to guess from the deployment config.
                       "engine": map_ops.active_algo(),
                       "localizer": localizers.name(),
+                      "localization": _localization_state(),
                       "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,

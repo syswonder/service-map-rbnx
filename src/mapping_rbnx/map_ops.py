@@ -454,41 +454,57 @@ def load_map_impl(map_id: str, mode: str = "localization",
         # prior pose, so `load_map` without a pose stops meaning "hope the scan
         # matcher converges from wherever the robot thinks it is".
         if localizers.enabled():
-            # One owner for map -> odom. Two publishers of the same tf edge
-            # overwrite each other rather than averaging, and the robot then
-            # teleports between their answers several times a second — which is
-            # exactly what it looked like in rviz. Hand the frame over BEFORE the
-            # filter starts, so there is never a window with two owners.
-            if ops is not None:
-                ok_y, detail_y = ops.yield_map_frame(node, 10.0)
-                if not ok_y:
-                    return {"ok": False,
-                            "detail": f"{algo} would not hand over map -> odom: {detail_y}; "
-                                      "refusing to start the localizer against it"}
-            else:
-                detail_y = ""
+            # The localizer is a RELOCALIZATION plugin, not a second source of
+            # localization: it recovers where the robot is on a map it has no
+            # prior for, hands that pose to the SLAM engine and stops. Only one
+            # node ever owns map -> odom at the end of this — the engine — and
+            # the deployment can still map, switch mode and load again.
+            ok_h, detail_h = (ops.hold(node, 10.0) if ops is not None else (True, ""))
+            if not ok_h:
+                return {"ok": False, "detail": f"{algo} would not hold for relocalization: {detail_h}"}
             ok_l, detail_l = localizers.start(map_dir, map_id)
             if not ok_l:
+                if ops is not None:
+                    ops.resume(node, 10.0)
                 return {"ok": False, "detail": f"localizer failed to start: {detail_l}"}
-            ready, detail_r = localizers.wait_ready(node)
-            if not ready:
+            try:
+                ready, detail_r = localizers.wait_ready(node)
+                if not ready:
+                    return {"ok": False, "detail": f"localizer did not come up: {detail_r}"}
+                if has_initial_pose:
+                    seed = pose_estimate_impl(x, y, theta)
+                    seed_detail = seed.get("detail", "")
+                else:
+                    ok_g, seed_detail = localizers.global_localize(node)
+                    if not ok_g:
+                        return {"ok": False, "detail": f"global localization failed: {seed_detail}"}
+                converge_timeout = float(os.environ.get("MAPPING_RELOCALIZE_TIMEOUT_S", "90"))
+                ok_c, pose, detail_c = localizers.wait_for_convergence(node, converge_timeout)
+                if not ok_c:
+                    return {"ok": False, "detail": f"{seed_detail}; {detail_c}"}
+            finally:
+                # The filter has done its job either way; leaving it running
+                # would put a second publisher on map -> odom.
                 localizers.stop()
-                return {"ok": False, "detail": f"localizer did not come up: {detail_r}"}
+            if ops is not None:
+                ok_a, detail_a = ops.activate(
+                    node, map_dir, map_id,
+                    float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180")), pose)
+                if not ok_a:
+                    return {"ok": False, "detail": f"{detail_c}, but {algo} would not "
+                                                   f"take the recovered pose: {detail_a}"}
+                ok_rs, detail_rs = ops.resume(node, 10.0)
+                if not ok_rs:
+                    return {"ok": False, "detail": f"{detail_c}, but {algo} would not resume: {detail_rs}"}
             lifecycle.set_mode("localization")
-            if has_initial_pose:
-                seed = pose_estimate_impl(x, y, theta)
-                seed_detail = seed.get("detail", "")
-            else:
-                ok_g, seed_detail = localizers.global_localize(node)
-                if not ok_g:
-                    localizers.stop()
-                    return {"ok": False, "detail": f"global localization failed: {seed_detail}"}
+            lifecycle.set_state(map_id, "localization", bump=False)
             # A saved map's frame is the artifact's own, not the previous live
             # session's: consumers holding map-frame coordinates must be told.
             lifecycle.mark_reset("localization")
             return {
                 "ok": True,
-                "detail": "; ".join(x for x in (detail_y, detail_l, seed_detail) if x),
+                "detail": (f"{detail_l}; {seed_detail}; {detail_c}; "
+                           f"{algo} localized at ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f})"),
                 "map_id": map_id,
                 "mode": "localization",
                 "localizer": localizers.name(),

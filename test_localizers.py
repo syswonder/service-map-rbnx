@@ -57,41 +57,38 @@ class LocalizerConfigTests(unittest.TestCase):
         self.assertIn("localizer: none", detail)
 
 
-class MapFrameOwnershipTests(unittest.TestCase):
-    """Only one node may publish map -> odom."""
+class RelocalizationHandoverTests(unittest.TestCase):
+    """The localizer recovers a pose and hands it back; the engine keeps the frame."""
 
-    def test_every_engine_can_hand_the_frame_over(self):
-        # RTAB-Map's implementations are injected by map_ops at import time.
-        from mapping_rbnx import engines, map_ops  # noqa: F401
+    def _ops(self, algo):
+        from mapping_rbnx import engines, map_ops  # noqa: F401  (map_ops registers rtabmap)
+        return engines.engine_for(algo)
+
+    def test_every_engine_can_be_held_and_resumed(self):
         for algo in ("slam_toolbox", "rtabmap"):
-            ops = engines.engine_for(algo)
+            ops = self._ops(algo)
             self.assertIsNotNone(ops, algo)
-            self.assertTrue(callable(getattr(ops, "yield_map_frame", None)), algo)
+            for verb in ("hold", "resume", "activate"):
+                self.assertTrue(callable(getattr(ops, verb, None)), f"{algo}.{verb}")
 
-    def test_rtabmap_keeps_the_frame_because_it_localizes_itself(self):
-        from mapping_rbnx import engines, map_ops  # noqa: F401
-        ok, detail = engines.engine_for("rtabmap").yield_map_frame(None, 1.0)
-        self.assertTrue(ok)
-        self.assertIn("localization mode", detail)
+    def test_rtabmap_needs_no_hold_because_load_map_switches_its_mode(self):
+        ops = self._ops("rtabmap")
+        for verb in ("hold", "resume"):
+            ok, detail = getattr(ops, verb)(None, 1.0)
+            self.assertTrue(ok)
+            self.assertIn("rtabmap", detail)
 
-    def test_no_slam_toolbox_process_means_the_frame_is_already_free(self):
-        from mapping_rbnx import engines
-        ok, detail = engines.engine_for("slam_toolbox").yield_map_frame(None, 1.0)
-        self.assertTrue(ok)                       # nothing is running here
-        self.assertIn("was not running", detail)
-
-    def test_a_process_that_will_not_die_is_reported_rather_than_assumed_gone(self):
-        from unittest import mock
-        from mapping_rbnx import engines
-        ops = engines.engine_for("slam_toolbox")
-        found = mock.Mock(stdout="4242\n")
-        with mock.patch("subprocess.run", return_value=found), \
-             mock.patch("os.kill"), \
-             mock.patch.object(engines, "_pid_alive", return_value=True):
-            ok, detail = ops.yield_map_frame(None, 1.0)
+    def test_slam_toolbox_reports_a_missing_service_rather_than_pretending(self):
+        # No ROS here, so the service type import fails — which must be an
+        # error, not a silent success that leaves the engine running.
+        ok, detail = self._ops("slam_toolbox").hold(None, 0.1)
         self.assertFalse(ok)
-        self.assertIn("4242", detail)
-        self.assertIn("fight", detail)
+        self.assertIn("slam_toolbox", detail)
+
+    def test_activate_takes_the_recovered_pose(self):
+        import inspect
+        sig = inspect.signature(self._ops("slam_toolbox").activate)
+        self.assertIn("pose", sig.parameters)
 
 
 class ConvergenceTests(unittest.TestCase):

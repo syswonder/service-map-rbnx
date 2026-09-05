@@ -48,19 +48,11 @@ class EngineOps(Protocol):
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Discard the live graph and start a fresh mapping session."""
 
-    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
-        """Stop publishing `map -> odom` so a localizer can own it."""
+    def hold(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Freeze the engine while a localizer recovers the robot's pose."""
 
-
-def _pid_alive(pid: int) -> bool:
-    """Is the process still there? (signal 0 tests without delivering.)"""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    def resume(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Carry on from the pose `activate` was given."""
 
 
 def _call_service(node, srv_type, name: str, request, timeout_s: float):
@@ -160,47 +152,31 @@ class SlamToolboxOps:
             return False, str(resp)
         return True, f"deserialized {req.filename} ({'localize at pose' if pose else 'first node'})"
 
-    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
-        """Stop publishing `map -> odom`.
+    def hold(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Freeze the pose graph while a localizer relocalizes.
 
-        Two nodes publishing the same tf edge do not average — they overwrite
-        each other, and the robot teleports between their two answers several
-        times a second. When a particle filter takes over on a saved map, the
-        SLAM engine has to let go, which for slam_toolbox means pausing its
-        graph updates (`pause_new_measurements`) so it stops emitting the
-        transform.
+        `pause_new_measurements` stops slam_toolbox consuming scans, so its
+        `map -> odom` stops moving; it still publishes the frozen value, which
+        is why the view is unsettled until the localizer converges and the
+        engine is resumed at the recovered pose. Toggling the same service
+        resumes it (see `resume`).
         """
-        import signal
-        import subprocess
-        # `pause_new_measurements` stops it consuming scans but it keeps
-        # publishing the transform on `transform_publish_period`, and there is
-        # no service or parameter to stop that — so the node has to go. Its pose
-        # graph is already on disk (load_map serialized it before this point),
-        # and the localizer is about to own the frame. Returning to mapping mode
-        # needs the mapping service restarted, which `switch_mode` says.
-        node_name = "async_slam" + "_toolbox_node"   # split: a pgrep of our own cmdline must not match
+        return self._toggle_pause(node, timeout_s, "held")
+
+    def resume(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Start consuming scans again, from wherever `activate` put us."""
+        return self._toggle_pause(node, timeout_s, "resumed")
+
+    def _toggle_pause(self, node, timeout_s: float, word: str) -> tuple[bool, str]:
         try:
-            found = subprocess.run(["pgrep", "-f", node_name], capture_output=True, text=True)
-        except OSError as e:
-            return False, f"cannot look for the slam_toolbox process: {e}"
-        pids = [int(x) for x in found.stdout.split() if x.isdigit()]
-        if not pids:
-            return True, "slam_toolbox was not running; the localizer owns map -> odom"
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except PermissionError as e:
-                return False, f"cannot stop slam_toolbox (pid {pid}): {e}"
-        deadline = time.monotonic() + max(5.0, timeout_s / 4.0)
-        while time.monotonic() < deadline:
-            alive = [p for p in pids if _pid_alive(p)]
-            if not alive:
-                return True, ("slam_toolbox stopped; the localizer owns map -> odom "
-                              "(restart the mapping service to map again)")
-            time.sleep(0.2)
-        return False, f"slam_toolbox (pid {pids}) did not exit; two publishers would fight over map -> odom"
+            from slam_toolbox.srv import Pause
+        except Exception as e:  # noqa: BLE001
+            return False, f"slam_toolbox Pause service type unavailable ({e})"
+        ok, resp = _call_service(node, Pause, self._srv("pause_new_measurements"),
+                                 Pause.Request(), timeout_s)
+        if not ok:
+            return False, str(resp)
+        return True, f"slam_toolbox {word}"
 
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Clear the live graph. `Reset` exists from slam_toolbox 2.6; older
@@ -245,10 +221,13 @@ class RtabmapOps:
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         return self._reset(node, timeout_s)
 
-    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
-        """RTAB-Map is put in localization mode by `load_map` and keeps owning
-        the transform there, so there is nothing to hand over."""
-        return True, "rtabmap keeps map -> odom in localization mode"
+    def hold(self, node, timeout_s: float) -> tuple[bool, str]:
+        """RTAB-Map has no equivalent pause; `load_map` switches it to
+        localization mode instead, so there is nothing to freeze."""
+        return True, "rtabmap needs no hold"
+
+    def resume(self, node, timeout_s: float) -> tuple[bool, str]:
+        return True, "rtabmap needs no resume"
 
 
 _REGISTRY: dict[str, EngineOps] = {}

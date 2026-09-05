@@ -213,3 +213,48 @@ def convergence_state(position_stddev_m: float, yaw_stddev_rad: float) -> str:
             and yaw_stddev_rad <= CONVERGED_YAW_RAD):
         return "converged"
     return "converging"
+
+
+def wait_for_convergence(node, timeout_s: float = 60.0) -> tuple[bool, tuple[float, float, float], str]:
+    """Watch the filter until it is tight enough to hand back, or give up.
+
+    Returns (converged, (x, y, yaw), detail). The pose is the filter's own
+    estimate off `POSE_TOPIC` — the whole point of the localizer slot is to
+    recover it after a load with no prior, so once it is recovered the filter
+    has done its job and the SLAM engine can carry on from it.
+    """
+    import math
+
+    try:
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+    except Exception as e:  # noqa: BLE001
+        return False, (0.0, 0.0, 0.0), f"geometry_msgs unavailable: {e}"
+
+    latest: dict = {"msg": None}
+
+    def _on_pose(msg) -> None:
+        latest["msg"] = msg
+
+    sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+    try:
+        deadline = time.monotonic() + timeout_s
+        best = ""
+        while time.monotonic() < deadline:
+            msg = latest["msg"]
+            if msg is not None:
+                position_sd, yaw_sd = spread(msg)
+                best = f"position ±{position_sd:.2f} m, heading ±{math.degrees(yaw_sd):.0f}°"
+                if convergence_state(position_sd, yaw_sd) == "converged":
+                    p, q = msg.pose.pose.position, msg.pose.pose.orientation
+                    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                    return True, (p.x, p.y, yaw), f"converged ({best})"
+            time.sleep(0.25)
+        if not best:
+            return False, (0.0, 0.0, 0.0), f"{name()} published no pose within {timeout_s:.0f}s"
+        return False, (0.0, 0.0, 0.0), f"{name()} did not converge within {timeout_s:.0f}s ({best})"
+    finally:
+        try:
+            node.destroy_subscription(sub)
+        except Exception:  # noqa: BLE001
+            pass

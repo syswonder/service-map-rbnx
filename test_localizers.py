@@ -94,6 +94,14 @@ class RelocalizationHandoverTests(unittest.TestCase):
         self.assertIn('"tf_broadcast": False', src)
         self.assertNotIn('"tf_broadcast": True', src)
 
+    def test_convergence_needs_travel_not_just_a_tight_cloud(self):
+        # A filter standing still in a symmetric room collapses tightly onto
+        # the wrong hypothesis: measured at ±0.2 m while 4 m from the truth.
+        self.assertGreaterEqual(localizers.MIN_TRAVEL_M, 1.0)
+        import inspect
+        sig = inspect.signature(localizers.wait_for_convergence)
+        self.assertIn("min_travel_m", sig.parameters)
+
     def test_activate_takes_the_recovered_pose(self):
         import inspect
         sig = inspect.signature(self._ops("slam_toolbox").activate)

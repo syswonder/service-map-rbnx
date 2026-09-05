@@ -478,10 +478,16 @@ def load_map_impl(map_id: str, mode: str = "localization",
                     ok_g, seed_detail = localizers.global_localize(node)
                     if not ok_g:
                         return {"ok": False, "detail": f"global localization failed: {seed_detail}"}
-                converge_timeout = float(os.environ.get("MAPPING_RELOCALIZE_TIMEOUT_S", "90"))
+                # The robot has to move for the filter to tell similar places
+                # apart, and this call cannot drive it — mapping does not own
+                # the chassis. So the wait is generous, and a timeout says what
+                # the caller has to do rather than just failing.
+                converge_timeout = float(os.environ.get("MAPPING_RELOCALIZE_TIMEOUT_S", "180"))
                 ok_c, pose, detail_c = localizers.wait_for_convergence(node, converge_timeout)
                 if not ok_c:
-                    return {"ok": False, "detail": f"{seed_detail}; {detail_c}"}
+                    return {"ok": False, "map_id": map_id, "mode": "relocalizing",
+                            "detail": f"{seed_detail}; {detail_c} — drive the robot "
+                                      "(a few metres past distinct geometry) and load again"}
             finally:
                 # The filter has done its job either way; leaving it running
                 # would put a second publisher on map -> odom.

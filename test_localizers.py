@@ -85,6 +85,15 @@ class RelocalizationHandoverTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("slam_toolbox", detail)
 
+    def test_the_localizer_never_broadcasts_the_frame(self):
+        # One owner for map -> odom at every instant. If this flips back to
+        # True the robot teleports between the filter's answer and the engine's.
+        with open(os.path.join(os.path.dirname(__file__), "launch",
+                               "localization_2d.launch.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('"tf_broadcast": False', src)
+        self.assertNotIn('"tf_broadcast": True', src)
+
     def test_activate_takes_the_recovered_pose(self):
         import inspect
         sig = inspect.signature(self._ops("slam_toolbox").activate)

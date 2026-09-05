@@ -11,7 +11,9 @@ without anyone typing a pose or clicking "2D Pose Estimate".
 Nodes:
   map_server          serves `<map_dir>/occupancy.yaml` on /map (latched)
   <localizer>         nav2_amcl or beluga_amcl (interface-compatible):
-                      map → odom TF, /amcl_pose, global localization service
+                      /amcl_pose + the global localization service. It does NOT
+                      publish map → odom: the SLAM engine owns that frame, and
+                      load_map hands it the recovered pose.
   lifecycle_manager   configures + activates both, autostart
 
 The SLAM engine keeps running in mapping mode or is left stopped by the caller;
@@ -68,7 +70,12 @@ def _launch_setup(context, *args, **kwargs):
         "laser_model_type": "likelihood_field",
         "set_initial_pose": False,
         "always_reset_initial_pose": False,
-        "tf_broadcast": True,
+        # The localizer estimates a pose; it does not own the frame. Two nodes
+        # publishing map -> odom overwrite each other and the robot teleports
+        # between their answers, so the filter is told to keep its estimate to
+        # /amcl_pose and leave the transform to the SLAM engine, which
+        # `load_map` resumes at the recovered pose once the filter converges.
+        "tf_broadcast": False,
         "transform_tolerance": 1.0,
     }
     nodes = [

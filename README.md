@@ -51,8 +51,9 @@ one is where "click 2D Pose Estimate, then click again" comes from: a scan
 matcher can only refine a guess it is already given. A particle filter over the
 saved occupancy grid can start from no guess at all.
 
-`load_map` uses the localizer as a **relocalization plugin, not a second
-localizer**: the SLAM engine is held, the filter is started and told to scatter
+The localizer never publishes `map → odom` (`tf_broadcast: false`): one node
+owns that frame at every instant, which is the SLAM engine. `load_map` uses the
+localizer as a **relocalization plugin, not a second localizer**: the SLAM engine is held, the filter is started and told to scatter
 its particles, and as soon as it converges its pose is handed to the engine
 (`activate` at that pose) and the filter is stopped. Exactly one node publishes
 `map → odom` when that returns — the engine — so the deployment can still map,

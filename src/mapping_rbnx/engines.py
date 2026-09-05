@@ -48,6 +48,9 @@ class EngineOps(Protocol):
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Discard the live graph and start a fresh mapping session."""
 
+    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Stop publishing `map -> odom` so a localizer can own it."""
+
 
 def _call_service(node, srv_type, name: str, request, timeout_s: float):
     """Call a ROS service, returning (ok, response_or_detail). Kept local so
@@ -146,6 +149,26 @@ class SlamToolboxOps:
             return False, str(resp)
         return True, f"deserialized {req.filename} ({'localize at pose' if pose else 'first node'})"
 
+    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
+        """Stop publishing `map -> odom`.
+
+        Two nodes publishing the same tf edge do not average — they overwrite
+        each other, and the robot teleports between their two answers several
+        times a second. When a particle filter takes over on a saved map, the
+        SLAM engine has to let go, which for slam_toolbox means pausing its
+        graph updates (`pause_new_measurements`) so it stops emitting the
+        transform.
+        """
+        try:
+            from slam_toolbox.srv import Pause
+        except Exception as e:  # noqa: BLE001
+            return False, f"slam_toolbox Pause service type unavailable ({e})"
+        ok, resp = _call_service(node, Pause, self._srv("pause_new_measurements"),
+                                 Pause.Request(), timeout_s)
+        if not ok:
+            return False, str(resp)
+        return True, "slam_toolbox paused; the localizer owns map -> odom"
+
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         """Clear the live graph. `Reset` exists from slam_toolbox 2.6; older
         builds are told so rather than silently continuing on a stale map."""
@@ -188,6 +211,11 @@ class RtabmapOps:
 
     def reset(self, node, timeout_s: float) -> tuple[bool, str]:
         return self._reset(node, timeout_s)
+
+    def yield_map_frame(self, node, timeout_s: float) -> tuple[bool, str]:
+        """RTAB-Map is put in localization mode by `load_map` and keeps owning
+        the transform there, so there is nothing to hand over."""
+        return True, "rtabmap keeps map -> odom in localization mode"
 
 
 _REGISTRY: dict[str, EngineOps] = {}

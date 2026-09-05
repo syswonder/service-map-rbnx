@@ -454,6 +454,19 @@ def load_map_impl(map_id: str, mode: str = "localization",
         # prior pose, so `load_map` without a pose stops meaning "hope the scan
         # matcher converges from wherever the robot thinks it is".
         if localizers.enabled():
+            # One owner for map -> odom. Two publishers of the same tf edge
+            # overwrite each other rather than averaging, and the robot then
+            # teleports between their answers several times a second — which is
+            # exactly what it looked like in rviz. Hand the frame over BEFORE the
+            # filter starts, so there is never a window with two owners.
+            if ops is not None:
+                ok_y, detail_y = ops.yield_map_frame(node, 10.0)
+                if not ok_y:
+                    return {"ok": False,
+                            "detail": f"{algo} would not hand over map -> odom: {detail_y}; "
+                                      "refusing to start the localizer against it"}
+            else:
+                detail_y = ""
             ok_l, detail_l = localizers.start(map_dir, map_id)
             if not ok_l:
                 return {"ok": False, "detail": f"localizer failed to start: {detail_l}"}
@@ -475,7 +488,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
             lifecycle.mark_reset("localization")
             return {
                 "ok": True,
-                "detail": f"{detail_l}; {seed_detail}",
+                "detail": "; ".join(x for x in (detail_y, detail_l, seed_detail) if x),
                 "map_id": map_id,
                 "mode": "localization",
                 "localizer": localizers.name(),

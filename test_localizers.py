@@ -57,6 +57,30 @@ class LocalizerConfigTests(unittest.TestCase):
         self.assertIn("localizer: none", detail)
 
 
+class MapFrameOwnershipTests(unittest.TestCase):
+    """Only one node may publish map -> odom."""
+
+    def test_every_engine_can_hand_the_frame_over(self):
+        # RTAB-Map's implementations are injected by map_ops at import time.
+        from mapping_rbnx import engines, map_ops  # noqa: F401
+        for algo in ("slam_toolbox", "rtabmap"):
+            ops = engines.engine_for(algo)
+            self.assertIsNotNone(ops, algo)
+            self.assertTrue(callable(getattr(ops, "yield_map_frame", None)), algo)
+
+    def test_rtabmap_keeps_the_frame_because_it_localizes_itself(self):
+        from mapping_rbnx import engines, map_ops  # noqa: F401
+        ok, detail = engines.engine_for("rtabmap").yield_map_frame(None, 1.0)
+        self.assertTrue(ok)
+        self.assertIn("localization mode", detail)
+
+    def test_slam_toolbox_reports_a_missing_pause_service_rather_than_pretending(self):
+        from mapping_rbnx import engines
+        ok, detail = engines.engine_for("slam_toolbox").yield_map_frame(None, 0.1)
+        self.assertFalse(ok)                      # no ROS here: the import fails
+        self.assertIn("slam_toolbox", detail)
+
+
 class ConvergenceTests(unittest.TestCase):
     """The spread the UI reports, read straight off AMCL's covariance."""
 

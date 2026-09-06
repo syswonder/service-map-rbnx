@@ -108,12 +108,19 @@ def stop() -> None:
         log.warning("stopping localizer failed: %s", e)
 
 
-def start(map_dir: str, map_id: str, log_path: str = "") -> tuple[bool, str]:
+def start(map_dir: str, map_id: str, log_path: str = "",
+          owns_tf: bool = False, initial_pose=None,
+          map_topic: str = "") -> tuple[bool, str]:
     """Launch map_server + the localizer on the saved map in `map_dir`.
 
     Replaces any running instance (loading a second map must not leave the first
     one publishing `map → odom`). Returns (ok, detail); the caller decides
     whether to seed a pose or ask for global localization.
+
+    `owns_tf` says whether this instance publishes `map → odom`. It does so only
+    when the SLAM engine has been paused for it — the two must never publish at
+    once. `initial_pose` hands back a pose the filter already recovered so a
+    restart into tf-owning mode does not search the map again.
     """
     global _PROC, _ACTIVE_MAP
     if not enabled():
@@ -132,7 +139,14 @@ def start(map_dir: str, map_id: str, log_path: str = "") -> tuple[bool, str]:
         f"odom_frame:={_CONFIG['odom_frame']}", f"global_frame:={_CONFIG['global_frame']}",
         f"use_sim_time:={'true' if _CONFIG['use_sim_time'] else 'false'}",
         f"min_particles:={_CONFIG['min_particles']}", f"max_particles:={_CONFIG['max_particles']}",
+        f"tf_broadcast:={'true' if owns_tf else 'false'}",
     ]
+    if map_topic:
+        cmd.append(f"map_topic:={map_topic}")
+    if initial_pose is not None:
+        cmd += [f"initial_x:={float(initial_pose[0])}",
+                f"initial_y:={float(initial_pose[1])}",
+                f"initial_yaw:={float(initial_pose[2])}"]
     out = open(log_path or os.path.join("/tmp", f"localizer_{map_id or 'map'}.log"), "ab", buffering=0)
     try:
         _PROC = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
@@ -140,7 +154,8 @@ def start(map_dir: str, map_id: str, log_path: str = "") -> tuple[bool, str]:
         return False, f"failed to launch localizer: {e}"
     _ACTIVE_MAP = map_id
     log.info("[localizer] %s on %s (%s)", name(), map_yaml, " ".join(shlex.quote(c) for c in cmd[3:]))
-    return True, f"{name()} started on {map_yaml}"
+    return True, (f"{name()} started on {map_yaml}"
+                  f"{' owning map -> odom' if owns_tf else ''}")
 
 
 def wait_ready(node, timeout_s: float = 30.0) -> tuple[bool, str]:
@@ -191,6 +206,23 @@ def global_localize(node, timeout_s: float = 15.0) -> tuple[bool, str]:
 # guess. Thresholds are the point where the estimate is good enough to plan
 # with; they are deliberately loose, because the alternative to a converging
 # filter is no localization at all.
+# Relocalization runs behind an already-loaded map, so its outcome is not the
+# return value of anything the operator called; it is recorded here for the
+# status page to report.
+_RELOC: dict = {"state": "idle", "detail": ""}
+
+
+def set_relocalization(state: str, detail: str = "") -> None:
+    """Record how the running (or last) relocalization is doing."""
+    _RELOC["state"] = state
+    _RELOC["detail"] = detail
+
+
+def relocalization() -> dict:
+    """The recorded relocalization outcome: idle / running / done / failed."""
+    return dict(_RELOC)
+
+
 POSE_TOPIC = os.environ.get("MAPPING_LOCALIZER_POSE_TOPIC", "/amcl_pose")
 CONVERGED_POSITION_M = 0.25
 CONVERGED_YAW_RAD = 0.15
@@ -223,17 +255,301 @@ def convergence_state(position_stddev_m: float, yaw_stddev_rad: float) -> str:
 # filter reported ±0.2 m while sitting 4 m and 152° from the truth.
 MIN_TRAVEL_M = 1.5
 
+# A particle filter reports how tightly its particles agree, not whether they
+# agree about the right place. In a room with repeated structure the cloud can
+# collapse onto a wrong hypothesis and report centimetres of spread while the
+# robot stands metres away, so the estimate is checked against the map the only
+# way that can fail independently: by asking whether the laser the robot is
+# seeing right now is the laser it would see from where it thinks it is.
+# Measured on this deployment's own map while the robot was known to be right
+# and known to be wrong: a correct pose reads 0.70 to 1.00, a pose five metres
+# out reads 0.49. Below this the fix is not acted on.
+SCAN_FIT_MIN = float(os.environ.get("MAPPING_SCAN_FIT_MIN", "0.60"))
+SCAN_FIT_TOLERANCE_CELLS = 3
+
+
+class _Grid:
+    """A saved occupancy map, in map-frame metres.
+
+    Occupied and known are kept apart because a saved map is mostly neither:
+    half of a hand-driven map is territory the robot never saw, and a beam that
+    ends there says nothing about where the robot is.
+    """
+
+    def __init__(self, width, height, occupied, known, resolution, origin):
+        self.width = width
+        self.height = height
+        self.cells = occupied       # bytearray, 1 = occupied
+        self.known = known          # bytearray, 1 = free or occupied
+        self.resolution = resolution
+        self.origin = origin
+
+    def _index(self, x: float, y: float):
+        col = int((x - self.origin[0]) / self.resolution)
+        row = int((y - self.origin[1]) / self.resolution)
+        if 0 <= col < self.width and 0 <= row < self.height:
+            return row * self.width + col
+        return None
+
+    def is_known(self, x: float, y: float) -> bool:
+        i = self._index(x, y)
+        return i is not None and bool(self.known[i])
+
+    def occupied_near(self, x: float, y: float, tolerance_cells: int) -> bool:
+        col = int((x - self.origin[0]) / self.resolution)
+        row = int((y - self.origin[1]) / self.resolution)
+        if not (0 <= col < self.width and 0 <= row < self.height):
+            return False
+        for dr in range(-tolerance_cells, tolerance_cells + 1):
+            r = row + dr
+            if not (0 <= r < self.height):
+                continue
+            base = r * self.width
+            for dc in range(-tolerance_cells, tolerance_cells + 1):
+                c = col + dc
+                if 0 <= c < self.width and self.cells[base + c]:
+                    return True
+        return False
+
+
+def load_grid(map_dir: str):
+    """Read `occupancy.{yaml,pgm}` from a saved map, or None if unreadable.
+
+    Only the occupied cells matter here, so the threshold from the yaml is
+    applied once and the grid is kept as one byte per cell.
+    """
+    yaml_path = os.path.join(map_dir, "occupancy.yaml")
+    pgm_path = os.path.join(map_dir, "occupancy.pgm")
+    try:
+        import yaml as _yaml
+        meta = _yaml.safe_load(open(yaml_path, encoding="utf-8"))
+        resolution = float(meta["resolution"])
+        origin = (float(meta["origin"][0]), float(meta["origin"][1]))
+        occupied_thresh = float(meta.get("occupied_thresh", 0.65))
+        negate = int(meta.get("negate", 0))
+        with open(pgm_path, "rb") as f:
+            if f.readline().strip() != b"P5":
+                return None
+            line = f.readline()
+            while line.startswith(b"#"):
+                line = f.readline()
+            width, height = (int(v) for v in line.split()[:2])
+            maxval = int(f.readline().split()[0])
+            raw = f.read(width * height)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[localizer] cannot read the saved grid in %s: %s", map_dir, e)
+        return None
+    # map_server's convention: darker is more occupied unless negate is set.
+    # A saved grid is trinary -- occupied, free, and the unobserved value that
+    # sits between the two thresholds -- and the middle one is not evidence.
+    free_thresh = float(meta.get("free_thresh", 0.25))
+    occupied = bytearray(width * height)
+    known = bytearray(width * height)
+    for i, v in enumerate(raw):
+        p_occ = (v / maxval) if negate else (1.0 - v / maxval)
+        if p_occ >= occupied_thresh:
+            occupied[i] = 1
+            known[i] = 1
+        elif p_occ <= free_thresh and v >= maxval - 5:
+            known[i] = 1
+    # The PGM's first row is the top of the map; the grid's first row is the
+    # bottom, so the rows are flipped once here rather than on every lookup.
+    def _flip(buf):
+        out = bytearray(width * height)
+        for r in range(height):
+            out[r * width:(r + 1) * width] = buf[(height - 1 - r) * width:(height - r) * width]
+        return out
+
+    return _Grid(width, height, _flip(occupied), _flip(known), resolution, origin)
+
+
+def scan_fit_of(grid, msg, pose) -> tuple[float, str]:
+    """Fraction of one scan's endpoints that land on a wall of `grid`.
+
+    Returns (fraction, detail); the fraction is -1.0 when the scan says nothing
+    about the pose, so "no evidence" is never mistaken for "bad fix". Beams that
+    end in territory the map never observed are not evidence either way and are
+    left out; beams that end where the map says free space are, and they count
+    against the pose.
+    """
+    if grid is None or msg is None:
+        return -1.0, "no map or no scan to check against"
+    x, y, yaw = pose
+    hits = 0
+    total = 0
+    angle = msg.angle_min
+    for r in msg.ranges:
+        a = angle
+        angle += msg.angle_increment
+        if not (msg.range_min < r < msg.range_max) or r != r:
+            continue
+        ex = x + r * math.cos(yaw + a)
+        ey = y + r * math.sin(yaw + a)
+        if grid.occupied_near(ex, ey, SCAN_FIT_TOLERANCE_CELLS):
+            hits += 1
+            total += 1
+        elif grid.is_known(ex, ey):
+            # Known-free: the map says there is nothing here, and there is.
+            total += 1
+    if total == 0:
+        return -1.0, ("no beam ended in mapped territory — the robot is looking "
+                      "at something the map does not cover")
+    return hits / total, f"{hits}/{total} beams over mapped ground land on a wall"
+
+
+def scan_fit(node, grid, pose, timeout_s: float = 6.0) -> tuple[float, str]:
+    """`scan_fit_of` on the next scan to arrive on the configured topic."""
+    if grid is None:
+        return -1.0, "no saved grid to check against"
+    try:
+        from sensor_msgs.msg import LaserScan
+    except Exception as e:  # noqa: BLE001
+        return -1.0, f"sensor_msgs unavailable: {e}"
+    import threading
+
+    got = threading.Event()
+    latest: dict = {"msg": None}
+
+    def _on_scan(msg) -> None:
+        latest["msg"] = msg
+        got.set()
+
+    topic = _CONFIG.get("scan_topic") or "/scan"
+    sub = node.create_subscription(LaserScan, topic, _on_scan, 5)
+    try:
+        got.wait(timeout_s)
+    finally:
+        try:
+            node.destroy_subscription(sub)
+        except Exception:  # noqa: BLE001
+            pass
+    if latest["msg"] is None:
+        return -1.0, f"no scan on {topic} within {timeout_s:.0f}s"
+    return scan_fit_of(grid, latest["msg"], pose)
+
+
+
+
+# Accepting a static match. The likelihood is high for any pose that explains
+# the scan; what makes an answer trustworthy is that no OTHER place explains it
+# nearly as well. Correct matches on this map lead their nearest real rival by
+# 12 to 39 points, so a margin of 8 leaves room while still refusing a tie --
+# and a tie is exactly the case where the operator should be asked for a nudge.
+STATIC_MATCH_MIN = float(os.environ.get("MAPPING_STATIC_MATCH_MIN", "0.75"))
+STATIC_MATCH_MARGIN = float(os.environ.get("MAPPING_STATIC_MATCH_MARGIN", "0.08"))
+
+
+def _global_match_module():
+    """Import the matcher lazily; it needs numpy, which not every image has."""
+    from mapping_rbnx import global_match
+    return global_match
+
+
+def relocalize_statically(node, grid, timeout_s: float = 8.0):
+    """Find the robot on `grid` from one scan, without moving it.
+
+    Returns (pose, detail) with pose None when the scan does not single a place
+    out. Standing still is the normal case on a robot that has just been
+    switched on or carried somewhere, and a particle filter cannot serve it:
+    its update is driven by motion, so with the robot still the cloud never
+    sharpens. Matching the scan against the map has no such requirement.
+    """
+    try:
+        matcher = _global_match_module()
+    except Exception as e:  # noqa: BLE001
+        return None, f"static matching unavailable: {e}"
+    try:
+        from sensor_msgs.msg import LaserScan
+    except Exception as e:  # noqa: BLE001
+        return None, f"sensor_msgs unavailable: {e}"
+    import threading
+
+    got = threading.Event()
+    latest: dict = {"msg": None}
+
+    def _on_scan(msg) -> None:
+        latest["msg"] = msg
+        got.set()
+
+    topic = _CONFIG.get("scan_topic") or "/scan"
+    from rclpy.qos import qos_profile_sensor_data
+    sub = node.create_subscription(LaserScan, topic, _on_scan, qos_profile_sensor_data)
+    try:
+        got.wait(timeout_s)
+    finally:
+        try:
+            node.destroy_subscription(sub)
+        except Exception:  # noqa: BLE001
+            pass
+    if latest["msg"] is None:
+        return None, f"no scan on {topic} within {timeout_s:.0f}s"
+
+    match = matcher.global_scan_match(grid, latest["msg"])
+    if match is None:
+        return None, "the scan does not cover enough of the map to place the robot"
+    if match.score < STATIC_MATCH_MIN:
+        return None, (f"no place on the map explains this scan ({match.detail}) — "
+                      f"is the robot on this map at all?")
+    if match.score - match.runner_up < STATIC_MATCH_MARGIN:
+        return None, (f"two places on the map explain this scan equally well "
+                      f"({match.detail}) — move the robot a metre and try again")
+    return match.pose, f"matched the map standing still: {match.detail}"
+
+
+def current_pose(node, timeout_s: float = 5.0):
+    """The filter's latest estimate as (x, y, yaw), or None if none arrives.
+
+    Used at the moment another node is ready to take the pose over: the
+    estimate the filter converged on is stale by then, because the robot kept
+    driving while that node started, and handing over a stale pose put the
+    robot metres behind where it stood.
+    """
+    try:
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+    except Exception:  # noqa: BLE001
+        return None
+    import threading
+
+    got = threading.Event()
+    latest: dict = {"msg": None}
+
+    def _on_pose(msg) -> None:
+        latest["msg"] = msg
+        got.set()
+
+    sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+    try:
+        got.wait(timeout_s)
+    finally:
+        try:
+            node.destroy_subscription(sub)
+        except Exception:  # noqa: BLE001
+            pass
+    msg = latest["msg"]
+    if msg is None:
+        return None
+    p, q = msg.pose.pose.position, msg.pose.pose.orientation
+    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    return (p.x, p.y, yaw)
+
 
 def wait_for_convergence(node, timeout_s: float = 60.0,
-                         min_travel_m: float = MIN_TRAVEL_M
-                         ) -> tuple[bool, tuple[float, float, float], str]:
-    """Watch the filter until it is tight enough AND the robot has moved, or
-    give up.
+                         min_travel_m: float = MIN_TRAVEL_M,
+                         map_dir: str = "") -> tuple[bool, tuple[float, float, float], str]:
+    """Watch the filter until it agrees with itself, has moved, and matches the
+    map, or give up.
 
     Returns (converged, (x, y, yaw), detail). The pose is the filter's own
     estimate off `POSE_TOPIC` — the whole point of the localizer slot is to
     recover it after a load with no prior, so once it is recovered the filter
     has done its job and the SLAM engine can carry on from it.
+
+    All three conditions are needed and none implies another: a stationary
+    filter collapses tightly wherever it started, a moving one can collapse
+    tightly onto the wrong room, and only the scan check can tell the wrong
+    room from the right one. Failing the scan check re-scatters the particles
+    rather than giving up, because the robot is still driving and the right
+    hypothesis is still reachable.
     """
     import math
 
@@ -247,8 +563,10 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
     except Exception as e:  # noqa: BLE001
         return False, (0.0, 0.0, 0.0), f"nav_msgs unavailable: {e}"
 
+    grid = load_grid(map_dir) if map_dir else None
     latest: dict = {"msg": None}
     travel: dict = {"m": 0.0, "last": None}
+    rejected = 0
 
     def _on_pose(msg) -> None:
         latest["msg"] = msg
@@ -277,7 +595,20 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
                     p, q = msg.pose.pose.position, msg.pose.pose.orientation
                     yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-                    return True, (p.x, p.y, yaw), f"converged ({best})"
+                    fit, fit_detail = scan_fit(node, grid, (p.x, p.y, yaw))
+                    if fit < 0.0:
+                        best = f"{best}; scan check skipped: {fit_detail}"
+                        return True, (p.x, p.y, yaw), f"converged ({best})"
+                    best = f"{best}, scan fit {fit:.0%} ({fit_detail})"
+                    if fit >= SCAN_FIT_MIN:
+                        return True, (p.x, p.y, yaw), f"converged ({best})"
+                    rejected += 1
+                    log.warning("[localizer] rejecting a tight fix that does not match "
+                                "the map: %s", best)
+                    global_localize(node)
+                    travel["m"] = 0.0
+                    time.sleep(2.0)
+                    continue
             time.sleep(0.25)
         if not best:
             return False, (0.0, 0.0, 0.0), f"{name()} published no pose within {timeout_s:.0f}s"
@@ -286,6 +617,10 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
                 f"{name()} needs the robot to move to tell similar places apart: "
                 f"only {travel['m']:.2f} m of the {min_travel_m:.1f} m it wants "
                 f"within {timeout_s:.0f}s ({best})")
+        if rejected:
+            return False, (0.0, 0.0, 0.0), (
+                f"{name()} converged {rejected} time(s) on a pose the laser does not "
+                f"support and was re-scattered each time; last was {best}")
         return False, (0.0, 0.0, 0.0), f"{name()} did not converge within {timeout_s:.0f}s ({best})"
     finally:
         for s_ in (sub, odom_sub):

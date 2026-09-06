@@ -69,6 +69,7 @@ from map_mcp import (  # type: ignore  # noqa: E402
     GetPose_Request as McpGetPoseReq,
     GetPose_Response as McpGetPoseResp,
 )
+from mapping_rbnx import engines  # noqa: E402
 from mapping_rbnx import lifecycle  # noqa: E402
 from mapping_rbnx import localizers  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
@@ -609,6 +610,18 @@ def init(cfg: dict):
     if localizer_name != "none":
         log.info("[mapping] localizer=%s on scan=%s (load_map without a pose will "
                  "request global localization)", localizer_name, resolved.get("scan_topic"))
+    # The engine needs the same settings for a different reason: loading a map
+    # restarts slam_toolbox as its localization executable, and a new process
+    # has to be given the deployment's scan topic and frames rather than
+    # inheriting them.
+    engine_ops = engines.engine_for(algo)
+    if engine_ops is not None and hasattr(engine_ops, "configure"):
+        engine_ops.configure(
+            scan_topic=resolved.get("scan_topic") or "",
+            base_frame=cfg.get("base_frame") or "base_link",
+            odom_frame=cfg.get("odom_frame") or "odom",
+            map_frame=cfg.get("map_frame") or "map",
+            use_sim_time=bool(cfg.get("use_sim_time", False)))
     if algo == "slam_toolbox":
         # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
         # They reach the launch through the resolved file like every other

@@ -49,39 +49,68 @@ def _launch_setup(context, *args, **kwargs):
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() == "true"
     min_particles = int(LaunchConfiguration("min_particles").perform(context))
     max_particles = int(LaunchConfiguration("max_particles").perform(context))
+    tf_broadcast = LaunchConfiguration("tf_broadcast").perform(context).lower() == "true"
+    initial_pose = [float(LaunchConfiguration(k).perform(context))
+                    for k in ("initial_x", "initial_y", "initial_yaw")]
+    has_initial_pose = any(v != 0.0 for v in initial_pose)
+
+    # The saved grid goes on a topic of its own. Published on /map it collides
+    # with the SLAM engine's live grid: two publishers, two different origins,
+    # and RViz redraws a different map every frame while the robot appears to
+    # jump between them. /map stays the engine's; the filter reads this one.
+    localizer_map_topic = LaunchConfiguration("map_topic").perform(context)
 
     common = {"use_sim_time": use_sim_time}
-    # Particle counts are the whole resource story for MCL: 500-2000 covers a
-    # room-scale map in a few tens of MB of RAM and a few percent of one core.
+    # Particle counts are the whole resource story for MCL, and global
+    # localization is what sets the floor: the particles are scattered over
+    # every free cell and every heading at once, so too few of them means no
+    # particle starts near the truth and the filter collapses confidently onto
+    # whichever wrong hypothesis it did cover. A room-scale map wants thousands.
     localizer_params = {
         **common,
         "base_frame_id": base_frame,
         "odom_frame_id": odom_frame,
         "global_frame_id": global_frame,
         "scan_topic": scan_topic,
+        "map_topic": localizer_map_topic,
         "min_particles": min_particles,
         "max_particles": max_particles,
-        # Recovery: without these the filter cannot inject random particles when
-        # the estimate goes bad, which is half of "it never re-converges".
-        "recovery_alpha_slow": 0.001,
-        "recovery_alpha_fast": 0.1,
+        # No random-particle injection. The localizer here runs only until a
+        # global relocalization succeeds and is then stopped, so injection buys
+        # no long-run recovery; what it did buy was a filter that kept adding
+        # noise to a cloud that was trying to settle, leaving the heading
+        # spread hovering above the convergence threshold. Recovering from a
+        # confident wrong answer is handled where it can be judged: the caller
+        # scores the fix against the map and re-scatters when it does not fit.
+        "recovery_alpha_slow": 0.0,
+        "recovery_alpha_fast": 0.0,
         "update_min_d": 0.15,
         "update_min_a": 0.15,
         "laser_model_type": "likelihood_field",
-        "set_initial_pose": False,
+        # A seeded start is how the filter is handed back a pose it already
+        # recovered, so a restart into pose-owning mode does not begin by
+        # searching the whole map again.
+        "set_initial_pose": has_initial_pose,
+        "initial_pose.x": initial_pose[0],
+        "initial_pose.y": initial_pose[1],
+        "initial_pose.yaw": initial_pose[2],
         "always_reset_initial_pose": False,
-        # The localizer estimates a pose; it does not own the frame. Two nodes
-        # publishing map -> odom overwrite each other and the robot teleports
-        # between their answers, so the filter is told to keep its estimate to
-        # /amcl_pose and leave the transform to the SLAM engine, which
-        # `load_map` resumes at the recovered pose once the filter converges.
-        "tf_broadcast": False,
+        # Exactly one node publishes map -> odom, and which one depends on the
+        # mode. While the robot is being relocalized the SLAM engine still owns
+        # it and the filter must stay quiet (tf_broadcast false); once the
+        # deployment is localizing on a saved map the engine is paused so the
+        # map cannot be edited, and the filter owns the frame instead. Two
+        # publishers overwrite each other and the robot teleports between their
+        # answers, so this is never both.
+        "tf_broadcast": tf_broadcast,
         "transform_tolerance": 1.0,
     }
     nodes = [
         Node(
             package="nav2_map_server", executable="map_server", name="map_server",
-            output="screen", parameters=[{**common, "yaml_filename": map_yaml, "frame_id": global_frame}],
+            output="screen",
+            parameters=[{**common, "yaml_filename": map_yaml, "frame_id": global_frame,
+                         "topic_name": localizer_map_topic}],
         ),
         Node(
             package=package, executable=package.replace("_", "-") if package == "beluga_amcl" else "amcl",
@@ -107,7 +136,15 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("odom_frame", default_value="odom"),
         DeclareLaunchArgument("global_frame", default_value="map"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
-        DeclareLaunchArgument("min_particles", default_value="500"),
-        DeclareLaunchArgument("max_particles", default_value="2000"),
+        # /map while the SLAM engine is stopped -- the operator still has to see
+        # the map they loaded -- and a private topic whenever the engine is the
+        # one publishing there.
+        DeclareLaunchArgument("map_topic", default_value="/localizer/map"),
+        DeclareLaunchArgument("tf_broadcast", default_value="false"),
+        DeclareLaunchArgument("initial_x", default_value="0.0"),
+        DeclareLaunchArgument("initial_y", default_value="0.0"),
+        DeclareLaunchArgument("initial_yaw", default_value="0.0"),
+        DeclareLaunchArgument("min_particles", default_value="800"),
+        DeclareLaunchArgument("max_particles", default_value="8000"),
         OpaqueFunction(function=_launch_setup),
     ])

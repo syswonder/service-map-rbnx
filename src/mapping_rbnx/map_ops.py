@@ -28,6 +28,7 @@ import threading
 import time
 
 import logging
+from typing import Optional
 
 from mapping_rbnx import engines, lifecycle, localizers
 
@@ -357,6 +358,175 @@ def _occupancy_sample_ready(msg) -> tuple[bool, str]:
     return ready, summary
 
 
+_RELOC_THREAD: Optional[threading.Thread] = None
+
+
+def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
+    """Find the robot on `map_id` and give the map frame back to the engine.
+
+    The robot is not driven. A saved map is loaded when a robot has just been
+    switched on or carried somewhere, and asking someone to push it around
+    before the map can be used is a poor answer; matching the current scan
+    against the map needs no motion at all. The particle filter is kept for the
+    case the scan cannot settle -- a corridor that looks the same at both ends --
+    and that is the only case where the operator is asked to move anything.
+
+    Nothing publishes `map -> odom` until the answer has been checked, so a
+    consumer that plans or records in the map frame cannot act on a pose no one
+    has verified.
+    """
+    grid = localizers.load_grid(map_dir)
+    pose, detail = (seed, "using the pose given with the load") if seed is not None \
+        else (None, "")
+    if pose is None:
+        localizers.set_relocalization("running", "matching the scan against the map")
+        pose, detail = localizers.relocalize_statically(node, grid)
+    if pose is None:
+        static_detail = detail
+        # The scan alone cannot say where the robot is. A particle filter can,
+        # given motion, so the fallback runs and says plainly that the robot has
+        # to be moved for it.
+        localizers.set_relocalization(
+            "running", f"{static_detail}; falling back to {localizers.name()}, "
+                       f"which needs the robot to move")
+        pose, detail = _relocalize_with_filter(node, map_dir, map_id, static_detail)
+        if pose is None:
+            localizers.set_relocalization("failed", detail)
+            return
+
+    ok_c, fit_detail = _confirm_against_map(node, grid, pose)
+    if not ok_c:
+        localizers.set_relocalization("failed", f"{detail}, but {fit_detail}")
+        return
+
+    ok_m, detail_m = ops.switch_mode(node, "localization", map_dir, map_id, 30.0, pose)
+    if not ok_m:
+        localizers.set_relocalization(
+            "failed", f"{detail}, but the engine would not take the map frame back: {detail_m}")
+        return
+    ok_w, detail_w = ops.wait_ready(node, 90.0)
+    if not ok_w:
+        localizers.set_relocalization("failed", f"{detail}, but {detail_w}")
+        return
+    # The engine was started AT the recovered pose, so it needs no second
+    # telling. Publishing /initialpose as well made it search again from there
+    # and settle a metre and a half away -- two ways of saying the same thing,
+    # disagreeing.
+    #
+    # Whether it ended up where it was told is then checked rather than
+    # assumed: the laser is asked about the pose the engine is actually
+    # reporting, and a handover that lost the answer says so instead of
+    # reporting success and leaving a wrong pose on screen.
+    time.sleep(3.0)
+    ok_v, detail_v = _confirm_engine_pose(node, grid)
+    if not ok_v:
+        localizers.set_relocalization(
+            "failed", f"{detail}, but the engine did not take the pose it was given: "
+                      f"{detail_v}")
+        return
+    localizers.set_relocalization("done", f"{detail}; {fit_detail}; {detail_m}; {detail_v}")
+    log.info("[localizer] relocalized on %s at (%.2f, %.2f, %.2f)",
+             map_id, pose[0], pose[1], pose[2])
+
+
+def _confirm_engine_pose(node, grid) -> tuple[bool, str]:
+    """Check the pose the ENGINE now reports, not the one it was handed.
+
+    Between being told where it is and settling there, a scan matcher can move;
+    the only pose worth reporting to a consumer is the one it will actually
+    publish.
+    """
+    pose = live_pose(node)
+    if pose is None:
+        return False, "the engine published no pose to check"
+    fit, fit_detail = localizers.scan_fit(node, grid, pose)
+    if fit < 0.0:
+        return True, f"engine at ({pose[0]:.2f}, {pose[1]:.2f}); check skipped: {fit_detail}"
+    if fit < localizers.SCAN_FIT_MIN:
+        return False, (f"it reports ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f}) where the "
+                       f"laser scores only {fit:.0%}")
+    return True, f"engine settled at ({pose[0]:.2f}, {pose[1]:.2f}), laser {fit:.0%}"
+
+
+def live_pose(node, timeout_s: float = 5.0):
+    """The engine's own current pose in the map frame, from tf."""
+    try:
+        import tf2_ros
+        from rclpy.duration import Duration
+        from rclpy.time import Time
+    except Exception:  # noqa: BLE001
+        return None
+    buf = tf2_ros.Buffer()
+    listener = tf2_ros.TransformListener(buf, node, spin_thread=False)
+    deadline = time.monotonic() + timeout_s
+    base = os.environ.get("MAPPING_BASE_FRAME", "base_link")
+    frame = os.environ.get("MAPPING_MAP_FRAME", "map")
+    while time.monotonic() < deadline:
+        try:
+            tf = buf.lookup_transform(frame, base, Time(), Duration(seconds=0.2))
+        except Exception:  # noqa: BLE001
+            time.sleep(0.2)
+            continue
+        finally:
+            pass
+        t, q = tf.transform.translation, tf.transform.rotation
+        del listener
+        return (t.x, t.y, math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+    del listener
+    return None
+
+
+def _confirm_against_map(node, grid, pose) -> tuple[bool, str]:
+    """Second opinion on a recovered pose, from the laser the robot sees now."""
+    fit, detail = localizers.scan_fit(node, grid, pose)
+    if fit < 0.0:
+        return True, f"scan check skipped: {detail}"
+    if fit < localizers.SCAN_FIT_MIN:
+        return False, (f"the laser does not support that pose ({fit:.0%}, "
+                       f"{detail}) — it is not where the map says")
+    return True, f"confirmed by the laser ({fit:.0%})"
+
+
+def _relocalize_with_filter(node, map_dir: str, map_id: str, why: str):
+    """Fall back to the particle filter, which needs the robot to be driven."""
+    ok_l, detail_l = localizers.start(map_dir, map_id, owns_tf=False, map_topic="/map")
+    if not ok_l:
+        return None, f"{why}; and the localizer failed to start: {detail_l}"
+    try:
+        ready, detail_r = localizers.wait_ready(node)
+        if not ready:
+            return None, f"{why}; and the localizer did not come up: {detail_r}"
+        ok_g, detail_g = localizers.global_localize(node)
+        if not ok_g:
+            return None, f"{why}; and global localization failed: {detail_g}"
+        timeout_s = float(os.environ.get("MAPPING_RELOCALIZE_TIMEOUT_S", "180"))
+        ok_c, pose, detail_c = localizers.wait_for_convergence(
+            node, timeout_s, map_dir=map_dir)
+        if not ok_c:
+            return None, (f"{why}; and {detail_c} — drive the robot a few metres "
+                          f"past distinct geometry and load again")
+        fresh = localizers.current_pose(node) or pose
+        return fresh, f"{why}; recovered by {localizers.name()} after driving ({detail_c})"
+    finally:
+        localizers.stop()
+
+
+def _begin_relocalization(node, ops, map_dir: str, map_id: str, seed) -> tuple[bool, str]:
+    """Start `_relocalize` in the background, unless one is already running."""
+    global _RELOC_THREAD
+    if ops is None:
+        return False, "no engine to hand a recovered pose to"
+    if _RELOC_THREAD is not None and _RELOC_THREAD.is_alive():
+        return False, "a relocalization is already running"
+    _RELOC_THREAD = threading.Thread(
+        target=_relocalize, args=(node, ops, map_dir, map_id, seed),
+        name="relocalize", daemon=True)
+    _RELOC_THREAD.start()
+    return True, (f"relocalizing with {localizers.name()} in the background "
+                  f"(drive the robot to help it converge)")
+
+
 def _begin_target_map_wait(node) -> dict:
     """Wait for the latched occupancy published after a successful map load."""
     from nav_msgs.msg import OccupancyGrid
@@ -453,67 +623,43 @@ def load_map_impl(map_id: str, mode: str = "localization",
         # deployment asked for it: it is the path that can relocalize with no
         # prior pose, so `load_map` without a pose stops meaning "hope the scan
         # matcher converges from wherever the robot thinks it is".
-        if localizers.enabled():
-            # The localizer is a RELOCALIZATION plugin, not a second source of
-            # localization: it recovers where the robot is on a map it has no
-            # prior for, hands that pose to the SLAM engine and stops. Only one
-            # node ever owns map -> odom at the end of this — the engine — and
-            # the deployment can still map, switch mode and load again.
-            ok_h, detail_h = (ops.hold(node, 10.0) if ops is not None else (True, ""))
-            if not ok_h:
-                return {"ok": False, "detail": f"{algo} would not hold for relocalization: {detail_h}"}
-            ok_l, detail_l = localizers.start(map_dir, map_id)
-            if not ok_l:
-                if ops is not None:
-                    ops.resume(node, 10.0)
-                return {"ok": False, "detail": f"localizer failed to start: {detail_l}"}
-            try:
-                ready, detail_r = localizers.wait_ready(node)
-                if not ready:
-                    return {"ok": False, "detail": f"localizer did not come up: {detail_r}"}
-                if has_initial_pose:
-                    seed = pose_estimate_impl(x, y, theta)
-                    seed_detail = seed.get("detail", "")
-                else:
-                    ok_g, seed_detail = localizers.global_localize(node)
-                    if not ok_g:
-                        return {"ok": False, "detail": f"global localization failed: {seed_detail}"}
-                # The robot has to move for the filter to tell similar places
-                # apart, and this call cannot drive it — mapping does not own
-                # the chassis. So the wait is generous, and a timeout says what
-                # the caller has to do rather than just failing.
-                converge_timeout = float(os.environ.get("MAPPING_RELOCALIZE_TIMEOUT_S", "180"))
-                ok_c, pose, detail_c = localizers.wait_for_convergence(node, converge_timeout)
-                if not ok_c:
-                    return {"ok": False, "map_id": map_id, "mode": "relocalizing",
-                            "detail": f"{seed_detail}; {detail_c} — drive the robot "
-                                      "(a few metres past distinct geometry) and load again"}
-            finally:
-                # The filter has done its job either way; leaving it running
-                # would put a second publisher on map -> odom.
-                localizers.stop()
-            if ops is not None:
-                ok_a, detail_a = ops.activate(
-                    node, map_dir, map_id,
-                    float(os.environ.get("MAPPING_LOAD_DATABASE_TIMEOUT_S", "180")), pose)
-                if not ok_a:
-                    return {"ok": False, "detail": f"{detail_c}, but {algo} would not "
-                                                   f"take the recovered pose: {detail_a}"}
-                ok_rs, detail_rs = ops.resume(node, 10.0)
-                if not ok_rs:
-                    return {"ok": False, "detail": f"{detail_c}, but {algo} would not resume: {detail_rs}"}
+        # RTAB-Map is deliberately not routed through here. It opens a saved
+        # database in localization mode further down and relocalizes against it
+        # itself; the staged flow below is for an engine whose own node cannot
+        # localize without also editing the map.
+        if localizers.enabled() and algo != "rtabmap":
+            # Loading a map runs in three stages, and each one has exactly one
+            # publisher of `/map` and of `map -> odom`.
+            #
+            #   1. the mapping node stops. Its transform is the session's
+            #      answer, not the saved map's, and nobody should be acting on
+            #      a pose no one has checked. The saved grid goes on /map so
+            #      the operator still sees what they loaded.
+            #   2. the particle filter recovers the robot on that grid, without
+            #      publishing a transform, while the robot drives.
+            #   3. slam_toolbox comes back as its localization node, started at
+            #      the recovered pose. It holds only the saved graph, does not
+            #      add to it, and owns /map and map -> odom from then on.
+            #
+            # The call returns after stage 1, because an operator who loads a
+            # map wants to see the map rather than a minute of nothing.
+            ok_s, detail_s = ops.stop_engine()
+            if not ok_s:
+                return {"ok": False, "detail": f"{algo} would not stand down for the load: {detail_s}"}
             lifecycle.set_mode("localization")
             lifecycle.set_state(map_id, "localization", bump=False)
             # A saved map's frame is the artifact's own, not the previous live
             # session's: consumers holding map-frame coordinates must be told.
             lifecycle.mark_reset("localization")
+            seed = (x, y, theta) if has_initial_pose else None
+            started, detail_reloc = _begin_relocalization(node, ops, map_dir, map_id, seed)
             return {
                 "ok": True,
-                "detail": (f"{detail_l}; {seed_detail}; {detail_c}; "
-                           f"{algo} localized at ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f})"),
+                "detail": f"loaded {map_id}; {detail_s}; {detail_reloc}",
                 "map_id": map_id,
                 "mode": "localization",
                 "localizer": localizers.name(),
+                "relocalizing": started,
             }
         if algo != "rtabmap":
             # Engine-owned restore: slam_toolbox deserializes its pose graph and
@@ -632,7 +778,11 @@ def _register_engines() -> None:
         snapshot=lambda node, staging_dir, timeout_s: (False, "rtabmap snapshots via save_map_impl"),
         activate=lambda node, map_dir, map_id, timeout_s, pose=None: (False, "rtabmap activates via load_map_impl"),
         reset=lambda node, timeout_s: (False, "rtabmap resets via reset_map_impl"),
+        set_mode=_set_mode,
     ))
+    # The engines share this deployment's localizer: slam_toolbox hands it
+    # map -> odom while the engine is frozen on a saved map.
+    engines.bind_localizer(localizers.enabled, localizers.start, localizers.stop)
 
 
 def read_meta(map_dir: str) -> dict[str, str]:
@@ -800,31 +950,68 @@ def _set_mode(node, mode: str) -> tuple[bool, str]:
     return (ok, srv if ok else f"{res} after {mode_timeout_s:.0f}s")
 
 
+def relocalize_impl() -> dict:
+    """Find the robot again on the map it is already localized on.
+
+    The case this exists for is a robot that was carried: its pose is now wrong
+    and nothing about the running system knows that, because a scan matcher
+    tracking frame to frame follows the robot into the wrong place quite
+    happily. Re-running the same search the load runs settles it, and the robot
+    does not have to be driven for it.
+    """
+    live = lifecycle.current()
+    map_id = live.get("map_id") or ""
+    if (live.get("mode") or "") != "localization" or not map_id:
+        return {"ok": False, "detail": "not localizing on a saved map; load one first"}
+    node = _get_node()
+    if node is None:
+        return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
+    ops = engines.engine_for(active_algo())
+    if ops is None:
+        return {"ok": False, "detail": f"{active_algo()} cannot relocalize"}
+    map_dir = os.path.join(MAPS_DIR, map_id)
+    # The engine stands down first, exactly as it does for a load: until the new
+    # answer has been checked nothing should be publishing the map frame, least
+    # of all the pose that is already known to be wrong.
+    ok_s, detail_s = ops.stop_engine()
+    if not ok_s:
+        return {"ok": False, "detail": f"the engine would not stand down: {detail_s}"}
+    lifecycle.mark_reset("localization")
+    started, detail = _begin_relocalization(node, ops, map_dir, map_id, None)
+    return {"ok": True, "map_id": map_id, "relocalizing": started,
+            "detail": f"{detail_s}; {detail}"}
+
+
 def switch_mode_impl(mode: str) -> dict:
-    """Flip the running rtabmap between mapping and localization on the CURRENT
-    map — no map load, no restart. Returns {ok, detail}."""
+    """Flip the running engine between mapping and localization on the map it
+    already has — no map load, no restart. Returns {ok, detail}.
+
+    How the flip is achieved is the engine's business: RTAB-Map has a service
+    for it, slam_toolbox is frozen and hands `map -> odom` to the localizer.
+    What every backend owes the caller is the same behaviour — in localization
+    mode the loaded map does not change and something still reports where the
+    robot is.
+    """
     mode = (mode or "").strip().lower()
     if mode not in ("localization", "mapping"):
         return {"ok": False, "detail": f"mode={mode!r} invalid (localization|mapping)"}
     node = _get_node()
     if node is None:
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
-    # Engines other than RTAB-Map have no in-place mode switch: load_map stopped
-    # the SLAM node so the localizer could own map -> odom, and there is nothing
-    # left to flip back. Say so instead of reporting a missing service.
     algo = active_algo()
-    if algo != "rtabmap":
-        return {"ok": False,
-                "detail": f"{algo} has no in-place mode switch; restart the mapping "
-                          f"service (map_mode: {mode}) to change mode"}
+    ops = engines.engine_for(algo)
+    if ops is None:
+        return {"ok": False, "detail": f"{algo} does not implement map persistence"}
+    live = get_mode_impl()
+    map_id = live.get("map_id", "")
+    map_dir = os.path.join(MAPS_DIR, map_id) if map_id else ""
     try:
-        ok, info = _set_mode(node, mode)
+        ok, detail = ops.switch_mode(node, mode, map_dir, map_id, 20.0)
         if not ok:
-            return {"ok": False, "detail": f"{info} — rtabmap may lack the mode service "
-                                           "(fall back to restart with config map_mode)"}
+            return {"ok": False, "detail": detail}
         # Mode flip only — the live frame does not move, so no generation bump.
         lifecycle.set_mode(mode)
-        return {"ok": True, "detail": f"switched to {mode} mode"}
+        return {"ok": True, "detail": f"switched to {mode} mode: {detail}"}
     except Exception as e:  # noqa: BLE001
         log.exception("switch_mode failed")
         return {"ok": False, "detail": str(e)}

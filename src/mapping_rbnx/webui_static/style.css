@@ -1,265 +1,702 @@
-/* Only what Bootstrap does not do: the full-window map canvas, the overlays
-   that float above it, and the two custom controls (mode switch, pose hint).
-   Spacing, buttons, cards, badges and the dark palette come from Bootstrap. */
+/* SPDX-License-Identifier: MulanPSL-2.0
+ *
+ * The mapping view in the same visual language as the scene view: a dark
+ * terminal-weight page where the map is the whole window and everything else
+ * is chrome laid over it. Written out rather than pulled from a UI framework
+ * because the two pages are read side by side and a framework's own idea of
+ * buttons, spacing and type made them look like different products.
+ */
+
 :root {
-  color-scheme: dark;
+  --bg: #08090c;
+  --panel: #0d0f14;
+  --chrome: #14171f;
+  --line: #303542;
+  --line-soft: #23262f;
+  --ink: #d8dde6;
+  --ink-dim: #8b93a3;
+  --blue: #5aa9ff;
+  --green: #5bd66f;
+  --amber: #d6a85b;
+  --red: #e0574a;
+  --pink: #d65b9a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --r: 5px;
+}
+
+* {
+  box-sizing: border-box;
 }
 html,
 body {
-  height: 100%;
-}
-body {
   margin: 0;
+  padding: 0;
+  height: 100%;
   overflow: hidden;
-  background: #0f1115;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+.d-none,
+[hidden] {
+  display: none !important;
 }
 
-/* ── the map is the page ─────────────────────────────────────────────────── */
 #mapcv {
   position: fixed;
   inset: 0;
-  width: 100vw;
-  height: 100vh;
-  display: block;
-  background: #0a0d12;
+  width: 100%;
+  height: 100%;
   cursor: grab;
   touch-action: none;
 }
-#mapcv:active {
-  cursor: grabbing;
-}
-/* Toolbar column, floating over the map so nothing can reflow the view. */
-.overlay-tl {
+
+/* ---- top-left chrome -------------------------------------------------- */
+
+/* justify-items:start is what stops the toolbar tracking the width of the
+   status row below it. That row carries the live pose, so it changes width
+   every poll, and a stretched toolbar visibly breathed with it. */
+#chrome {
   position: fixed;
-  left: 1rem;
-  top: 1rem;
+  left: 10px;
+  top: 10px;
   z-index: 6;
-  max-width: calc(100vw - 2rem);
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  max-width: calc(100vw - 20px);
 }
-.overlay-tl .card,
-.panel {
-  --bs-card-bg: rgba(23, 26, 33, 0.94);
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 5px 6px;
+  background: rgba(20, 23, 31, 0.94);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
   backdrop-filter: blur(6px);
 }
-.tool {
+
+.brand {
+  padding: 0 8px 0 4px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.brand span {
+  color: var(--ink-dim);
+  font-weight: 400;
+}
+
+.sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 3px;
+  background: var(--line);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+.btn {
   display: inline-flex;
   align-items: center;
-  gap: 0.45rem;
+  gap: 5px;
+  padding: 4px 9px;
+  white-space: nowrap;
+  background: #1b1f29;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
 }
-.tool svg,
-.ico {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
+.btn:hover {
+  background: #242936;
+  border-color: #3d4354;
+}
+.btn:active {
+  background: #171b23;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+.btn[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn svg {
+  width: 13px;
+  height: 13px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
+  flex: 0 0 auto;
 }
-.mw-status {
-  max-width: min(46vw, 640px);
+/* A pressed toolbar button means "this panel is the one on screen". */
+.btn.active {
+  background: #23384f;
+  border-color: #3f6b96;
+  color: #cfe4ff;
 }
-/* Visibility is a class, not an inline style: Bootstrap's display utilities
-   carry !important, so a d-flex on this element beat style="display:none" and
-   the banner was always on screen -- empty whenever the mode was not
-   localization. */
+.btn.danger {
+  border-color: #5a2a26;
+  color: #f0a79e;
+}
+.btn.danger:hover {
+  background: #3a1e1b;
+  border-color: #7c3a34;
+}
+.btn.primary {
+  background: #1d3a58;
+  border-color: #3f6b96;
+  color: #d6e8ff;
+}
+.btn.primary:hover {
+  background: #24486d;
+}
+.btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-dim);
+  padding: 2px 5px;
+}
+.btn.ghost:hover {
+  background: #20242e;
+  color: var(--ink);
+}
+.btn.sm {
+  padding: 2px 7px;
+  font-size: 11px;
+}
+
+/* ---- status chips ------------------------------------------------------ */
+
+.chips {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.chip {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--ink-dim);
+  background: rgba(13, 15, 20, 0.92);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.chip b {
+  color: var(--ink);
+  font-weight: 600;
+}
+/* The pose chip's digits change every poll; tabular figures and a floor on
+   its width keep the row from shuffling as they do. */
+#posechip {
+  font-variant-numeric: tabular-nums;
+  /* Wide enough for the longest form this ever takes, so a minus sign or an
+     extra digit appearing does not resize the chip mid-poll. */
+  min-width: 42ch;
+}
+#status {
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip.ok {
+  color: #bff0c6;
+  border-color: #2f5c38;
+  background: rgba(30, 62, 38, 0.55);
+}
+.chip.warn {
+  color: #f2dfae;
+  border-color: #6b5526;
+  background: rgba(64, 51, 22, 0.55);
+}
+.chip.bad {
+  color: #f6c3bc;
+  border-color: #6b302a;
+  background: rgba(64, 27, 23, 0.55);
+}
+
+/* ---- mode switch ------------------------------------------------------- */
+
+.switch {
+  position: relative;
+  display: inline-flex;
+  padding: 2px;
+  background: rgba(13, 15, 20, 0.94);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 2px);
+  border-radius: 3px;
+  background: #24486d;
+  transition: transform 0.16s ease;
+}
+.switch.loc .knob {
+  transform: translateX(100%);
+  background: #1e5c3a;
+}
+.swopt {
+  position: relative;
+  z-index: 1;
+  padding: 3px 12px;
+  min-width: 92px;
+  background: none;
+  border: 0;
+  border-radius: 3px;
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+.swopt.on {
+  color: #eaf1fb;
+}
+
+/* ---- warning strip ----------------------------------------------------- */
+
 #modewarn {
   display: none;
-  max-width: min(680px, calc(100vw - 2rem));
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  max-width: 100%;
+  color: #f2dfae;
+  background: rgba(58, 45, 18, 0.94);
+  border: 1px solid #6b5526;
+  border-radius: var(--r);
 }
 #modewarn.on {
   display: flex;
 }
+#modewarntext {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
-/* ── floating panels ─────────────────────────────────────────────────────── */
-.panel {
+/* ---- right dock -------------------------------------------------------- */
+
+/* One dock, one visible panel: panels used to be separate floating cards and
+   opening two of them put one on top of the other. */
+#dock {
   position: fixed;
-  right: 1rem;
-  top: 1rem;
-  z-index: 6;
+  right: 10px;
+  top: 10px;
+  bottom: 10px;
+  z-index: 7;
+  width: clamp(280px, 26vw, 400px);
   display: none;
-  width: 22rem;
-  max-height: calc(100vh - 2rem);
+  flex-direction: column;
+  background: rgba(13, 15, 20, 0.96);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  backdrop-filter: blur(6px);
+  overflow: hidden;
 }
-.panel.on {
+#dock.on {
   display: flex;
 }
-/* Two open panels stack rather than overlap. */
-#savepanel.on ~ #libpanel.on {
-  top: 9.5rem;
-}
-#logpanel {
-  width: 27rem;
-  top: auto;
-  bottom: 1rem;
-  max-height: 45vh;
-}
-.mapitem {
+#docktabs {
   display: flex;
-  gap: 0.5rem;
-  align-items: center;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 27px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--line);
 }
-.mapitem img {
-  width: 56px;
-  height: 56px;
-  object-fit: contain;
-  background: #000;
-  border-radius: 0.25rem;
+.tab {
+  padding: 0 12px;
+  background: none;
+  border: 0;
+  border-right: 1px solid var(--line-soft);
+  color: var(--ink-dim);
+  font-size: 11px;
+  cursor: pointer;
 }
-.mapitem .mi {
+.tab:hover {
+  color: var(--ink);
+  background: #1b1f29;
+}
+.tab.on {
+  color: #cfe4ff;
+  background: var(--panel);
+  box-shadow: inset 0 -2px 0 var(--blue);
+}
+#dockclose {
+  margin-left: auto;
+  border-right: 0;
+  padding: 0 10px;
+}
+.pane {
+  display: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  padding: 10px;
+  gap: 8px;
+  overflow: auto;
+}
+.pane.on {
+  display: flex;
+}
+.hint {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+
+input[type="text"],
+input:not([type]) {
   flex: 1 1 auto;
   min-width: 0;
+  padding: 5px 8px;
+  font: inherit;
+  color: var(--ink);
+  background: #12151c;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+input:focus {
+  outline: none;
+  border-color: #3f6b96;
+}
+.row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 
-/* ── mode switch: one setting, two states ────────────────────────────────── */
-.switch {
-  position: relative;
-  display: inline-flex;
-  background: rgba(15, 17, 21, 0.94);
-  border: 1px solid var(--bs-border-color);
-  border-radius: 999px;
-  padding: 3px;
+/* ---- saved maps -------------------------------------------------------- */
+
+.mapitem {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  background: #12151c;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
 }
-.switch .knob {
-  position: absolute;
-  top: 3px;
-  bottom: 3px;
-  left: 3px;
-  width: calc(50% - 3px);
-  border-radius: 999px;
-  background: var(--bs-primary);
-  transition:
-    transform 0.18s ease,
-    background 0.18s ease;
+.mapitem img {
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
+  background: #0a0c10;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
 }
-.switch.loc .knob {
-  transform: translateX(100%);
-  background: var(--bs-success);
+.mapitem .mi {
+  min-width: 0;
 }
-.switch .swopt {
-  position: relative;
-  z-index: 1;
-  background: transparent;
-  border: 0;
-  color: var(--bs-secondary-color);
-  border-radius: 999px;
-  padding: 0.25rem 0.9rem;
-  font-size: 0.8rem;
-  min-width: 5.75rem;
-  cursor: pointer;
-  transition: color 0.18s ease;
+.mapitem .mi b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.switch .swopt.on {
-  color: #fff;
-  font-weight: 600;
+.mapitem .mi div {
+  color: var(--ink-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mapitem .acts {
+  display: flex;
+  gap: 4px;
 }
 
-/* ── pose-estimate hint ──────────────────────────────────────────────────── */
+/* ---- log --------------------------------------------------------------- */
+
+#logbox {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+}
+#logbox > div {
+  padding: 2px 0;
+  border-bottom: 1px solid var(--line-soft);
+  word-break: break-word;
+}
+#logbox .t {
+  color: #6b7385;
+}
+
+/* ---- pose hint --------------------------------------------------------- */
+
 #posehint {
-  display: none;
   position: fixed;
   left: 50%;
-  top: 12rem;
+  bottom: 46px;
   transform: translateX(-50%);
-  z-index: 7;
-  max-width: 34rem;
-  --bs-card-bg: rgba(23, 26, 33, 0.96);
+  z-index: 8;
+  display: none;
+  max-width: min(560px, calc(100vw - 20px));
+  padding: 8px 12px;
+  background: rgba(58, 45, 18, 0.96);
+  border: 1px solid #6b5526;
+  border-radius: var(--r);
+  color: #f5e6bd;
 }
 #posehint.on {
   display: block;
 }
-/* The gesture, animated: a dot where you press, then an arrow drawn out of it.
-   Revealing a finished arrow keeps the head in view, which is the part that
-   says the drag sets a heading. */
-.phdemo {
-  flex: 0 0 66px;
-  height: 16px;
+#posehint .sub {
+  margin-top: 3px;
+  color: #c9b483;
+  font-size: 11px;
 }
-.phdot,
+.phdot {
+  fill: #f5e6bd;
+}
+.phline,
 .phhead {
-  fill: #ffb454;
-}
-.phline {
-  stroke: #ffb454;
-  stroke-width: 2;
+  stroke: #f5e6bd;
+  fill: #f5e6bd;
+  stroke-width: 1.5;
 }
 .phreveal {
-  animation: phdrag 1.8s ease-in-out infinite;
+  animation: phsweep 1.8s ease-in-out infinite;
+  transform-origin: 7px 8px;
 }
-@keyframes phdrag {
-  0% {
-    clip-path: inset(0 100% 0 0);
+@keyframes phsweep {
+  0%,
+  15% {
+    transform: scaleX(0);
     opacity: 0;
   }
-  15% {
-    opacity: 1;
-  }
-  70%,
-  92% {
-    clip-path: inset(0 0 0 0);
+  45%,
+  80% {
+    transform: scaleX(1);
     opacity: 1;
   }
   100% {
-    clip-path: inset(0 0 0 0);
+    transform: scaleX(1);
     opacity: 0;
   }
 }
 
-/* ── blocking overlays ───────────────────────────────────────────────────── */
+#maphint {
+  position: fixed;
+  left: 10px;
+  bottom: 8px;
+  z-index: 4;
+  color: var(--ink-dim);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+/* ---- overlays ---------------------------------------------------------- */
+
 #busy,
 #modal {
   position: fixed;
   inset: 0;
+  z-index: 20;
   display: none;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.72);
-  z-index: 50;
+  background: rgba(4, 5, 7, 0.72);
+  backdrop-filter: blur(2px);
 }
 #busy.on,
 #modal.on {
   display: flex;
 }
-/* The dialogs sit on a dimmed backdrop, so they need a surface of their own:
-   inheriting the card default left them frameless against the dark map. */
 #busybox,
 #modalbox {
-  background: #171a21;
-  border: 1px solid #3a4150 !important;
-  border-radius: 0.75rem;
+  width: min(440px, calc(100vw - 32px));
+  padding: 18px 20px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
 }
 #busybox {
-  min-width: 18rem;
-  max-width: 30rem;
+  text-align: center;
 }
-#modalbox {
-  width: min(36rem, calc(100vw - 2rem));
+#modalbox.danger {
+  border-color: #6b302a;
 }
-#modalbody {
+#modaltitle {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+#busytitle {
+  margin: 12px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+#modalbody,
+#busybody {
+  color: var(--ink-dim);
+  font-size: 11px;
   white-space: pre-wrap;
-  line-height: 1.6;
+}
+#modalacts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 16px;
+}
+.spinner {
+  width: 22px;
+  height: 22px;
+  margin: 0 auto;
+  border: 2px solid #2a303c;
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-.min-w-0 {
-  min-width: 0;
+/* ---- narrow windows ---------------------------------------------------- */
+
+/* Below this the dock would leave no map, so it becomes a bottom sheet and the
+   toolbar is allowed to wrap. */
+@media (max-width: 860px) {
+  #dock {
+    left: 10px;
+    right: 10px;
+    top: auto;
+    bottom: 10px;
+    width: auto;
+    max-height: 52vh;
+  }
+  #maphint {
+    display: none;
+  }
+  #status {
+    max-width: 22ch;
+  }
+}
+@media (max-width: 560px) {
+  .brand span {
+    display: none;
+  }
+  .btn .lbl {
+    display: none;
+  }
+  .swopt {
+    min-width: 68px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .phreveal,
+  .spinner,
+  .switch .knob {
+    animation: none;
+    transition: none;
+  }
 }
 
-/* Relocalization: the particle filter is spread over the map until it has seen
-   enough to narrow down, and the robot's arrow is a guess until then. The badge
-   pulses while that is true so the pose on screen is not read as fact. */
-#locbadge.loc-converging {
-  background: #7a5b00;
-  color: #ffe08a;
-  border: 1px solid #b98900;
-  animation: locpulse 1.2s ease-in-out infinite;
+/* Relocalization is in flight rather than simply true or false, so the chip
+   that reports it borrows the warning colour while the cloud is still spread
+   and the healthy one once it has settled. */
+.chip.loc-converging {
+  color: #f2dfae;
+  border-color: #6b5526;
+  background: rgba(64, 51, 22, 0.55);
 }
-#locbadge.loc-converged {
-  background: #14351d;
-  color: #7ee2a8;
-  border: 1px solid #2c7a4b;
+.chip.loc-converged {
+  color: #bff0c6;
+  border-color: #2f5c38;
+  background: rgba(30, 62, 38, 0.55);
 }
-@keyframes locpulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
+
+/* ---- localization trust ------------------------------------------------ */
+
+/* Given its own row, at full contrast: this is the difference between a robot
+   that knows where it is and one that will drive somewhere dangerous while
+   reporting centimetres of confidence. */
+#trust {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  max-width: 100%;
+  border: 1px solid;
+  border-radius: var(--r);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+#trust.on {
+  display: flex;
+}
+#trusticon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+#trusttext {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
+}
+#trusttext b {
+  font-weight: 600;
+}
+#trust.ok {
+  color: #bff0c6;
+  border-color: #2f5c38;
+  background: rgba(24, 54, 32, 0.94);
+}
+#trust.suspect {
+  color: #ffc9c0;
+  border-color: #8a3a31;
+  background: rgba(74, 26, 21, 0.96);
+  animation: trustpulse 1.6s ease-in-out infinite;
+}
+#trust.unknown {
+  color: #f2dfae;
+  border-color: #6b5526;
+  background: rgba(58, 45, 18, 0.94);
+}
+@keyframes trustpulse {
+  50% {
+    border-color: #d9584a;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #trust.suspect {
+    animation: none;
+  }
+}
+.chip.loc-failed {
+  color: #f6c3bc;
+  border-color: #6b302a;
+  background: rgba(64, 27, 23, 0.55);
 }

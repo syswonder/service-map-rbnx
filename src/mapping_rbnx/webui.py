@@ -109,8 +109,16 @@ def _log_add(kind: str, msg: str) -> None:
 
 
 def _live_pose_xytheta():
-    """Current map-frame pose as (x, y, yaw) from the latest /pose, or None."""
-    ps = _latest.get("pose")
+    """Current map-frame pose as (x, y, yaw), or None.
+
+    In localization mode the engine is frozen on the saved map and the particle
+    filter is what tracks the robot, so its estimate is the live pose; the
+    engine's own topic still publishes, but it publishes the pose it was frozen
+    at.
+    """
+    ps = _latest.get("localizer_pose") if _localizer_is_live() else None
+    if ps is None:
+        ps = _latest.get("pose")
     if ps is None:
         return None
     pp = ps.pose.pose
@@ -404,6 +412,10 @@ def _subscribe_range_sensors(node) -> None:
             log.warning("webui overlay: tf2 unavailable, no range overlay: %s", e)
             _tf_buffer = None
 
+    def _on_scan(msg) -> None:
+        _latest["scan"] = _scan_points(msg)
+        _latest["scan_msg"] = msg
+
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""
     if _range_subscribed["scan"]:
@@ -415,7 +427,10 @@ def _subscribe_range_sensors(node) -> None:
             from sensor_msgs.msg import LaserScan
             node.create_subscription(
                 LaserScan, scan_topic,
-                lambda m: _latest.__setitem__("scan", _scan_points(m)),
+                # The projected points draw the overlay; the message itself is
+                # what the map check needs, and re-projecting it back would
+                # throw away the ranges that check depends on.
+                _on_scan,
                 qos_profile_sensor_data)
             _range_subscribed["scan"] = True
             log.info("webui overlay: subscribed scan %s", scan_topic)
@@ -476,6 +491,81 @@ def _grid_to_png(grid, pose=None) -> bytes:
     return buf.getvalue()
 
 
+# "Is my localization right?" is the one question this page must answer without
+# being asked, because acting on a wrong one is what makes a robot dangerous.
+# A particle filter cannot answer it — its covariance says how much the
+# particles agree with each other, not with the world — so the answer comes
+# from the map: the fraction of the current laser's beams that land on a wall
+# the saved map already has. The threshold is the same one relocalization is
+# gated on, so the page and the recovery agree about what "right" means.
+_trust: dict = {"grid_for": "", "grid": None, "fit": None, "at": 0.0, "detail": "",
+                "history": []}
+TRUST_PERIOD_S = 2.0
+# One scan is a noisy witness: a person walking past, or a moment facing a wall
+# the map only half covers, drops a single reading well below the gate while the
+# robot is perfectly localized. Reporting the median of the last few readings
+# says what the last quarter-minute looked like, which is what an operator
+# glancing at the page needs to know.
+TRUST_WINDOW = 7
+
+
+def _localizer_is_live(max_age_s: float = 5.0) -> bool:
+    """Is the particle filter currently the thing tracking the robot?"""
+    if not localizers.enabled():
+        return False
+    at = float(_latest.get("localizer_pose_at") or 0.0)
+    return at > 0.0 and (time.time() - at) <= max_age_s
+
+
+def _localization_trust() -> dict:
+    """Whether the live pose is supported by the map, recomputed periodically.
+
+    Returns {} outside localization mode; otherwise a verdict of `ok`,
+    `suspect` or `unknown` with the measured fraction. `unknown` means the
+    laser cannot speak — the robot is looking at ground the map never covered —
+    which is not the same as a bad fix and must not be shown as one.
+    """
+    # The lifecycle is what knows which map is loaded; get_mode_impl reports the
+    # engine's mode and carries no map id, so reading the id from there returned
+    # nothing and the check silently never ran.
+    live = lifecycle.current()
+    if (live.get("mode") or "") != "localization":
+        return {}
+    map_id = live.get("map_id") or ""
+    if not map_id:
+        return {}
+    map_dir = os.path.join(MAPS_DIR, map_id)
+    if _trust["grid_for"] != map_id:
+        _trust.update(grid_for=map_id, grid=localizers.load_grid(map_dir),
+                      fit=None, at=0.0, detail="")
+    now = time.time()
+    if now - float(_trust["at"] or 0.0) >= TRUST_PERIOD_S:
+        pose = _live_pose_xytheta()
+        scan = _latest.get("scan_msg")
+        if pose is not None and scan is not None and _trust["grid"] is not None:
+            fit, detail = localizers.scan_fit_of(_trust["grid"], scan, pose)
+            history = _trust["history"]
+            if fit >= 0.0:
+                history.append(fit)
+                del history[:-TRUST_WINDOW]
+            _trust.update(fit=fit, detail=detail, at=now)
+        else:
+            _trust.update(fit=None, at=now, history=[],
+                          detail="waiting for a pose, a scan and the saved map")
+    history = _trust["history"]
+    if not history:
+        return {"verdict": "unknown", "threshold": localizers.SCAN_FIT_MIN,
+                "detail": _trust["detail"] or "no reading yet"}
+    ordered = sorted(history)
+    fit = ordered[len(ordered) // 2]
+    return {"verdict": "ok" if fit >= localizers.SCAN_FIT_MIN else "suspect",
+            "threshold": localizers.SCAN_FIT_MIN,
+            "fit": round(fit, 3),
+            "latest": round(history[-1], 3),
+            "samples": len(history),
+            "detail": _trust["detail"]}
+
+
 def _localization_state() -> dict:
     """How the particle filter is doing, for the page to say so.
 
@@ -491,12 +581,25 @@ def _localization_state() -> dict:
     # and the particle filter is not up, so there is nothing to wait for.
     if map_ops.get_mode_impl().get("mode", "") != "localization":
         return {"state": "off"}
+    reloc = localizers.relocalization()
     msg = _latest.get("localizer_pose")
     if msg is None:
-        return {"state": "waiting", "localizer": localizers.name()}
+        # No filter estimate is the normal case now: a scan matched against the
+        # map standing still never starts one. The recorded outcome is then the
+        # only thing that knows how the relocalization went.
+        state = {"done": "converged", "running": "converging",
+                 "failed": "failed"}.get(reloc.get("state"), "waiting")
+        return {"state": state, "localizer": localizers.name(),
+                "detail": reloc.get("detail", "")}
     position_stddev, yaw_stddev = localizers.spread(msg)
+    state = localizers.convergence_state(position_stddev, yaw_stddev)
+    if reloc.get("state") == "failed":
+        # The filter's own numbers are stale once it has been stopped; the
+        # recorded outcome is what actually happened.
+        state = "failed"
     return {
-        "state": localizers.convergence_state(position_stddev, yaw_stddev),
+        "state": state,
+        "detail": reloc.get("detail", ""),
         "localizer": localizers.name(),
         "position_stddev_m": round(position_stddev, 3),
         "yaw_stddev_rad": round(yaw_stddev, 3),
@@ -607,6 +710,7 @@ class _Handler(BaseHTTPRequestHandler):
                       "engine": map_ops.active_algo(),
                       "localizer": localizers.name(),
                       "localization": _localization_state(),
+                      "trust": _localization_trust(),
                       "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
@@ -691,6 +795,10 @@ class _Handler(BaseHTTPRequestHandler):
                     _track_convergence(x, y, th)
                 else:
                     _log_add("pose", f"✗ pose estimate: {out.get('detail','')}")
+                return self._json(out)
+            if p == "/api/relocalize":
+                out = map_ops.relocalize_impl()
+                _log_add("load", f"{'✓' if out.get('ok') else '✗'} relocalize: {out.get('detail','')}")
                 return self._json(out)
             if p == "/api/switch_mode":
                 mode = body.get("mode", "")

@@ -85,14 +85,37 @@ class RelocalizationHandoverTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("slam_toolbox", detail)
 
-    def test_the_localizer_never_broadcasts_the_frame(self):
-        # One owner for map -> odom at every instant. If this flips back to
-        # True the robot teleports between the filter's answer and the engine's.
+    def test_the_localizer_does_not_broadcast_the_frame_unless_asked(self):
+        # One owner for map -> odom at every instant. The filter is silent by
+        # default and speaks only when a caller has taken the engine off the
+        # frame first; two publishers make the robot teleport between their
+        # answers, which is what this guards.
         with open(os.path.join(os.path.dirname(__file__), "launch",
                                "localization_2d.launch.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn('"tf_broadcast": False', src)
-        self.assertNotIn('"tf_broadcast": True', src)
+        self.assertIn('DeclareLaunchArgument("tf_broadcast", default_value="false")', src)
+        self.assertIn('"tf_broadcast": tf_broadcast', src)
+
+    def test_a_loaded_map_is_localized_on_not_mapped_into(self):
+        # The asynchronous node folds every scan into whatever graph it holds,
+        # so localizing with it edits the map that was just loaded. The engine
+        # swaps to slam_toolbox's localization executable instead, and that one
+        # must not close loops: a closure against a fixed map has nothing to
+        # correct and wrenched a correctly localized robot three metres sideways.
+        with open(os.path.join(os.path.dirname(__file__), "launch",
+                               "slam_toolbox_localization.launch.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("localization_slam_toolbox_node", src)
+        self.assertIn('"do_loop_closing": False', src)
+        self.assertIn('"map_start_pose"', src)
+
+    def test_a_static_match_has_to_beat_the_alternatives(self):
+        # Any pose that explains the scan scores highly; what makes an answer
+        # trustworthy is that no other place explains it nearly as well. Without
+        # a margin the search returns the first saturated candidate, which was
+        # six metres from the robot and reported no doubt at all.
+        self.assertGreater(localizers.STATIC_MATCH_MIN, 0.5)
+        self.assertGreater(localizers.STATIC_MATCH_MARGIN, 0.0)
 
     def test_convergence_needs_travel_not_just_a_tight_cloud(self):
         # A filter standing still in a symmetric room collapses tightly onto

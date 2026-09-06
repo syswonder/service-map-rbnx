@@ -24,23 +24,18 @@ from launch_ros.actions import Node
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _launch_setup(context, *args, **kwargs):
-    """Build the node list. Side effects: none."""
-    scan_topic = LaunchConfiguration("scan_topic").perform(context)
-    base_frame = LaunchConfiguration("base_frame").perform(context)
-    odom_frame = LaunchConfiguration("odom_frame").perform(context)
-    map_frame = LaunchConfiguration("map_frame").perform(context)
-    use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() == "true"
-    mode = LaunchConfiguration("map_mode").perform(context).strip().lower()
-    resolution = float(LaunchConfiguration("resolution").perform(context))
-    max_laser_range = float(LaunchConfiguration("max_laser_range").perform(context))
-    travel_distance = float(LaunchConfiguration("minimum_travel_distance").perform(context))
-    travel_heading = float(LaunchConfiguration("minimum_travel_heading").perform(context))
-    scan_buffer = int(float(LaunchConfiguration("scan_buffer_size").perform(context)))
-    loop_distance = float(LaunchConfiguration("loop_search_maximum_distance").perform(context))
+def slam_toolbox_params(*, scan_topic, base_frame, odom_frame, map_frame, use_sim_time,
+                        mode, resolution, max_laser_range, travel_distance,
+                        travel_heading, scan_buffer, loop_distance) -> dict:
+    """The deployment's slam_toolbox tuning, shared by both of its launches.
 
+    The localization node is a different executable started later, and when it
+    was given a hand-typed subset of these the loop-closure gates fell back to
+    slam_toolbox's stock values -- a wrong loop closure then wrenched a freshly
+    relocalized robot two metres sideways. One dict, two launches.
+    """
     common = {"use_sim_time": use_sim_time}
-    slam_params = {
+    return {
         **common,
         "odom_frame": odom_frame,
         "map_frame": map_frame,
@@ -85,6 +80,29 @@ def _launch_setup(context, *args, **kwargs):
         "link_scan_maximum_distance": 1.5,
         "stack_size_to_use": 40000000,
     }
+
+
+def _launch_setup(context, *args, **kwargs):
+    """Build the node list. Side effects: none."""
+    scan_topic = LaunchConfiguration("scan_topic").perform(context)
+    base_frame = LaunchConfiguration("base_frame").perform(context)
+    odom_frame = LaunchConfiguration("odom_frame").perform(context)
+    map_frame = LaunchConfiguration("map_frame").perform(context)
+    use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() == "true"
+    mode = LaunchConfiguration("map_mode").perform(context).strip().lower()
+    resolution = float(LaunchConfiguration("resolution").perform(context))
+    max_laser_range = float(LaunchConfiguration("max_laser_range").perform(context))
+    travel_distance = float(LaunchConfiguration("minimum_travel_distance").perform(context))
+    travel_heading = float(LaunchConfiguration("minimum_travel_heading").perform(context))
+    scan_buffer = int(float(LaunchConfiguration("scan_buffer_size").perform(context)))
+    loop_distance = float(LaunchConfiguration("loop_search_maximum_distance").perform(context))
+
+    slam_params = slam_toolbox_params(
+        scan_topic=scan_topic, base_frame=base_frame, odom_frame=odom_frame,
+        map_frame=map_frame, use_sim_time=use_sim_time, mode=mode,
+        resolution=resolution, max_laser_range=max_laser_range,
+        travel_distance=travel_distance, travel_heading=travel_heading,
+        scan_buffer=scan_buffer, loop_distance=loop_distance)
     sim_time = "true" if use_sim_time else "false"
     # The two adapters are standalone scripts under scripts/, not ros2
     # entrypoints registered in a setup.py, so they are run the same way

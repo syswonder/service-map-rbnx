@@ -78,7 +78,15 @@ def write_grid(pgm_path, yaml_path, png_path, msg):
             f"resolution: {msg.info.resolution}\n"
             f"origin: [{msg.info.origin.position.x}, "
             f"{msg.info.origin.position.y}, 0.0]\n"
-            "negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n"
+            # These thresholds have to agree with the three values written
+            # above, and 0.25 did not. map_server reads a pixel as
+            # occ = (255 - pixel) / 255, so unknown (205) came out at 0.196 --
+            # under 0.25, so every cell the robot had never seen was served to
+            # nav2 as free floor, and the page rendered a map with no unknown
+            # state left in it at all. ROS's own default of 0.196 separates them
+            # by 0.00008, which is a coincidence rather than a margin; 0.1 keeps
+            # free (254 -> 0.004) and unknown (205 -> 0.196) far apart.
+            "negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.1\n"
         )
     try:
         from PIL import Image

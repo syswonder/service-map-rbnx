@@ -378,3 +378,52 @@ class TrustEnforcementTests(unittest.TestCase):
         self.webui._latest["pose_at"] = now - (self.webui.STALE_AFTER_S + 1)
         self.webui._latest["localizer_pose_at"] = 0.0
         self.assertIn("no pose", self.webui._stale_inputs(now))
+
+
+class SavedMapThresholdTests(unittest.TestCase):
+    """The saved map must still have three states when it is read back.
+
+    save_map writes nav2's pixel convention (254 free, 205 unknown, 0 occupied)
+    and a yaml beside it; the two have to agree. They did not. map_server reads
+    a pixel as occ = (255 - pixel) / 255, so unknown came out at 0.196, under a
+    free_thresh of 0.25 -- every cell the robot had never seen was handed to
+    nav2 as free floor to plan across, and a loaded map rendered pure black and
+    white with the unknown state gone. It only showed up on a loaded map:
+    while mapping, `/map` comes straight from slam_toolbox, where unknown is -1
+    and no threshold is involved.
+    """
+
+    UNKNOWN_PX, FREE_PX, OCCUPIED_PX = 205, 254, 0
+
+    @staticmethod
+    def _trinary(pixel, free_thresh, occupied_thresh=0.65):
+        """map_server's own reading of one pixel, negate: 0."""
+        occ = (255 - pixel) / 255.0
+        if occ > occupied_thresh:
+            return 100
+        return 0 if occ < free_thresh else -1
+
+    def _written_free_thresh(self):
+        import re
+        here = os.path.dirname(__file__)
+        src = open(os.path.join(here, "scripts", "save_map.py"), encoding="utf-8").read()
+        m = re.search(r"free_thresh: ([0-9.]+)", src)
+        self.assertIsNotNone(m, "save_map.py no longer writes free_thresh")
+        return float(m.group(1))
+
+    def test_the_three_states_survive_a_save_and_load(self):
+        ft = self._written_free_thresh()
+        self.assertEqual(self._trinary(self.FREE_PX, ft), 0)
+        self.assertEqual(self._trinary(self.UNKNOWN_PX, ft), -1,
+                         "unknown is being served as free floor")
+        self.assertEqual(self._trinary(self.OCCUPIED_PX, ft), 100)
+
+    def test_the_threshold_is_not_a_coincidence(self):
+        # ROS's default 0.196 separates unknown from free by 0.00008, which is
+        # close enough that a float or a rounded yaml turns the map back into
+        # two states. Insist on real clearance.
+        ft = self._written_free_thresh()
+        self.assertLess(ft, (255 - self.UNKNOWN_PX) / 255.0 - 0.05,
+                        "free_thresh sits too close to unknown to be safe")
+        self.assertGreater(ft, (255 - self.FREE_PX) / 255.0 + 0.05,
+                           "free_thresh sits too close to free to be safe")

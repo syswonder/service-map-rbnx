@@ -111,8 +111,15 @@ def distance_field(occ, resolution: float):
     return d * resolution
 
 
-def _score(grid, field, known, ranges, angles, xs, ys, yaws):
+def _score(grid, field, known, ranges, angles, xs, ys, yaws, sensor_xy=(0.0, 0.0)):
     """Likelihood of the scan at every (x, y, yaw) given, in [0, 1].
+
+    (x, y, yaw) is the ROBOT's pose and `sensor_xy` is where the laser is
+    mounted in the robot's frame, so the beams are cast from the laser, not
+    from the base. Casting from the base searched for where the LASER was and
+    returned it as where the ROBOT was: every fix came out short by the mount
+    offset, 0.202 m forward on this robot, and the overlay drew the scan that
+    far off the wall.
 
     Each beam contributes exp(-d^2 / 2 sigma^2) for the distance from where it
     ended to the nearest mapped wall; a beam ending where the map never looked
@@ -122,10 +129,14 @@ def _score(grid, field, known, ranges, angles, xs, ys, yaws):
     """
     import numpy as np
 
+    sx, sy = sensor_xy
+    cyaw, syaw = np.cos(yaws)[:, None], np.sin(yaws)[:, None]
+    lx = xs[:, None] + sx * cyaw - sy * syaw
+    ly = ys[:, None] + sx * syaw + sy * cyaw
     cos = np.cos(yaws[:, None] + angles[None, :])
     sin = np.sin(yaws[:, None] + angles[None, :])
-    ex = xs[:, None] + ranges[None, :] * cos
-    ey = ys[:, None] + ranges[None, :] * sin
+    ex = lx + ranges[None, :] * cos
+    ey = ly + ranges[None, :] * sin
     col = ((ex - grid.origin[0]) / grid.resolution).astype(np.int32)
     row = ((ey - grid.origin[1]) / grid.resolution).astype(np.int32)
     inside = (col >= 0) & (col < grid.width) & (row >= 0) & (row < grid.height)
@@ -139,7 +150,8 @@ def _score(grid, field, known, ranges, angles, xs, ys, yaws):
     return like.mean(axis=1), inside.sum(axis=1)
 
 
-def global_scan_match(grid, msg, tolerance_cells: int = 3) -> Optional[Match]:
+def global_scan_match(grid, msg, tolerance_cells: int = 3,
+                     sensor_xy: tuple = (0.0, 0.0)) -> Optional[Match]:
     """Best pose for `msg` on `grid`, or None when the scan says nothing.
 
     `grid` is `localizers._Grid`; the search runs over its free cells, since a
@@ -180,7 +192,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3) -> Optional[Match]:
     for yaw in yaws:
         s, _ = _score(grid, field, known, ranges, angles,
                       px.astype(np.float32), py.astype(np.float32),
-                      np.full(len(px), yaw, dtype=np.float32))
+                      np.full(len(px), yaw, dtype=np.float32), sensor_xy)
         for i in np.argsort(s)[-FINE_CANDIDATES:]:
             best.append((float(s[i]), float(px[i]), float(py[i]), float(yaw)))
     best.sort(reverse=True)
@@ -196,7 +208,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3) -> Optional[Match]:
         gx, gy = gx.ravel(), gy.ravel()
         for dy in dyaws:
             s, _ = _score(grid, field, known, ranges, angles, gx, gy,
-                          np.full(len(gx), cyaw + dy, dtype=np.float32))
+                          np.full(len(gx), cyaw + dy, dtype=np.float32), sensor_xy)
             i = int(np.argmax(s))
             refined.append((float(s[i]), float(gx[i]), float(gy[i]), float(cyaw + dy)))
     refined.sort(reverse=True)
@@ -210,7 +222,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3) -> Optional[Match]:
     gx, gy = gx.ravel(), gy.ravel()
     for dy in pyaws:
         sc, _ = _score(grid, field, known, ranges, angles, gx, gy,
-                       np.full(len(gx), pyaw0 + dy, dtype=np.float32))
+                       np.full(len(gx), pyaw0 + dy, dtype=np.float32), sensor_xy)
         i = int(np.argmax(sc))
         refined.append((float(sc[i]), float(gx[i]), float(gy[i]), float(pyaw0 + dy)))
     refined.sort(reverse=True)

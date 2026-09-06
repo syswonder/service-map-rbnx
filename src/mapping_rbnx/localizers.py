@@ -266,6 +266,13 @@ MIN_TRAVEL_M = 1.5
 # out reads 0.49. Below this the fix is not acted on.
 SCAN_FIT_MIN = float(os.environ.get("MAPPING_SCAN_FIT_MIN", "0.60"))
 SCAN_FIT_TOLERANCE_CELLS = 3
+# How much of a scan has to end on ground the map has observed before the fit is
+# a statement about the pose at all. A robot legitimately facing unmapped space
+# reads `unknown`; a robot whose pose has left the map reads `unknown` too,
+# rather than a high score computed from three surviving beams.
+SCAN_FIT_MIN_SCORED = float(os.environ.get("MAPPING_SCAN_FIT_MIN_SCORED", "0.35"))
+# Cached laser mount offset; see sensor_offset_xy.
+_sensor_offset = None
 
 
 class _Grid:
@@ -363,8 +370,16 @@ def load_grid(map_dir: str):
     return _Grid(width, height, _flip(occupied), _flip(known), resolution, origin)
 
 
-def scan_fit_of(grid, msg, pose) -> tuple[float, str]:
+def scan_fit_of(grid, msg, pose, sensor_xy=None) -> tuple[float, str]:
     """Fraction of one scan's endpoints that land on a wall of `grid`.
+
+    `pose` is the robot's base in the map; `sensor_xy` is where the laser sits
+    in the base frame. That offset is not a detail: on this robot the hokuyo is
+    0.202 m in front of base_link, so projecting the scan from the base put
+    every endpoint 20 cm past the wall it actually hit. The fit still read
+    100%, because the tolerance below is 15 cm and the walls are two cells
+    thick -- a correct pose looked correct for the wrong reason, and the
+    overlay drew the scan visibly off the wall.
 
     Returns (fraction, detail); the fraction is -1.0 when the scan says nothing
     about the pose, so "no evidence" is never mistaken for "bad fix". Beams that
@@ -375,16 +390,22 @@ def scan_fit_of(grid, msg, pose) -> tuple[float, str]:
     if grid is None or msg is None:
         return -1.0, "no map or no scan to check against"
     x, y, yaw = pose
+    sx, sy = sensor_xy or (0.0, 0.0)
+    # The laser's own origin in the map frame.
+    lx = x + sx * math.cos(yaw) - sy * math.sin(yaw)
+    ly = y + sx * math.sin(yaw) + sy * math.cos(yaw)
     hits = 0
     total = 0
+    valid = 0
     angle = msg.angle_min
     for r in msg.ranges:
         a = angle
         angle += msg.angle_increment
         if not (msg.range_min < r < msg.range_max) or r != r:
             continue
-        ex = x + r * math.cos(yaw + a)
-        ey = y + r * math.sin(yaw + a)
+        valid += 1
+        ex = lx + r * math.cos(yaw + a)
+        ey = ly + r * math.sin(yaw + a)
         if grid.occupied_near(ex, ey, SCAN_FIT_TOLERANCE_CELLS):
             hits += 1
             total += 1
@@ -394,7 +415,59 @@ def scan_fit_of(grid, msg, pose) -> tuple[float, str]:
     if total == 0:
         return -1.0, ("no beam ended in mapped territory — the robot is looking "
                       "at something the map does not cover")
-    return hits / total, f"{hits}/{total} beams over mapped ground land on a wall"
+    # A denominator floor, and the reason for it: beams landing in never-observed
+    # cells are excluded as evidence, so a pose that has drifted right off the
+    # map keeps only the handful of beams that happen to graze a wall -- and
+    # scores them 70% while the overlay shows the scan nowhere near the walls.
+    # Below this share of the scan, the reading is not a verdict about the pose,
+    # it is a verdict about how little of the scan was scored at all.
+    if total < SCAN_FIT_MIN_SCORED * valid:
+        return -1.0, (f"only {total} of {valid} beams ended on mapped ground "
+                      f"({total / max(1, valid):.0%}); too little of the scan is "
+                      "over the map to judge the pose")
+    return hits / total, (f"{hits}/{total} beams over mapped ground land on a wall "
+                          f"({total}/{valid} of the scan was scored)")
+
+
+SENSOR_OFFSET_ENV = "MAPPING_LASER_OFFSET_XY"
+
+
+def sensor_offset_xy(node=None, laser_frame: str = "", base_frame: str = "") -> tuple[float, float]:
+    """Where the laser sits in the base frame, from tf, or from the env override.
+
+    Looked up once and cached: it is a fixed mount. Falling back to (0, 0) is
+    wrong by however far the laser is mounted from the base, so the lookup
+    failing is logged rather than passed over quietly.
+    """
+    global _sensor_offset
+    if _sensor_offset is not None:
+        return _sensor_offset
+    raw = os.environ.get(SENSOR_OFFSET_ENV, "").strip()
+    if raw:
+        try:
+            a, b = (float(v) for v in raw.replace(",", " ").split()[:2])
+            _sensor_offset = (a, b)
+            return _sensor_offset
+        except ValueError:
+            log.warning("%s=%r is not 'x y'; ignoring", SENSOR_OFFSET_ENV, raw)
+    frame = laser_frame or os.environ.get("MAPPING_LASER_FRAME", "")
+    base = base_frame or os.environ.get("MAPPING_BASE_FRAME", "base_link")
+    if node is not None and frame:
+        try:
+            import tf2_ros
+            from rclpy.duration import Duration
+            buf = tf2_ros.Buffer()
+            tf2_ros.TransformListener(buf, node, spin_thread=True)
+            import rclpy.time
+            tr = buf.lookup_transform(base, frame, rclpy.time.Time(),
+                                      timeout=Duration(seconds=3.0)).transform.translation
+            _sensor_offset = (float(tr.x), float(tr.y))
+            log.info("laser sits at (%.3f, %.3f) in %s", tr.x, tr.y, base)
+            return _sensor_offset
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot read %s -> %s, scan checks will assume the laser "
+                        "is at the base: %s", base, frame, e)
+    return (0.0, 0.0)
 
 
 def scan_fit(node, grid, pose, timeout_s: float = 6.0) -> tuple[float, str]:
@@ -425,7 +498,8 @@ def scan_fit(node, grid, pose, timeout_s: float = 6.0) -> tuple[float, str]:
             pass
     if latest["msg"] is None:
         return -1.0, f"no scan on {topic} within {timeout_s:.0f}s"
-    return scan_fit_of(grid, latest["msg"], pose)
+    return scan_fit_of(grid, latest["msg"], pose,
+                       sensor_offset_xy(node, latest["msg"].header.frame_id))
 
 
 
@@ -484,7 +558,9 @@ def relocalize_statically(node, grid, timeout_s: float = 8.0):
     if latest["msg"] is None:
         return None, f"no scan on {topic} within {timeout_s:.0f}s"
 
-    match = matcher.global_scan_match(grid, latest["msg"])
+    match = matcher.global_scan_match(grid, latest["msg"],
+                                      sensor_xy=sensor_offset_xy(
+                                          node, latest["msg"].header.frame_id))
     if match is None:
         return None, "the scan does not cover enough of the map to place the robot"
     if match.score < STATIC_MATCH_MIN:

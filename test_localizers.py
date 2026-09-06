@@ -427,3 +427,51 @@ class SavedMapThresholdTests(unittest.TestCase):
                         "free_thresh sits too close to unknown to be safe")
         self.assertGreater(ft, (255 - self.FREE_PX) / 255.0 + 0.05,
                            "free_thresh sits too close to free to be safe")
+
+
+class ScanFitEvidenceTests(unittest.TestCase):
+    """A fit is a verdict on the pose only when the scan can deliver one.
+
+    Beams ending where the map never looked are excluded as evidence, which is
+    right: a robot facing an unmapped corridor should not be marked wrong for
+    it. But a pose that has drifted off the map excludes almost every beam for
+    the same reason, and the few that graze a wall then read 70% while the
+    overlay shows the scan nowhere near a wall. Below a floor on how much of
+    the scan was scored at all, the answer is "unknown", not a score.
+    """
+
+    class _Scan:
+        angle_min = -1.57
+        angle_increment = 0.0157      # 200 beams over 180 degrees
+        range_min = 0.05
+        range_max = 12.0
+
+        def __init__(self, ranges):
+            self.ranges = ranges
+
+    def _map(self):
+        """A 2 x 2 m map: one wall, and observed ground only near it."""
+        from mapping_rbnx import localizers
+        w = h = 40
+        occ, known = bytearray(w * h), bytearray(w * h)
+        for c in range(w):
+            occ[2 * w + c] = 1
+            for r in range(5):
+                known[r * w + c] = 1
+        return localizers._Grid(w, h, bytes(occ), bytes(known), 0.05, (0.0, 0.0))
+
+    def test_a_pose_that_has_left_the_map_reads_unknown_not_high(self):
+        from mapping_rbnx import localizers
+        # Facing off the edge: most beams leave the grid entirely and are no
+        # evidence, so only a fraction of the scan can be scored. Without the
+        # floor those few would be reported as the pose's quality.
+        fit, detail = localizers.scan_fit_of(self._map(), self._Scan([1.0] * 200),
+                                             (1.0, 0.15, -1.5708))
+        self.assertEqual(fit, -1.0, detail)
+        self.assertIn("too little of the scan", detail)
+        self.assertIn("25 of 200", detail)
+
+    def test_the_floor_is_a_share_of_the_scan_not_a_count(self):
+        from mapping_rbnx import localizers
+        self.assertGreater(localizers.SCAN_FIT_MIN_SCORED, 0.0)
+        self.assertLess(localizers.SCAN_FIT_MIN_SCORED, 1.0)

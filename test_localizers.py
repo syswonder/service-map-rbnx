@@ -314,3 +314,67 @@ class SlamToolboxParamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrustEnforcementTests(unittest.TestCase):
+    """Withdrawing the map frame — the part that makes the verdict binding.
+
+    The status line saying "suspect" is advice; nav2 accepted a goal and drove
+    on a pose 7 m wrong while it said so. Publishing `map -> odom` is a claim to
+    know where the robot is, so the claim is withdrawn when the evidence stops
+    supporting it — including when the evidence stops arriving at all.
+    """
+
+    def setUp(self):
+        from mapping_rbnx import webui, map_ops
+        self.webui, self.map_ops = webui, map_ops
+        self._relocalize = map_ops.relocalize_impl
+        self.calls = []
+        map_ops.relocalize_impl = lambda: (self.calls.append(1), {"ok": True})[1]
+        self._after = webui.WITHDRAW_AFTER_S
+        webui.WITHDRAW_AFTER_S = 0.0     # the timer itself is not what is under test
+        webui._trust.update(bad_since=0.0, withdrawn=False)
+
+    def tearDown(self):
+        self.map_ops.relocalize_impl = self._relocalize
+        self.webui.WITHDRAW_AFTER_S = self._after
+        self.webui._trust.update(bad_since=0.0, withdrawn=False)
+
+    def test_one_bad_reading_does_not_stand_the_robot_down(self):
+        # Somebody walking past the laser is not a lost robot.
+        self.webui._enforce_trust(False, "m", 0.3)
+        self.assertFalse(self.webui._trust["withdrawn"])
+        self.assertEqual(self.calls, [])
+
+    def test_sustained_disagreement_withdraws_once_and_relocalizes(self):
+        self.webui._enforce_trust(False, "m", 0.3)   # arms the timer
+        self.webui._enforce_trust(False, "m", 0.3)   # expires it (WITHDRAW_AFTER_S = 0)
+        self.assertTrue(self.webui._trust["withdrawn"])
+        self.webui._enforce_trust(False, "m", 0.3)   # must not fire again
+        self.assertEqual(len(self.calls), 1)
+
+    def test_recovery_re_arms_the_check(self):
+        self.webui._enforce_trust(False, "m", 0.3)
+        self.webui._enforce_trust(False, "m", 0.3)
+        self.webui._enforce_trust(True, "m", 0.9)
+        self.assertFalse(self.webui._trust["withdrawn"])
+        self.webui._enforce_trust(False, "m", 0.3)
+        self.webui._enforce_trust(False, "m", 0.3)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_silent_sensor_is_not_confidence(self):
+        # A carried robot froze mapping outright, and the check compared the
+        # cached scan against the cached pose: they were captured together, so
+        # they agreed perfectly. It read "ok 100%" for two minutes while the
+        # true error was 2.97 m. Silence has to be its own verdict.
+        import time
+        now = time.time()
+        self.webui._latest["scan_at"] = now
+        self.webui._latest["pose_at"] = now
+        self.assertEqual(self.webui._stale_inputs(now), "")
+        self.webui._latest["scan_at"] = now - (self.webui.STALE_AFTER_S + 1)
+        self.assertIn("no laser", self.webui._stale_inputs(now))
+        self.webui._latest["scan_at"] = now
+        self.webui._latest["pose_at"] = now - (self.webui.STALE_AFTER_S + 1)
+        self.webui._latest["localizer_pose_at"] = 0.0
+        self.assertIn("no pose", self.webui._stale_inputs(now))

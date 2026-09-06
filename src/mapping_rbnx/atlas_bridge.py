@@ -702,6 +702,9 @@ def init(cfg: dict):
         cloud=resolved.get("lidar_topic", ""),
     )
     webui.maybe_start()
+    # Independent of the page: nothing else notices a pose that has drifted off
+    # the map, and a robot acting on one is the failure this guards against.
+    webui.start_supervisor()
     return Ok()
 
 

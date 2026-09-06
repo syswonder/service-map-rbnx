@@ -674,7 +674,8 @@ input:focus {
   border-color: #2f5c38;
   background: rgba(24, 54, 32, 0.94);
 }
-#trust.suspect {
+#trust.suspect,
+#trust.stale {
   color: #ffc9c0;
   border-color: #8a3a31;
   background: rgba(74, 26, 21, 0.96);
@@ -691,7 +692,8 @@ input:focus {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  #trust.suspect {
+  #trust.suspect,
+  #trust.stale {
     animation: none;
   }
 }

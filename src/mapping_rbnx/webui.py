@@ -46,7 +46,8 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 # frame, so the page can draw them straight onto the occupancy canvas and an
 # operator can see whether the live returns line up with the saved map.
 _latest = {"grid": None, "pose": None, "scan": None, "cloud": None,
-           "localizer_pose": None, "localizer_pose_at": 0.0}
+           "localizer_pose": None, "localizer_pose_at": 0.0,
+           "scan_at": 0.0, "pose_at": 0.0}
 # Topics for the range sensors, resolved through Atlas by the bridge and
 # injected with set_sensor_topics(). Empty means the deployment has no such
 # capability bound, and the page simply has nothing to draw.
@@ -188,6 +189,7 @@ def _ensure_subscriptions() -> None:
 
             def _on_pose(msg):
                 _latest["pose"] = msg
+                _latest["pose_at"] = time.time()
 
             def _on_localizer_pose(msg):
                 # The particle filter's own estimate, kept for its covariance:
@@ -415,6 +417,7 @@ def _subscribe_range_sensors(node) -> None:
     def _on_scan(msg) -> None:
         _latest["scan"] = _scan_points(msg)
         _latest["scan_msg"] = msg
+        _latest["scan_at"] = time.time()
 
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""
@@ -451,7 +454,13 @@ def _subscribe_range_sensors(node) -> None:
 
 def _grid_to_png(grid, pose=None) -> bytes:
     """Render a nav_msgs/OccupancyGrid to a PNG (free=white, occ=black,
-    unknown=grey), origin bottom-left, with an optional robot pose marker."""
+    unknown=grey), origin bottom-left, with an optional robot pose marker.
+
+    The conventional palette, deliberately. An occupancy grid carries three
+    states and the whole of its meaning is telling them apart; a dark-theme
+    inversion tried here put free and unknown within twenty greys of each other
+    and left only wall outlines -- one state gone, and the map no longer read as
+    an occupancy grid at all."""
     from PIL import Image, ImageDraw
     w, h = grid.info.width, grid.info.height
     res = grid.info.resolution
@@ -499,7 +508,16 @@ def _grid_to_png(grid, pose=None) -> bytes:
 # the saved map already has. The threshold is the same one relocalization is
 # gated on, so the page and the recovery agree about what "right" means.
 _trust: dict = {"grid_for": "", "grid": None, "fit": None, "at": 0.0, "detail": "",
-                "history": []}
+                "history": [], "bad_since": 0.0, "withdrawn": False}
+# Publishing `map -> odom` is a claim to know where the robot is. When the laser
+# has disagreed with the map for this long, the claim is withdrawn: the engine
+# stands down and a relocalization starts. Everything downstream then loses the
+# map frame and stops on its own -- nav2 reports `Localization: inactive` and
+# refuses goals, Scene's tf lookups return nothing and it records nothing --
+# without mapping having to reach into either of them. A page that only says
+# "do not send goals" is advice, and a robot driving on a pose known to be wrong
+# is exactly what this exists to prevent.
+WITHDRAW_AFTER_S = float(os.environ.get("MAPPING_TRUST_WITHDRAW_AFTER_S", "12"))
 TRUST_PERIOD_S = 2.0
 # One scan is a noisy witness: a person walking past, or a moment facing a wall
 # the map only half covers, drops a single reading well below the gate while the
@@ -515,6 +533,29 @@ def _localizer_is_live(max_age_s: float = 5.0) -> bool:
         return False
     at = float(_latest.get("localizer_pose_at") or 0.0)
     return at > 0.0 and (time.time() - at) <= max_age_s
+
+
+# How long either input may go missing before the check refuses to speak for it.
+# Longer than any real gap between scans, short enough that a robot cannot cross
+# a room on a pose nothing is updating.
+STALE_AFTER_S = float(os.environ.get("MAPPING_TRUST_STALE_AFTER_S", "5"))
+
+
+def _stale_inputs(now: float) -> str:
+    """Why the check cannot run right now, or "" when both inputs are current."""
+    scan_age = now - float(_latest.get("scan_at") or 0.0)
+    pose_at = max(float(_latest.get("pose_at") or 0.0),
+                  float(_latest.get("localizer_pose_at") or 0.0))
+    pose_age = now - pose_at
+    if not _latest.get("scan_at"):
+        return "no laser has arrived yet"
+    if scan_age > STALE_AFTER_S:
+        return f"no laser for {scan_age:.0f}s"
+    if not pose_at:
+        return "no pose has arrived yet"
+    if pose_age > STALE_AFTER_S:
+        return f"no pose for {pose_age:.0f}s"
+    return ""
 
 
 def _localization_trust() -> dict:
@@ -540,9 +581,20 @@ def _localization_trust() -> dict:
                       fit=None, at=0.0, detail="")
     now = time.time()
     if now - float(_trust["at"] or 0.0) >= TRUST_PERIOD_S:
-        pose = _live_pose_xytheta()
-        scan = _latest.get("scan_msg")
-        if pose is not None and scan is not None and _trust["grid"] is not None:
+        # Comparing a stale scan against a stale pose measures nothing: the two
+        # were captured together and agree with each other for as long as both
+        # sit still in memory. A run that carried the robot for real read
+        # `ok 100%` for two minutes after the laser stopped arriving, while the
+        # true error was 2.97 m -- a system that has stopped listening reporting
+        # perfect confidence. So silence is its own verdict, and it withdraws
+        # the map frame on the same timer a wrong pose does: a robot nobody is
+        # tracking must not keep being navigated.
+        stale = _stale_inputs(now)
+        pose = None if stale else _live_pose_xytheta()
+        scan = None if stale else _latest.get("scan_msg")
+        if stale:
+            _trust.update(fit=None, at=now, history=[], detail=stale)
+        elif pose is not None and scan is not None and _trust["grid"] is not None:
             fit, detail = localizers.scan_fit_of(_trust["grid"], scan, pose)
             history = _trust["history"]
             if fit >= 0.0:
@@ -554,16 +606,57 @@ def _localization_trust() -> dict:
                           detail="waiting for a pose, a scan and the saved map")
     history = _trust["history"]
     if not history:
+        stale = _stale_inputs(time.time())
+        if stale:
+            _enforce_trust(False, map_id, 0.0)
+            out = {"verdict": "stale", "threshold": localizers.SCAN_FIT_MIN,
+                   "detail": stale}
+            if _trust["withdrawn"]:
+                out["withdrawn"] = True
+            return out
         return {"verdict": "unknown", "threshold": localizers.SCAN_FIT_MIN,
                 "detail": _trust["detail"] or "no reading yet"}
     ordered = sorted(history)
     fit = ordered[len(ordered) // 2]
-    return {"verdict": "ok" if fit >= localizers.SCAN_FIT_MIN else "suspect",
-            "threshold": localizers.SCAN_FIT_MIN,
-            "fit": round(fit, 3),
-            "latest": round(history[-1], 3),
-            "samples": len(history),
-            "detail": _trust["detail"]}
+    good = fit >= localizers.SCAN_FIT_MIN
+    _enforce_trust(good, map_id, fit)
+    out = {"verdict": "ok" if good else "suspect",
+           "threshold": localizers.SCAN_FIT_MIN,
+           "fit": round(fit, 3),
+           "latest": round(history[-1], 3),
+           "samples": len(history),
+           "detail": _trust["detail"]}
+    if _trust["withdrawn"]:
+        out["withdrawn"] = True
+    return out
+
+
+def _enforce_trust(good: bool, map_id: str, fit: float) -> None:
+    """Withdraw the map frame while the laser says the pose is wrong.
+
+    Hysteresis, not a hair trigger: a single bad reading is a person walking
+    past, and pulling the frame for that would stop a healthy robot. Sustained
+    disagreement is a robot that has been moved or has slipped, and driving on
+    is the dangerous option.
+    """
+    now = time.time()
+    if good:
+        _trust["bad_since"] = 0.0
+        if _trust["withdrawn"]:
+            _trust["withdrawn"] = False
+        return
+    if not _trust["bad_since"]:
+        _trust["bad_since"] = now
+        return
+    if _trust["withdrawn"] or now - _trust["bad_since"] < WITHDRAW_AFTER_S:
+        return
+    _trust["withdrawn"] = True
+    _log_add("load", f"✗ the laser has disagreed with '{map_id}' for "
+                     f"{WITHDRAW_AFTER_S:.0f}s ({fit:.0%}); withdrawing the map frame "
+                     f"and relocalizing")
+    out = map_ops.relocalize_impl()
+    if not out.get("ok"):
+        _log_add("load", f"✗ automatic relocalization refused: {out.get('detail','')}")
 
 
 def _localization_state() -> dict:
@@ -814,6 +907,36 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 _server = None
+
+
+_supervisor = None
+
+
+def start_supervisor() -> None:
+    """Keep checking the localization with nobody watching the page.
+
+    The reading and the withdrawal it drives are a property of the running
+    system, not a feature of the status page: a robot whose pose has gone wrong
+    is dangerous whether or not an operator has a browser open. Started
+    unconditionally by atlas_bridge, so a deployment that disables the web UI
+    still gets the check. The page reads the same state this loop maintains.
+    """
+    global _supervisor
+    if _supervisor is not None:
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(TRUST_PERIOD_S)
+            try:
+                _ensure_subscriptions()
+                _localization_trust()
+            except Exception as e:  # noqa: BLE001
+                log.warning("localization supervisor: %s", e)
+
+    _supervisor = threading.Thread(target=_loop, daemon=True, name="loc-supervisor")
+    _supervisor.start()
+    log.info("localization supervisor running every %.1fs", TRUST_PERIOD_S)
 
 
 def maybe_start() -> None:

@@ -24,7 +24,7 @@ function applyTrust() {
     return;
   }
   el.classList.add("on");
-  el.classList.remove("ok", "suspect", "unknown");
+  el.classList.remove("ok", "suspect", "stale", "unknown");
   el.classList.add(t.verdict);
   // The median of the recent readings, not the latest one: a single scan
   // dips whenever someone walks past the robot.
@@ -36,11 +36,20 @@ function applyTrust() {
     icon.textContent = "\u2713";
     text.innerHTML = "<b>Localization checks out</b> — " + pct +
       " of the laser lands on mapped walls (needs " + gate + ")";
+  } else if (t.verdict == "stale") {
+    icon.textContent = "!";
+    text.innerHTML = "<b>Nothing is tracking the robot</b> — " + (t.detail || "") +
+      ". The check cannot run, so the map frame is withdrawn rather than " +
+      "assumed good.";
   } else if (t.verdict == "suspect") {
     icon.textContent = "!";
-    text.innerHTML = "<b>Localization does not match the map</b> — only " + pct +
-      " of the laser lands on mapped walls (needs " + gate +
-      "). Do not send goals; drive it until this clears.";
+    text.innerHTML = t.withdrawn
+      ? "<b>Map frame withdrawn</b> — only " + pct +
+        " of the laser lands on mapped walls. Navigation and recording are " +
+        "stopped until this is settled; relocalizing."
+      : "<b>Localization does not match the map</b> — only " + pct +
+        " of the laser lands on mapped walls (needs " + gate +
+        "). The map frame is withdrawn if this holds.";
   } else {
     icon.textContent = "?";
     text.innerHTML = "<b>Localization unverified</b> — " + (t.detail || "no evidence either way");

@@ -26,8 +26,39 @@ optional:
   algo:
     type: string
     default: rtabmap
-    allowed: [rtabmap, dlio, fastlio2]
-    description: Mapping engine. fastlio2 is retained only for diagnostics.
+    allowed: [rtabmap, slam_toolbox, dlio, fastlio2]
+    description: >-
+      Mapping engine. rtabmap is sensor-agnostic (2D/3D/RGB-D) and the default;
+      slam_toolbox is 2D-lidar-only, CPU-only, and serializes its pose graph to
+      two files instead of a database. fastlio2 is retained only for diagnostics.
+
+  localizer:
+    type: string
+    default: none
+    allowed: [none, amcl, beluga]
+    description: >-
+      Localization engine used by load_map on a saved map. `none` keeps the SLAM
+      engine's own localization (needs a pose seed close enough to converge).
+      `amcl` (nav2) and `beluga` (beluga_amcl, interface-compatible) run a
+      particle filter over the saved occupancy grid and can relocalize with no
+      prior pose at all — load_map without an initial pose then triggers global
+      localization instead of guessing. CPU only, a few tens of MB.
+
+  localizer_particles:
+    type: mapping[string, scalar]
+    description: >-
+      Optional {min, max} particle counts for the localizer (defaults 500/2000).
+      More particles converge from worse guesses and cost proportionally more.
+
+  slam_toolbox_params:
+    type: mapping[string, scalar]
+    description: >-
+      Scan-matching overrides for algo: slam_toolbox, the counterpart of
+      rtabmap_params. Keys: min_travel_m and min_heading_rad (how far the robot
+      moves before a new pose-graph node), scan_buffer (how many recent scans
+      are matched against each other) and loop_search_m (radius searched for a
+      loop closure). Defaults suit a slow indoor platform in a room-scale map:
+      0.1 m, 0.1 rad, 30 scans, 2.5 m. Unset keys keep those defaults.
 
   occupancy_sources:
     type: list[string]

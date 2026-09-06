@@ -69,13 +69,16 @@ from map_mcp import (  # type: ignore  # noqa: E402
     GetPose_Request as McpGetPoseReq,
     GetPose_Response as McpGetPoseResp,
 )
+from mapping_rbnx import engines  # noqa: E402
 from mapping_rbnx import lifecycle  # noqa: E402
+from mapping_rbnx import localizers  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
     choose_provider_record,
     resolve_occupancy_sources,
     resolve_rtabmap_overrides,
+    resolve_slam_toolbox_overrides,
     select_rtabmap_inputs,
 )
 
@@ -266,6 +269,21 @@ _ALGO_TOPIC_BINDINGS: dict[str, dict[str, str]] = {
         # same map→odom correction baked in via /tf. When icp_odometry
         # is running internally, this IS the odom source.
         "robonix/service/map/odom":           "/rtabmap/odom",
+    },
+    "slam_toolbox": {
+        # Karto scan matching + pose graph, 2D lidar only. slam_toolbox owns
+        # /map and the map → odom transform itself; there is no 3D cloud, so the
+        # pointcloud contract is backed by the same adapter dlio uses in reverse
+        # — a laser-scan-to-cloud republisher in the launch — rather than left
+        # unbound, because every algo must back the whole exported surface.
+        "robonix/service/map/occupancy_grid": "/map",
+        "robonix/service/map/pointcloud":     "/robonix/map/cloud",
+        # Same tf_to_pose adapter as rtabmap: slam_toolbox publishes /pose only
+        # in localization mode, while map → base_link is always in tf.
+        "robonix/service/map/pose":           "/robonix/map/pose",
+        # No corrected-odometry stream of its own; the chassis odometry with the
+        # map → odom correction in tf is what consumers get.
+        "robonix/service/map/odom":           "/robonix/map/odom",
     },
     "dlio": {
         # Direct LiDAR-Inertial Odometry: real-robot 3D livox path.
@@ -569,6 +587,50 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     resolved.update(persist)
+    # Frames and clock reach the launch through the same resolved file the
+    # topics do; slam_toolbox takes them as launch arguments and rtabmap reads
+    # them from its own params, so writing them unconditionally is harmless.
+    resolved.setdefault("base_frame", str(cfg.get("base_frame") or "base_link"))
+    resolved.setdefault("odom_frame", str(cfg.get("odom_frame") or "odom"))
+    resolved.setdefault("use_sim_time", "true" if cfg.get("use_sim_time") else "false")
+
+    # Localization engine used by load_map (see localizers.py). Configured once
+    # the sensor topics are resolved, because the particle filter subscribes to
+    # the same scan the SLAM engine does. A bad name raises here, at init.
+    particles = cfg.get("localizer_particles") or {}
+    localizer_name = localizers.configure({
+        "localizer": cfg.get("localizer"),
+        "scan_topic": resolved.get("scan_topic"),
+        "base_frame": cfg.get("base_frame") or "base_link",
+        "odom_frame": cfg.get("odom_frame") or "odom",
+        "use_sim_time": bool(cfg.get("use_sim_time", False)),
+        "min_particles": particles.get("min"),
+        "max_particles": particles.get("max"),
+    })
+    if localizer_name != "none":
+        log.info("[mapping] localizer=%s on scan=%s (load_map without a pose will "
+                 "request global localization)", localizer_name, resolved.get("scan_topic"))
+    # The engine needs the same settings for a different reason: loading a map
+    # restarts slam_toolbox as its localization executable, and a new process
+    # has to be given the deployment's scan topic and frames rather than
+    # inheriting them.
+    engine_ops = engines.engine_for(algo)
+    if engine_ops is not None and hasattr(engine_ops, "configure"):
+        engine_ops.configure(
+            scan_topic=resolved.get("scan_topic") or "",
+            base_frame=cfg.get("base_frame") or "base_link",
+            odom_frame=cfg.get("odom_frame") or "odom",
+            map_frame=cfg.get("map_frame") or "map",
+            use_sim_time=bool(cfg.get("use_sim_time", False)))
+    if algo == "slam_toolbox":
+        # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
+        # They reach the launch through the resolved file like every other
+        # setting; unset keys keep the launch defaults.
+        try:
+            resolved.update(resolve_slam_toolbox_overrides(
+                cfg.get("slam_toolbox_params")))
+        except RuntimeError as e:
+            return Err(str(e))
     if algo == "rtabmap":
         try:
             overrides_path = _write_rtabmap_overrides(cfg, resolved)
@@ -640,6 +702,9 @@ def init(cfg: dict):
         cloud=resolved.get("lidar_topic", ""),
     )
     webui.maybe_start()
+    # Independent of the page: nothing else notices a pose that has drifted off
+    # the map, and a robot acting on one is the failure this guards against.
+    webui.start_supervisor()
     return Ok()
 
 

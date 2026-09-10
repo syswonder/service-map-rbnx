@@ -359,6 +359,9 @@ def _occupancy_sample_ready(msg) -> tuple[bool, str]:
 
 
 _RELOC_THREAD: Optional[threading.Thread] = None
+# Set to retire a retry loop when a newer request supersedes it.
+_RELOC_STOP = threading.Event()
+RELOCALIZE_RETRY_S = float(os.environ.get("MAPPING_RELOCALIZE_RETRY_S", "20"))
 
 
 def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
@@ -378,13 +381,52 @@ def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
     grid = localizers.load_grid(map_dir)
     # Acceptance follows this map's own reference; see _fit_reference_now.
     localizers.set_fit_reference(read_meta(map_dir).get("scan_fit_reference"))
+    if _attempt_relocalization(node, ops, grid, map_dir, map_id, seed,
+                               allow_filter=True):
+        return
+
+    # A refusal is not a terminal state. The scan match declines when the spot
+    # it was asked about looks the same from more than one place, and that stops
+    # being true the moment the robot is anywhere else -- pushed by an operator,
+    # driven by a skill, nudged by anything. Before this the frame stayed
+    # withdrawn until a human noticed and asked again, so one ambiguous parking
+    # spot took the robot out of service indefinitely. Retrying costs one scan
+    # and about a tenth of a second, so it is cheaper than the noticing.
+    attempt = 1
+    while not _RELOC_STOP.wait(RELOCALIZE_RETRY_S):
+        live = lifecycle.current()
+        if (live.get("map_id") or "") != map_id or (live.get("mode") or "") != "localization":
+            return          # a different map now; whoever loaded it owns this
+        attempt += 1
+        # Only the scan match is retried. The particle filter needs the robot
+        # driven several metres, and running it on a loop would drown the log
+        # in advice nobody asked for.
+        if _attempt_relocalization(node, ops, grid, map_dir, map_id, None,
+                                   allow_filter=False, attempt=attempt):
+            return
+
+
+def _attempt_relocalization(node, ops, grid, map_dir: str, map_id: str, seed,
+                            allow_filter: bool, attempt: int = 1) -> bool:
+    """One go at finding the robot and giving the engine the map frame back.
+
+    Returns True when the pose was found, confirmed, installed and confirmed
+    again on the engine. Records why it stopped otherwise; the caller decides
+    whether that is final.
+    """
     pose, detail = (seed, "using the pose given with the load") if seed is not None \
         else (None, "")
     if pose is None:
-        localizers.set_relocalization("running", "matching the scan against the map")
+        again = f" (attempt {attempt})" if attempt > 1 else ""
+        localizers.set_relocalization(
+            "running", f"matching the scan against the map{again}")
         pose, detail = localizers.relocalize_statically(node, grid)
     if pose is None:
         static_detail = detail
+        if not allow_filter:
+            localizers.set_relocalization(
+                "running", f"{static_detail}; still looking (attempt {attempt})")
+            return False
         # The scan alone cannot say where the robot is. A particle filter can,
         # given motion, so the fallback runs and says plainly that the robot has
         # to be moved for it.
@@ -394,22 +436,22 @@ def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
         pose, detail = _relocalize_with_filter(node, map_dir, map_id, static_detail)
         if pose is None:
             localizers.set_relocalization("failed", detail)
-            return
+            return False
 
     ok_c, fit_detail = _confirm_against_map(node, grid, pose)
     if not ok_c:
         localizers.set_relocalization("failed", f"{detail}, but {fit_detail}")
-        return
+        return False
 
     ok_m, detail_m = ops.switch_mode(node, "localization", map_dir, map_id, 30.0, pose)
     if not ok_m:
         localizers.set_relocalization(
             "failed", f"{detail}, but the engine would not take the map frame back: {detail_m}")
-        return
+        return False
     ok_w, detail_w = ops.wait_ready(node, 90.0)
     if not ok_w:
         localizers.set_relocalization("failed", f"{detail}, but {detail_w}")
-        return
+        return False
     # The engine was started AT the recovered pose, so it needs no second
     # telling. Publishing /initialpose as well made it search again from there
     # and settle a metre and a half away -- two ways of saying the same thing,
@@ -425,10 +467,11 @@ def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
         localizers.set_relocalization(
             "failed", f"{detail}, but the engine did not take the pose it was given: "
                       f"{detail_v}")
-        return
+        return False
     localizers.set_relocalization("done", f"{detail}; {fit_detail}; {detail_m}; {detail_v}")
     log.info("[localizer] relocalized on %s at (%.2f, %.2f, %.2f)",
              map_id, pose[0], pose[1], pose[2])
+    return True
 
 
 def _confirm_engine_pose(node, grid) -> tuple[bool, str]:
@@ -520,7 +563,13 @@ def _begin_relocalization(node, ops, map_dir: str, map_id: str, seed) -> tuple[b
     if ops is None:
         return False, "no engine to hand a recovered pose to"
     if _RELOC_THREAD is not None and _RELOC_THREAD.is_alive():
-        return False, "a relocalization is already running"
+        # A retry loop must not lock out the operator asking again by hand:
+        # retire it, and only refuse if it will not go.
+        _RELOC_STOP.set()
+        _RELOC_THREAD.join(timeout=5.0)
+        if _RELOC_THREAD.is_alive():
+            return False, "a relocalization is already running"
+    _RELOC_STOP.clear()
     _RELOC_THREAD = threading.Thread(
         target=_relocalize, args=(node, ops, map_dir, map_id, seed),
         name="relocalize", daemon=True)

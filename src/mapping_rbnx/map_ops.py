@@ -376,6 +376,8 @@ def _relocalize(node, ops, map_dir: str, map_id: str, seed) -> None:
     has verified.
     """
     grid = localizers.load_grid(map_dir)
+    # Acceptance follows this map's own reference; see _fit_reference_now.
+    localizers.set_fit_reference(read_meta(map_dir).get("scan_fit_reference"))
     pose, detail = (seed, "using the pose given with the load") if seed is not None \
         else (None, "")
     if pose is None:
@@ -442,7 +444,7 @@ def _confirm_engine_pose(node, grid) -> tuple[bool, str]:
     fit, fit_detail = localizers.scan_fit(node, grid, pose)
     if fit < 0.0:
         return True, f"engine at ({pose[0]:.2f}, {pose[1]:.2f}); check skipped: {fit_detail}"
-    if fit < localizers.SCAN_FIT_MIN:
+    if fit < localizers.fit_threshold():
         return False, (f"it reports ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f}) where the "
                        f"laser scores only {fit:.0%}")
     return True, f"engine settled at ({pose[0]:.2f}, {pose[1]:.2f}), laser {fit:.0%}"
@@ -482,7 +484,7 @@ def _confirm_against_map(node, grid, pose) -> tuple[bool, str]:
     fit, detail = localizers.scan_fit(node, grid, pose)
     if fit < 0.0:
         return True, f"scan check skipped: {detail}"
-    if fit < localizers.SCAN_FIT_MIN:
+    if fit < localizers.fit_threshold():
         return False, (f"the laser does not support that pose ({fit:.0%}, "
                        f"{detail}) — it is not where the map says")
     return True, f"confirmed by the laser ({fit:.0%})"
@@ -1192,6 +1194,29 @@ def _run_preview_snapshot(map_dir: str) -> bool:
         return False
 
 
+
+def _fit_reference_now(map_dir: str):
+    """Score the live scan against the just-saved grid, at the engine's pose.
+
+    Returns None when anything is missing or the scan says nothing about the
+    pose; a map with no reference keeps the fixed threshold rather than
+    inheriting a number nobody measured.
+    """
+    node = _get_node()
+    if node is None:
+        return None
+    try:
+        grid = localizers.load_grid(map_dir)
+        pose = localizers.current_pose(node)
+        if grid is None or pose is None:
+            return None
+        fit, _ = localizers.scan_fit(node, grid, pose)
+    except Exception:  # noqa: BLE001
+        log.exception("could not measure a scan-fit reference for %s", map_dir)
+        return None
+    return fit if fit > 0.0 else None
+
+
 def _save_map_via_engine(map_id: str, map_dir: str, algo: str, note: str = "") -> dict:
     """Snapshot the live map for an engine other than RTAB-Map.
 
@@ -1225,8 +1250,18 @@ def _save_map_via_engine(map_id: str, map_dir: str, algo: str, note: str = "") -
             return {"ok": False, "map_id": map_id, "artifact_path": "",
                     "detail": "map preview/occupancy snapshot was not produced; "
                               "refusing to publish an incomplete spatial artifact"}
-        _write_meta_fields(staging_dir, {"map_id": map_id, "engine": algo,
-                                         "note": note or "-"})
+        fields = {"map_id": map_id, "engine": algo, "note": note or "-"}
+        # What a correct pose scores is a property of this map, not of the
+        # matcher: every beam ending on something the map never recorded counts
+        # against the pose, so a furnished room reads far below a bare one. The
+        # robot is localized right now, by definition of being able to save,
+        # so this is the one moment a correct pose can be measured. Without it
+        # acceptance falls back to a fixed number that is too loose in an empty
+        # room and rejected a pose good to 0.27 m in the office this runs in.
+        reference = _fit_reference_now(staging_dir)
+        if reference is not None:
+            fields["scan_fit_reference"] = f"{reference:.3f}"
+        _write_meta_fields(staging_dir, fields)
         if not os.path.isfile(os.path.join(staging_dir, "occupancy.png")):
             return {"ok": False, "map_id": map_id, "artifact_path": "",
                     "detail": "occupancy preview missing after snapshot"}

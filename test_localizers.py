@@ -117,6 +117,37 @@ class RelocalizationHandoverTests(unittest.TestCase):
         self.assertGreater(localizers.STATIC_MATCH_MIN, 0.5)
         self.assertGreater(localizers.STATIC_MATCH_MARGIN, 0.0)
 
+    def test_acceptance_follows_the_map_rather_than_a_fixed_number(self):
+        # What a correct pose scores depends on how much of the room the map
+        # never recorded: measured 1.00 in a bare room, 0.75 with four unmapped
+        # obstacles, 0.49 in the furnished office. A fixed 0.60 accepts a pose
+        # 0.3 m out in the first (it scores 0.73) and rejects a pose good to
+        # 0.27 m in the last. The map carries its own reference instead.
+        try:
+            self.assertIsNone(localizers.fit_reference())
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+
+            localizers.set_fit_reference(0.754)
+            self.assertAlmostEqual(localizers.fit_threshold(), 0.603, places=3)
+            # the pose 0.3 m out in that room scored 0.558, and must not pass
+            self.assertGreater(localizers.fit_threshold(), 0.558)
+
+            localizers.set_fit_reference(0.488)   # the furnished office
+            self.assertLess(localizers.fit_threshold(), 0.488)
+
+            # A map saved from a bad pose cannot license itself.
+            localizers.set_fit_reference(0.05)
+            self.assertGreaterEqual(localizers.fit_threshold(),
+                                    localizers.SCAN_FIT_FLOOR)
+
+            # Maps saved before references existed keep the old behaviour.
+            localizers.set_fit_reference(None)
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+            localizers.set_fit_reference("not a number")
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+        finally:
+            localizers.set_fit_reference(None)
+
     def test_convergence_needs_travel_not_just_a_tight_cloud(self):
         # A filter standing still in a symmetric room collapses tightly onto
         # the wrong hypothesis: measured at ±0.2 m while 4 m from the truth.

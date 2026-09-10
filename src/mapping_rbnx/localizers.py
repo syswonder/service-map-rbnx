@@ -271,6 +271,52 @@ SCAN_FIT_TOLERANCE_CELLS = 3
 # reads `unknown`; a robot whose pose has left the map reads `unknown` too,
 # rather than a high score computed from three surviving beams.
 SCAN_FIT_MIN_SCORED = float(os.environ.get("MAPPING_SCAN_FIT_MIN_SCORED", "0.35"))
+
+# What a CORRECT pose scores is a property of the map, not of the algorithm.
+# Every beam that ends on something the map never recorded -- a chair, a bin, a
+# person -- counts against the pose, so the same correct fix reads 1.00 in a bare
+# room, 0.75 with four unmapped obstacles, and 0.49 in the furnished office this
+# runs in. A fixed 0.60 therefore rejects correct poses in a lived-in room and
+# would accept sloppy ones in an empty one: it is measuring the furniture.
+#
+# So the map carries its own reference, measured at save time from the pose the
+# robot was known to be at, and acceptance is a fraction of that. The fraction
+# comes from the separation actually measured on the synthetic room: a correct
+# pose 0.754, the same pose 0.3 m out 0.558. Anything at or below three quarters
+# of the reference is the wrong place.
+SCAN_FIT_REFERENCE_FRACTION = float(
+    os.environ.get("MAPPING_SCAN_FIT_REFERENCE_FRACTION", "0.80"))
+# A reference cannot license anything: a map saved from a bad pose would set a
+# low bar and then agree with itself forever.
+SCAN_FIT_FLOOR = float(os.environ.get("MAPPING_SCAN_FIT_FLOOR", "0.30"))
+_fit_reference: Optional[float] = None
+
+
+def set_fit_reference(value) -> None:
+    """Record what a correct pose scores on the map now loaded, or None."""
+    global _fit_reference
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = -1.0
+    _fit_reference = v if 0.0 < v <= 1.0 else None
+
+
+def fit_reference():
+    """The loaded map's own reference score, or None when it has none."""
+    return _fit_reference
+
+
+def fit_threshold() -> float:
+    """The fit a pose has to reach on the map now loaded.
+
+    Falls back to the fixed minimum for maps saved before references existed,
+    so an old map keeps the behaviour it was tuned under.
+    """
+    if _fit_reference is None:
+        return SCAN_FIT_MIN
+    return max(SCAN_FIT_FLOOR, _fit_reference * SCAN_FIT_REFERENCE_FRACTION)
+
 # Cached laser mount offset; see sensor_offset_xy.
 _sensor_offset = None
 

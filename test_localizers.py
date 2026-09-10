@@ -117,6 +117,37 @@ class RelocalizationHandoverTests(unittest.TestCase):
         self.assertGreater(localizers.STATIC_MATCH_MIN, 0.5)
         self.assertGreater(localizers.STATIC_MATCH_MARGIN, 0.0)
 
+    def test_acceptance_follows_the_map_rather_than_a_fixed_number(self):
+        # What a correct pose scores depends on how much of the room the map
+        # never recorded: measured 1.00 in a bare room, 0.75 with four unmapped
+        # obstacles, 0.49 in the furnished office. A fixed 0.60 accepts a pose
+        # 0.3 m out in the first (it scores 0.73) and rejects a pose good to
+        # 0.27 m in the last. The map carries its own reference instead.
+        try:
+            self.assertIsNone(localizers.fit_reference())
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+
+            localizers.set_fit_reference(0.754)
+            self.assertAlmostEqual(localizers.fit_threshold(), 0.603, places=3)
+            # the pose 0.3 m out in that room scored 0.558, and must not pass
+            self.assertGreater(localizers.fit_threshold(), 0.558)
+
+            localizers.set_fit_reference(0.488)   # the furnished office
+            self.assertLess(localizers.fit_threshold(), 0.488)
+
+            # A map saved from a bad pose cannot license itself.
+            localizers.set_fit_reference(0.05)
+            self.assertGreaterEqual(localizers.fit_threshold(),
+                                    localizers.SCAN_FIT_FLOOR)
+
+            # Maps saved before references existed keep the old behaviour.
+            localizers.set_fit_reference(None)
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+            localizers.set_fit_reference("not a number")
+            self.assertEqual(localizers.fit_threshold(), localizers.SCAN_FIT_MIN)
+        finally:
+            localizers.set_fit_reference(None)
+
     def test_convergence_needs_travel_not_just_a_tight_cloud(self):
         # A filter standing still in a symmetric room collapses tightly onto
         # the wrong hypothesis: measured at ±0.2 m while 4 m from the truth.
@@ -129,6 +160,78 @@ class RelocalizationHandoverTests(unittest.TestCase):
         import inspect
         sig = inspect.signature(self._ops("slam_toolbox").activate)
         self.assertIn("pose", sig.parameters)
+
+
+class RelocalizationRetryTests(unittest.TestCase):
+    """A refusal has to be recoverable without a human asking again."""
+
+    def setUp(self):
+        from mapping_rbnx import map_ops
+        self.map_ops = map_ops
+
+    def test_a_retry_does_not_re_run_the_particle_filter(self):
+        # The scan match declines in seconds and needs no motion, so retrying it
+        # is cheap. The filter needs the robot driven several metres; looping on
+        # it would spend three minutes an attempt telling the operator to drive.
+        from unittest import mock
+        with mock.patch.object(self.map_ops.localizers, "relocalize_statically",
+                               return_value=(None, "two places explain this scan")), \
+             mock.patch.object(self.map_ops, "_relocalize_with_filter") as filt:
+            installed = self.map_ops._attempt_relocalization(
+                node=object(), ops=object(), grid=object(), map_dir="/x",
+                map_id="m", seed=None, allow_filter=False, attempt=3)
+        self.assertFalse(installed)
+        filt.assert_not_called()
+        state = self.map_ops.localizers.relocalization()
+        self.assertEqual(state["state"], "running")
+        self.assertIn("still looking", state["detail"])
+
+    def test_the_first_go_is_allowed_the_filter(self):
+        from unittest import mock
+        with mock.patch.object(self.map_ops.localizers, "relocalize_statically",
+                               return_value=(None, "no")), \
+             mock.patch.object(self.map_ops, "_relocalize_with_filter",
+                               return_value=(None, "needs driving")) as filt:
+            installed = self.map_ops._attempt_relocalization(
+                node=object(), ops=object(), grid=object(), map_dir="/x",
+                map_id="m", seed=None, allow_filter=True)
+        self.assertFalse(installed)
+        filt.assert_called_once()
+
+    def test_a_new_request_retires_a_running_retry_loop(self):
+        # Before this, a loop that kept retrying answered every manual attempt
+        # with "a relocalization is already running" and never let go. `ops` has
+        # to be a real object here: the None check returns before the thread is
+        # ever looked at, so passing None tests nothing.
+        import threading
+        from unittest import mock
+        self.map_ops._RELOC_STOP.clear()
+        started = threading.Event()
+
+        def loop():
+            started.set()
+            while not self.map_ops._RELOC_STOP.wait(0.02):
+                pass
+
+        old = threading.Thread(target=loop, daemon=True)
+        self.map_ops._RELOC_THREAD = old
+        old.start()
+        self.assertTrue(started.wait(2.0))
+        try:
+            with mock.patch.object(self.map_ops.threading, "Thread") as spawn:
+                ok, detail = self.map_ops._begin_relocalization(
+                    node=object(), ops=object(), map_dir="/x", map_id="m", seed=None)
+            # read before the cleanup below sets it again
+            left_clear = not self.map_ops._RELOC_STOP.is_set()
+        finally:
+            self.map_ops._RELOC_STOP.set()
+            old.join(timeout=2.0)
+        self.assertTrue(ok, detail)
+        self.assertNotIn("already running", detail)
+        self.assertFalse(old.is_alive(), "the old loop was not retired")
+        spawn.assert_called_once()
+        # and the flag is left clear, or the loop just started would exit at once
+        self.assertTrue(left_clear)
 
 
 class ConvergenceTests(unittest.TestCase):

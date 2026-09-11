@@ -268,30 +268,62 @@ class RtabmapConfigurationTest(unittest.TestCase):
         self.assertIn('(\"imu\", filtered_imu_topic)', source)
 
     def test_icp_motion_limits_are_forwarded_to_internal_odometry(self):
-        source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
-        self.assertIn("icp_odom_params.update({", source)
-        self.assertIn("for key, value in deploy_overrides.items()", source)
+        profiles = load_profiles()
+        selected = profiles.select_icp_odometry_overrides(
+            {
+                "Icp/MaxTranslation": "0.25",
+                "Odom/GuessMotion": "false",
+                "Reg/Force3DoF": "false",
+                "Grid/RangeMax": "10.0",
+                "deskewing": False,
+                "unknown_native": True,
+            },
+            {"deskewing", "publish_tf"},
+        )
+        self.assertEqual(
+            selected,
+            {
+                "Icp/MaxTranslation": "0.25",
+                "Odom/GuessMotion": "false",
+                "Reg/Force3DoF": "false",
+                "deskewing": False,
+            },
+        )
+
+    def test_deploy_override_normalization_preserves_native_ros_types(self):
+        profiles = load_profiles()
+        normalized = profiles.normalize_rtabmap_overrides(
+            {
+                "Icp/PointToPlane": False,
+                "Grid/RangeMin": 0.25,
+                "deskewing": False,
+                "queue_size": 20,
+            }
+        )
+        self.assertEqual(normalized["Icp/PointToPlane"], "false")
+        self.assertEqual(normalized["Grid/RangeMin"], "0.25")
+        self.assertIs(normalized["deskewing"], False)
+        self.assertEqual(normalized["queue_size"], 20)
 
     def test_icp_odometry_defaults_are_applied_before_deploy_overrides(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
         default = source.index('"Icp/MaxCorrespondenceDistance": "1.0"')
-        merge = source.index("icp_odom_params.update({", default)
+        merge = source.index("icp_odom_params.update(", default)
         node = source.index("executable=\"icp_odometry\"", merge)
         self.assertLess(default, merge)
         self.assertLess(merge, node)
 
-    def test_all_deploy_overrides_are_merged_into_icp_parameters(self):
+    def test_only_icp_compatible_overrides_are_merged_into_icp_parameters(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
-        self.assertNotIn("icp_odom_args", source)
+        self.assertIn("select_icp_odometry_overrides(", source)
+        self.assertIn("set(icp_odom_params)", source)
 
     def test_publish_null_when_lost_keeps_native_boolean_type(self):
         source = (ROOT / "launch" / "rtabmap_2d.launch.py").read_text()
         self.assertIn('"publish_null_when_lost": True', source)
+        self.assertIn('overrides["publish_null_when_lost"], bool', source)
         self.assertIn(
-            'isinstance(overrides["publish_null_when_lost"], bool)', source
-        )
-        self.assertIn(
-            'icp_odom_params["publish_null_when_lost"] = overrides[', source
+            "normalize_rtabmap_overrides(overrides)", source
         )
 
     def test_navigation_odom_bridge_is_opt_in_and_keeps_legacy_defaults(self):

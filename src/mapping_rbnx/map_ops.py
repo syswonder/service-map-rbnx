@@ -593,7 +593,6 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": False, "detail": f"mode={requested_mode!r} invalid (localization|mapping)"}
     mode = "localization"
     map_dir = os.path.join(MAPS_DIR, map_id)
-    db_path = os.path.join(map_dir, "rtabmap.db")
     if not os.path.isdir(map_dir):
         return {"ok": False, "detail": f"no saved map at {map_dir}"}
     # A saved map belongs to the engine that built it: the graph file and the
@@ -610,6 +609,9 @@ def load_map_impl(map_id: str, mode: str = "localization",
                               else _rtabmap_graph_ready(map_dir))
     if not graph_ok:
         return {"ok": False, "detail": f"saved {algo} map is not loadable: {graph_detail}"}
+    db_path = os.path.join(map_dir, "rtabmap.db")
+    source_path = (db_path if algo == "rtabmap" else
+                   os.path.join(map_dir, engines.SLAM_TOOLBOX_STEM))
 
     node = _get_node()
     if node is None:
@@ -618,7 +620,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
     try:
         started = time.monotonic()
         log.info("load_map[%s] stage=prepare source=%s requested_mode=%s", map_id,
-                 db_path, requested_mode)
+                 source_path, requested_mode)
         # Particle-filter localization on the saved occupancy grid, when the
         # deployment asked for it: it is the path that can relocalize with no
         # prior pose, so `load_map` without a pose stops meaning "hope the scan

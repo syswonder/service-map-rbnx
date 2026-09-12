@@ -117,14 +117,14 @@ def _sanitize_map_id(map_id: str) -> str:
 
 
 def _resolve_persistence(cfg: dict) -> dict[str, str]:
-    """Resolve a private runtime DB, and only read saved maps in localization.
+    """Validate the selected engine's saved artifact for the requested mode.
 
-    ``maps/<map_id>/rtabmap.db`` is an immutable published artifact. RTAB-Map
-    must never use it as its active writer database. A mapping session always
-    receives a fresh runtime DB; ``save_map`` snapshots that DB atomically into
-    a stable map id. Localization first copies the saved artifact to a runtime
-    DB, so even RTAB-Map bookkeeping cannot mutate the saved copy.
+    RTAB-Map persists a SQLite database and needs a private runtime copy because
+    it can update bookkeeping even in localization mode. Other engines own
+    different artifacts: slam_toolbox, for example, requires both posegraph
+    files. Never use the presence of ``rtabmap.db`` as a generic map check.
     """
+    algo = str(cfg.get("algo", "rtabmap")).strip()
     raw_id = cfg.get("map_id")
     map_id = _sanitize_map_id(str(raw_id)) if raw_id else ""
     mode = str(cfg.get("map_mode", "mapping")).strip().lower()
@@ -137,26 +137,46 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
         if not map_id:
             raise RuntimeError("map_mode=localization requires a saved map_id")
         map_dir = os.path.join(MAPS_DIR, map_id)
-        saved_db = os.path.join(map_dir, "rtabmap.db")
-        if not os.path.isfile(saved_db):
-            raise RuntimeError(
-                f"map_mode=localization but no saved map at {saved_db!r}. "
-                "Save a mapping session first, or check MAPPING_MAPS_DIR."
-            )
         if reset:
             raise RuntimeError("reset_map=true is meaningless in localization mode")
-        runtime_db = map_ops._runtime_db_copy(saved_db, map_id)
-        log.info("persistence: localization map_id=%s saved_db=%s runtime_db=%s",
-                 map_id, saved_db, runtime_db)
-        return {
+        saved_engine = map_ops.map_engine(map_dir)
+        if saved_engine and saved_engine != algo:
+            raise RuntimeError(
+                f"map {map_id!r} was built by {saved_engine}, but this "
+                f"deployment runs {algo}"
+            )
+        ops = engines.engine_for(algo)
+        if ops is None:
+            raise RuntimeError(f"algo={algo!r} does not support saved-map localization")
+        ready, detail = ops.graph_ready(map_dir)
+        if not ready:
+            raise RuntimeError(
+                f"map_mode=localization but saved {algo} map {map_id!r} is "
+                f"not loadable: {detail}. Save a mapping session first, or "
+                "check MAPPING_MAPS_DIR."
+            )
+        result = {
             "map_id": map_id,
             "map_mode": "localization",
-            "database_path": runtime_db,
             "reset_map": "false",
         }
+        if algo == "rtabmap":
+            saved_db = os.path.join(map_dir, "rtabmap.db")
+            runtime_db = map_ops._runtime_db_copy(saved_db, map_id)
+            result["database_path"] = runtime_db
+            log.info("persistence: localization map_id=%s saved_db=%s runtime_db=%s",
+                     map_id, saved_db, runtime_db)
+        else:
+            log.info("persistence: localization map_id=%s engine=%s artifact=%s",
+                     map_id, algo, detail)
+        return result
 
     # Mapping is always a new mutable session. Keep a supplied map_id out of
     # the runtime binding: it identifies a saved artifact, not a live session.
+    if algo != "rtabmap":
+        log.info("persistence: fresh %s mapping session requested_map_id=%s",
+                 algo, map_id or "<none>")
+        return {"map_mode": "mapping", "reset_map": "true"}
     os.makedirs(map_ops.RUNTIME_DB_DIR, exist_ok=True)
     runtime_db = os.path.join(
         map_ops.RUNTIME_DB_DIR,

@@ -7,7 +7,9 @@ benchmark, not in unit tests.
 """
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
@@ -277,6 +279,80 @@ class MapPersistenceTests(unittest.TestCase):
         row = json.loads(self.map_ops.list_maps_impl()["maps_json"])[0]
         self.assertFalse(row["has_spatial_artifact"])
         self.assertFalse(row["loadable_here"])
+
+
+class StartupPersistenceResolutionTests(unittest.TestCase):
+    """CMD_INIT validates the artifact owned by the selected mapping engine."""
+
+    def setUp(self):
+        from mapping_rbnx import atlas_bridge, map_ops
+        self.bridge = atlas_bridge
+        self.map_ops = map_ops
+        self.tmp = tempfile.TemporaryDirectory()
+        self.maps_dir = os.path.join(self.tmp.name, "maps")
+        self.runtime_dir = os.path.join(self.tmp.name, "runtime")
+        os.makedirs(self.maps_dir)
+        self.saved_maps_dir = self.bridge.MAPS_DIR
+        self.saved_runtime_dir = self.map_ops.RUNTIME_DB_DIR
+        self.bridge.MAPS_DIR = self.maps_dir
+        self.map_ops.RUNTIME_DB_DIR = self.runtime_dir
+
+    def tearDown(self):
+        self.bridge.MAPS_DIR = self.saved_maps_dir
+        self.map_ops.RUNTIME_DB_DIR = self.saved_runtime_dir
+        self.tmp.cleanup()
+
+    def _map(self, map_id, engine, files):
+        map_dir = os.path.join(self.maps_dir, map_id)
+        os.makedirs(map_dir)
+        with open(os.path.join(map_dir, "meta.yaml"), "w", encoding="utf-8") as fh:
+            fh.write(f"map_id: {map_id}\nengine: {engine}\n")
+        for name in files:
+            with open(os.path.join(map_dir, name), "wb") as fh:
+                fh.write(b"saved-map-artifact")
+        return map_dir
+
+    def test_complete_slam_toolbox_graph_is_accepted_without_runtime_db(self):
+        self._map("lab", "slam_toolbox", ("posegraph.posegraph", "posegraph.data"))
+        out = self.bridge._resolve_persistence({
+            "algo": "slam_toolbox", "map_mode": "localization", "map_id": "lab",
+        })
+        self.assertEqual(out["map_id"], "lab")
+        self.assertNotIn("database_path", out)
+
+    def test_incomplete_slam_toolbox_graph_names_the_missing_file(self):
+        self._map("half", "slam_toolbox", ("posegraph.posegraph",))
+        with self.assertRaisesRegex(RuntimeError, "posegraph.data"):
+            self.bridge._resolve_persistence({
+                "algo": "slam_toolbox", "map_mode": "localization", "map_id": "half",
+            })
+
+    def test_saved_engine_must_match_selected_engine(self):
+        self._map("other", "rtabmap", ("rtabmap.db",))
+        with self.assertRaisesRegex(RuntimeError, "built by rtabmap"):
+            self.bridge._resolve_persistence({
+                "algo": "slam_toolbox", "map_mode": "localization", "map_id": "other",
+            })
+
+    def test_rtabmap_localization_uses_a_private_runtime_copy(self):
+        map_dir = self._map("rt", "rtabmap", ("rtabmap.db",))
+        runtime_db = os.path.join(self.runtime_dir, "rt-runtime.db")
+        fake_ops = mock.Mock()
+        fake_ops.graph_ready.return_value = (True, "database ok")
+        with mock.patch.object(self.bridge.engines, "engine_for", return_value=fake_ops), \
+                mock.patch.object(self.map_ops, "_runtime_db_copy", return_value=runtime_db) as copy:
+            out = self.bridge._resolve_persistence({
+                "algo": "rtabmap", "map_mode": "localization", "map_id": "rt",
+            })
+        copy.assert_called_once_with(os.path.join(map_dir, "rtabmap.db"), "rt")
+        self.assertEqual(out["database_path"], runtime_db)
+
+    def test_non_rtabmap_mapping_does_not_create_a_sqlite_runtime_db(self):
+        out = self.bridge._resolve_persistence({
+            "algo": "slam_toolbox", "map_mode": "mapping", "map_id": "new-map",
+        })
+        self.assertEqual(out, {"map_mode": "mapping", "reset_map": "true"})
+        self.assertFalse(os.path.exists(self.runtime_dir))
 
 
 class SlamToolboxParamTests(unittest.TestCase):

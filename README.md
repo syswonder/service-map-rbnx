@@ -87,6 +87,10 @@ robot-specific branches.
 1. **Register your sensors** as Robonix primitives under the standard
    contracts (`robonix/primitive/lidar/lidar3d`, `.../camera/depth`,
    `.../chassis/odom`, …). mapping discovers them via atlas.
+
+   A 3-D lidar may instead be projected by `service-pcld2lscan-rbnx`. Bind its
+   output with `sensor_providers.scan_converter`; `slam_toolbox` and particle
+   filter localizers then consume the resolved LaserScan topic.
 2. **Pick a deployment target** and reference the matching package manifest
    from your deploy `robonix_manifest.yaml`:
 

@@ -15,7 +15,9 @@ required:
     description: >-
       Sensor role to Atlas provider_id. A key enables that Mapping input and
       its value selects the provider. Supported roles are lidar2d, lidar3d,
-      rgb, depth, imu, and odom. RGB-D requires both rgb and depth.
+      scan_converter, rgb, depth, imu, and odom. RGB-D requires both rgb and
+      depth. scan_converter consumes the LaserScan output of
+      service-pcld2lscan-rbnx and is mutually exclusive with lidar2d.
     example:
       lidar3d: roof_lidar
       rgb: front_camera

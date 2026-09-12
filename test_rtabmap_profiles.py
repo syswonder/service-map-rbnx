@@ -20,6 +20,17 @@ def load_profiles():
 
 
 class RtabmapConfigurationTest(unittest.TestCase):
+    def test_scan_converter_is_a_supported_laserscan_provider(self):
+        source = (ROOT / "src/mapping_rbnx/atlas_bridge.py").read_text()
+        self.assertIn(
+            '("scan_converter", "robonix/service/lidar/scan_converter/scan", "scan_topic")',
+            source,
+        )
+        self.assertIn(
+            '"sensor_providers.lidar2d and scan_converter are mutually exclusive"',
+            source,
+        )
+
     def test_docker_start_mounts_manifest_directory_read_only(self):
         bash_major = int(
             subprocess.run(

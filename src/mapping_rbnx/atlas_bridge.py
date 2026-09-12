@@ -328,6 +328,7 @@ _SENSOR_CONTRACTS = [
     # (config-key,   contract,                                  yaml-key)
     ("lidar3d",  "robonix/primitive/lidar/lidar3d",       "lidar_topic"),
     ("lidar2d",  "robonix/primitive/lidar/lidar",         "scan_topic"),
+    ("scan_converter", "robonix/service/lidar/scan_converter/scan", "scan_topic"),
     ("imu",      "robonix/primitive/imu/imu",             "imu_topic"),
     ("depth",    "robonix/primitive/camera/depth",        "depth_topic"),
     ("rgb",      "robonix/primitive/camera/rgb",          "rgb_topic"),
@@ -353,6 +354,10 @@ def _enabled_sensors(cfg: dict) -> dict:
             raise RuntimeError(
                 f"unknown sensor provider role(s) {sorted(unknown)}; "
                 f"options: {sorted(supported)}"
+            )
+        if "lidar2d" in providers and "scan_converter" in providers:
+            raise RuntimeError(
+                "sensor_providers.lidar2d and scan_converter are mutually exclusive"
             )
         for key, provider_id in providers.items():
             if not isinstance(provider_id, str) or not provider_id.strip():

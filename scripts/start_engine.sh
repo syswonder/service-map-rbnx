@@ -20,6 +20,7 @@ set -eo pipefail
 
 ALGO="${MAPPING_ALGO:-rtabmap}"
 RESOLVED="/tmp/${ALGO}_resolved.yaml"
+ENGINE_PID_FILE="${MAPPING_ENGINE_PID_FILE:-/tmp/mapping_engine_pid}"
 
 source /opt/ros/humble/setup.bash
 
@@ -28,6 +29,31 @@ read_y() {
     # would otherwise abort the script before we even get to the
     # case branch. Default-empty is what every caller wants anyway.
     { grep -E "^$1:" "$RESOLVED" 2>/dev/null || true; } | head -1 | awk '{print $2}' || true
+}
+
+process_group_alive() {
+    local pgid="$1"
+    ps -eo pgid= | awk -v wanted="$pgid" '$1 == wanted { found=1 } END { exit !found }'
+}
+
+stop_process_group() {
+    local pgid="${1:-}"
+    [[ "$pgid" =~ ^[0-9]+$ ]] || return 0
+    process_group_alive "$pgid" || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in $(seq 1 25); do
+        process_group_alive "$pgid" || return 0
+        sleep 0.2
+    done
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+}
+
+clear_engine_pid_file() {
+    local expected="${1:-}" recorded=""
+    recorded="$(cat "$ENGINE_PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$expected" || "$recorded" == "$expected" ]]; then
+        rm -f "$ENGINE_PID_FILE"
+    fi
 }
 
 case "$ALGO" in
@@ -213,8 +239,21 @@ PYEOF
         # the whole container down with exit 143.
         ENGINE_REQUEST=/tmp/mapping_engine_request
         ENGINE_ARGS=/tmp/mapping_engine_args
+        OLD_ENGINE_PID="$(cat "$ENGINE_PID_FILE" 2>/dev/null || true)"
+        if [[ "$OLD_ENGINE_PID" =~ ^[0-9]+$ ]] && process_group_alive "$OLD_ENGINE_PID"; then
+            echo "[start_engine] ERR: stale slam_toolbox process group $OLD_ENGINE_PID is still alive; run the mapping stop hook before restarting" >&2
+            exit 3
+        fi
+        clear_engine_pid_file
         : > "$ENGINE_REQUEST"
-        trap 'kill -TERM $LAUNCH_PID 2>/dev/null; exit 143' TERM INT
+        LAUNCH_PID=""
+        cleanup_slam_toolbox() {
+            stop_process_group "$LAUNCH_PID"
+            clear_engine_pid_file "$LAUNCH_PID"
+            rm -f "$ENGINE_REQUEST" "$ENGINE_ARGS"
+        }
+        trap 'cleanup_slam_toolbox; exit 143' TERM INT
+        trap cleanup_slam_toolbox EXIT
         while true; do
             REQ=$(cat "$ENGINE_REQUEST" 2>/dev/null || true)
             if [ "$REQ" = "idle" ]; then
@@ -241,12 +280,14 @@ PYEOF
                     $ST_ARGS &
             fi
             LAUNCH_PID=$!
-            echo "$LAUNCH_PID" > /tmp/mapping_engine_pid
+            echo "$LAUNCH_PID" > "$ENGINE_PID_FILE"
             # `|| true` matters: this script runs under `set -e`, the engine is
             # stopped with SIGTERM whenever the mode is swapped, and an errexit
             # on a 143 from `wait` ended the script -- which closed the pipe the
             # entrypoint waits on and took the whole container down with it.
             wait "$LAUNCH_PID" || true
+            clear_engine_pid_file "$LAUNCH_PID"
+            LAUNCH_PID=""
             echo "[start_engine] slam_toolbox launch exited; restarting in 2s"
             sleep 2
         done

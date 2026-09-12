@@ -282,6 +282,18 @@ class MapPersistenceTests(unittest.TestCase):
 class SlamToolboxParamTests(unittest.TestCase):
     """A mistyped scan-matching knob must fail at init, not at map time."""
 
+    def test_shutdown_reaps_the_recorded_slam_toolbox_process_group(self):
+        root = os.path.dirname(__file__)
+        with open(os.path.join(root, "scripts", "stop.sh"), encoding="utf-8") as f:
+            stop_source = f.read()
+        with open(os.path.join(root, "scripts", "start_engine.sh"), encoding="utf-8") as f:
+            engine_source = f.read()
+        self.assertIn('kill -TERM -- "-$pgid"', stop_source)
+        self.assertIn('kill -KILL -- "-$pgid"', stop_source)
+        self.assertIn('terminate_recorded_engine_group', stop_source)
+        self.assertIn('stale slam_toolbox process group', engine_source)
+        self.assertIn('trap cleanup_slam_toolbox EXIT', engine_source)
+
     def test_native_launch_directory_is_used_for_both_slam_toolbox_nodes(self):
         root = os.path.dirname(__file__)
         with open(os.path.join(root, "scripts", "start_engine.sh"), encoding="utf-8") as f:

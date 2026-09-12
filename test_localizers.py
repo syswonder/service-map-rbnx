@@ -282,6 +282,19 @@ class MapPersistenceTests(unittest.TestCase):
 class SlamToolboxParamTests(unittest.TestCase):
     """A mistyped scan-matching knob must fail at init, not at map time."""
 
+    def test_native_launch_directory_is_used_for_both_slam_toolbox_nodes(self):
+        root = os.path.dirname(__file__)
+        with open(os.path.join(root, "scripts", "start_engine.sh"), encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn(
+            '${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_2d.launch.py',
+            source,
+        )
+        self.assertIn(
+            '${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_localization.launch.py',
+            source,
+        )
+
     def setUp(self):
         from mapping_rbnx import profiles
         self.bridge = profiles

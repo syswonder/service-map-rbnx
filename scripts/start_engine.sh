@@ -228,11 +228,11 @@ PYEOF
                 echo "[start_engine] slam_toolbox -> localization node"
                 # shellcheck disable=SC2046  # the args file is one arg per line
                 # The deployment's scan-matching overrides apply to both nodes.
-                setsid ros2 launch /mapping/launch/slam_toolbox_localization.launch.py \
+                setsid ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_localization.launch.py" \
                     $(cat "$ENGINE_ARGS") $ST_ARGS &
             else
                 echo "[start_engine] slam_toolbox -> mapping node"
-                setsid ros2 launch /mapping/launch/slam_toolbox_2d.launch.py \
+                setsid ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_2d.launch.py" \
                     scan_topic:="$SCAN_TOPIC" \
                     base_frame:="${BASE_FRAME:-base_link}" \
                     odom_frame:="${ODOM_FRAME:-odom}" \

@@ -183,6 +183,14 @@ class LaunchFileTests(unittest.TestCase):
                     "global_frame", "use_sim_time", "min_particles", "max_particles"):
             self.assertIn(f'DeclareLaunchArgument("{arg}"', src, f"{arg} is passed but not declared")
 
+    def test_beluga_uses_its_packaged_executable_and_stable_pose_topic(self):
+        with open(os.path.join(os.path.dirname(__file__), "launch",
+                               "localization_2d.launch.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('"amcl_node" if localizer == "beluga"', src)
+        self.assertIn('[("pose", "/amcl_pose")]', src)
+        self.assertNotIn('package.replace("_", "-")', src)
+
     def test_localization_boot_starts_engine_supervisor_idle(self):
         with open(os.path.join(os.path.dirname(__file__), "scripts",
                                "start_engine.sh"), encoding="utf-8") as fh:

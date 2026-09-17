@@ -105,6 +105,12 @@ def _launch_setup(context, *args, **kwargs):
         "tf_broadcast": tf_broadcast,
         "transform_tolerance": 1.0,
     }
+    # Beluga is interface-compatible at the parameter/service level, but its
+    # Debian package exposes `amcl_node` (not `beluga-amcl`) and publishes the
+    # estimate on `pose`. Keep the service's stable /amcl_pose handover topic
+    # for both implementations so localizers.py and the Web UI need no branch.
+    executable = "amcl_node" if localizer == "beluga" else "amcl"
+    remappings = [("pose", "/amcl_pose")] if localizer == "beluga" else []
     nodes = [
         Node(
             package="nav2_map_server", executable="map_server", name="map_server",
@@ -113,8 +119,9 @@ def _launch_setup(context, *args, **kwargs):
                          "topic_name": localizer_map_topic}],
         ),
         Node(
-            package=package, executable=package.replace("_", "-") if package == "beluga_amcl" else "amcl",
+            package=package, executable=executable,
             name="amcl", output="screen", parameters=[localizer_params],
+            remappings=remappings,
         ),
         Node(
             package="nav2_lifecycle_manager", executable="lifecycle_manager",

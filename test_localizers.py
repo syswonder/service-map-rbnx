@@ -183,6 +183,20 @@ class LaunchFileTests(unittest.TestCase):
                     "global_frame", "use_sim_time", "min_particles", "max_particles"):
             self.assertIn(f'DeclareLaunchArgument("{arg}"', src, f"{arg} is passed but not declared")
 
+    def test_localization_boot_starts_engine_supervisor_idle(self):
+        with open(os.path.join(os.path.dirname(__file__), "scripts",
+                               "start_engine.sh"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('if [ "${MAP_MODE:-mapping}" = "localization" ]', src)
+        self.assertIn("printf '%s\\n' idle > \"$ENGINE_REQUEST\"", src)
+
+    def test_non_rtabmap_localization_runs_the_staged_startup_load(self):
+        with open(os.path.join(os.path.dirname(__file__), "src", "mapping_rbnx",
+                               "atlas_bridge.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('active_mode == "localization" and algo != "rtabmap"', src)
+        self.assertIn('map_ops.load_map_impl(map_id, "localization")', src)
+
 
 
 class EngineRegistryTests(unittest.TestCase):

@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -189,6 +190,37 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
         "database_path": runtime_db,
         "reset_map": "true",
     }
+
+
+_STARTUP_LOAD_THREAD: Optional[threading.Thread] = None
+
+
+def _begin_startup_localization(map_id: str) -> None:
+    """Restore a validated non-RTABMap artifact after CMD_INIT returns.
+
+    RTAB-Map consumes its runtime database directly from launch arguments.
+    slam_toolbox instead needs the staged load_map handover: publish the saved
+    grid, recover the robot globally, then start its read-only localization
+    executable at the recovered pose. Recovery is asynchronous because it may
+    require scans and robot movement and must not block service INIT.
+    """
+    global _STARTUP_LOAD_THREAD
+    if _STARTUP_LOAD_THREAD is not None and _STARTUP_LOAD_THREAD.is_alive():
+        raise RuntimeError("saved-map startup localization is already running")
+
+    def restore() -> None:
+        try:
+            out = map_ops.load_map_impl(map_id, "localization")
+            if out.get("ok"):
+                log.info("startup localization: %s", out.get("detail", "started"))
+            else:
+                log.error("startup localization failed: %s", out.get("detail", out))
+        except Exception:  # noqa: BLE001
+            log.exception("startup localization crashed for map_id=%s", map_id)
+
+    _STARTUP_LOAD_THREAD = threading.Thread(
+        target=restore, name="startup-map-localization", daemon=True)
+    _STARTUP_LOAD_THREAD.start()
 
 
 def _write_rtabmap_overrides(cfg: dict, resolved: dict[str, str]) -> str:
@@ -730,6 +762,15 @@ def init(cfg: dict):
     # Independent of the page: nothing else notices a pose that has drifted off
     # the map, and a robot acting on one is the failure this guards against.
     webui.start_supervisor()
+    # RTAB-Map opens its resolved runtime DB in start_engine.sh. Engines with
+    # typed artifacts require load_map's safe handover instead. The launcher is
+    # initialized to `idle` for this mode, so no empty mapping node can claim
+    # map -> odom while global localization is in progress.
+    if active_mode == "localization" and algo != "rtabmap":
+        try:
+            _begin_startup_localization(persist["map_id"])
+        except RuntimeError as e:
+            return Err(str(e))
     return Ok()
 
 

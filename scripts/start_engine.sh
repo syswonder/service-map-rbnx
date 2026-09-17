@@ -245,7 +245,15 @@ PYEOF
             exit 3
         fi
         clear_engine_pid_file
-        : > "$ENGINE_REQUEST"
+        # A localization deployment must not briefly launch a fresh mapping
+        # node. atlas_bridge will run load_map's staged handover: saved grid +
+        # global localizer first, localization_slam_toolbox_node only after a
+        # pose is accepted. Starting idle also guarantees one map->odom owner.
+        if [ "${MAP_MODE:-mapping}" = "localization" ]; then
+            printf '%s\n' idle > "$ENGINE_REQUEST"
+        else
+            : > "$ENGINE_REQUEST"
+        fi
         LAUNCH_PID=""
         cleanup_slam_toolbox() {
             stop_process_group "$LAUNCH_PID"

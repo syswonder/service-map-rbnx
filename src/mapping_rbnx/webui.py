@@ -609,19 +609,19 @@ def _localization_trust() -> dict:
         stale = _stale_inputs(time.time())
         if stale:
             _enforce_trust(False, map_id, 0.0)
-            out = {"verdict": "stale", "threshold": localizers.SCAN_FIT_MIN,
+            out = {"verdict": "stale", "threshold": localizers.fit_threshold(),
                    "detail": stale}
             if _trust["withdrawn"]:
                 out["withdrawn"] = True
             return out
-        return {"verdict": "unknown", "threshold": localizers.SCAN_FIT_MIN,
+        return {"verdict": "unknown", "threshold": localizers.fit_threshold(),
                 "detail": _trust["detail"] or "no reading yet"}
     ordered = sorted(history)
     fit = ordered[len(ordered) // 2]
-    good = fit >= localizers.SCAN_FIT_MIN
+    good = fit >= localizers.fit_threshold()
     _enforce_trust(good, map_id, fit)
     out = {"verdict": "ok" if good else "suspect",
-           "threshold": localizers.SCAN_FIT_MIN,
+           "threshold": localizers.fit_threshold(),
            "fit": round(fit, 3),
            "latest": round(history[-1], 3),
            "samples": len(history),

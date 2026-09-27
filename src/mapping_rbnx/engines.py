@@ -374,14 +374,25 @@ class SlamToolboxOps:
         _, before, before_stamp = _await_map_shape(node, topic, None, 2.0)
 
         mode = _get_remote_parameter(node, self._ns, "mode", 5.0)
+        if mode == "localization":
+            # The localization node refuses every other match type ("non-
+            # localization deserialization in localization mode"), and its
+            # LOCALIZE_AT_POSE searches near the map it already holds. Another
+            # map is a node started on that map.
+            ok, detail = self._start_localization_node(map_dir, map_id, pose)
+            if not ok:
+                return False, detail
+            loaded, shape, _ = _await_map_shape(node, topic, want, min(timeout_s, 60.0),
+                                                newer_than=before_stamp)
+            if not loaded:
+                return False, (f"the localization node started on {map_id} published "
+                               f"{shape}, not the saved {want}")
+            return True, detail
         req = DeserializePoseGraph.Request()
         req.filename = os.path.join(map_dir, SLAM_TOOLBOX_STEM)
         if pose is None:
             req.match_type = DeserializePoseGraph.Request.START_AT_FIRST_NODE
             placed = "first node"
-        elif mode == "localization":
-            req.match_type = DeserializePoseGraph.Request.LOCALIZE_AT_POSE
-            placed = "localize at pose"
         else:
             req.match_type = DeserializePoseGraph.Request.START_AT_GIVEN_POSE
             placed = "given pose"

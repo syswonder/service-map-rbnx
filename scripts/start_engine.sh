@@ -9,6 +9,8 @@
 #               sensors.* the deploy enabled (lidar2d / lidar3d / rgb /
 #               depth / odom). Webots tiago = lidar2d + rgb + depth; real
 #               robot (mid360) = lidar3d + rgb + depth.
+#   slam_toolbox — Karto scan matching + pose graph, 2D lidar only.
+#               CPU-only, no database, no visual loop closure.
 #   dlio      — Direct LiDAR-Inertial Odometry (3D Livox; real robot)
 #   fastlio2  — [BROKEN: drift] kept for repro/debug only
 #
@@ -18,6 +20,7 @@ set -eo pipefail
 
 ALGO="${MAPPING_ALGO:-rtabmap}"
 RESOLVED="/tmp/${ALGO}_resolved.yaml"
+ENGINE_PID_FILE="${MAPPING_ENGINE_PID_FILE:-/tmp/mapping_engine_pid}"
 
 source /opt/ros/humble/setup.bash
 
@@ -26,6 +29,31 @@ read_y() {
     # would otherwise abort the script before we even get to the
     # case branch. Default-empty is what every caller wants anyway.
     { grep -E "^$1:" "$RESOLVED" 2>/dev/null || true; } | head -1 | awk '{print $2}' || true
+}
+
+process_group_alive() {
+    local pgid="$1"
+    ps -eo pgid= | awk -v wanted="$pgid" '$1 == wanted { found=1 } END { exit !found }'
+}
+
+stop_process_group() {
+    local pgid="${1:-}"
+    [[ "$pgid" =~ ^[0-9]+$ ]] || return 0
+    process_group_alive "$pgid" || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in $(seq 1 25); do
+        process_group_alive "$pgid" || return 0
+        sleep 0.2
+    done
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+}
+
+clear_engine_pid_file() {
+    local expected="${1:-}" recorded=""
+    recorded="$(cat "$ENGINE_PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$expected" || "$recorded" == "$expected" ]]; then
+        rm -f "$ENGINE_PID_FILE"
+    fi
 }
 
 case "$ALGO" in
@@ -174,6 +202,104 @@ PYEOF
         wait $LAUNCH_PID
         ;;
 
+    slam_toolbox)
+        # Karto scan matching + pose graph, 2D lidar only. Needs scan_topic;
+        # everything else has a default. Frames come from the deploy config the
+        # same way rtabmap gets them.
+        SCAN_TOPIC=$(read_y scan_topic)
+        BASE_FRAME=$(read_y base_frame); ODOM_FRAME=$(read_y odom_frame)
+        MAP_MODE=$(read_y map_mode); USE_SIM_TIME=$(read_y use_sim_time)
+        # Scan-matching knobs: absent from the contract means "use the launch
+        # default", which is sized for a slow indoor platform.
+        ST_TRAVEL=$(read_y slam_toolbox_min_travel_m)
+        ST_HEADING=$(read_y slam_toolbox_min_heading_rad)
+        ST_BUFFER=$(read_y slam_toolbox_scan_buffer)
+        ST_LOOP=$(read_y slam_toolbox_loop_search_m)
+        ST_ARGS=""
+        [ -n "$ST_TRAVEL" ] && [ "$ST_TRAVEL" != "<none>" ] && ST_ARGS="$ST_ARGS minimum_travel_distance:=$ST_TRAVEL"
+        [ -n "$ST_HEADING" ] && [ "$ST_HEADING" != "<none>" ] && ST_ARGS="$ST_ARGS minimum_travel_heading:=$ST_HEADING"
+        [ -n "$ST_BUFFER" ] && [ "$ST_BUFFER" != "<none>" ] && ST_ARGS="$ST_ARGS scan_buffer_size:=$ST_BUFFER"
+        [ -n "$ST_LOOP" ] && [ "$ST_LOOP" != "<none>" ] && ST_ARGS="$ST_ARGS loop_search_maximum_distance:=$ST_LOOP"
+        if [ -z "$SCAN_TOPIC" ] || [ "$SCAN_TOPIC" = "<none>" ]; then
+            echo "[start_engine] ERR: slam_toolbox needs a 2D lidar (scan_topic); none resolved" >&2
+            exit 2
+        fi
+        echo "[start_engine] slam_toolbox scan=$SCAN_TOPIC base=${BASE_FRAME:-base_link} odom=${ODOM_FRAME:-odom} mode=${MAP_MODE:-mapping}"
+        # Which slam_toolbox executable runs is fixed when the process starts:
+        # the asynchronous node maps and never stops mapping, and localizing on
+        # a saved map without editing it is a different executable. So the
+        # engine is supervised here rather than exec'd. `load_map` asks for the
+        # swap by writing the request file and stopping the launch; this loop
+        # starts the other one. The entrypoint waits on THIS script, so the
+        # container survives a swap -- killing the launch directly used to end
+        # the container with it.
+        # `setsid` below is load-bearing. ros2 launch signals its own process
+        # group when it shuts down, and with the launch in this script's group
+        # that reached the entrypoint too: stopping the engine to swap it took
+        # the whole container down with exit 143.
+        ENGINE_REQUEST=/tmp/mapping_engine_request
+        ENGINE_ARGS=/tmp/mapping_engine_args
+        OLD_ENGINE_PID="$(cat "$ENGINE_PID_FILE" 2>/dev/null || true)"
+        if [[ "$OLD_ENGINE_PID" =~ ^[0-9]+$ ]] && process_group_alive "$OLD_ENGINE_PID"; then
+            echo "[start_engine] ERR: stale slam_toolbox process group $OLD_ENGINE_PID is still alive; run the mapping stop hook before restarting" >&2
+            exit 3
+        fi
+        clear_engine_pid_file
+        # A localization deployment must not briefly launch a fresh mapping
+        # node. atlas_bridge will run load_map's staged handover: saved grid +
+        # global localizer first, localization_slam_toolbox_node only after a
+        # pose is accepted. Starting idle also guarantees one map->odom owner.
+        if [ "${MAP_MODE:-mapping}" = "localization" ]; then
+            printf '%s\n' idle > "$ENGINE_REQUEST"
+        else
+            : > "$ENGINE_REQUEST"
+        fi
+        LAUNCH_PID=""
+        cleanup_slam_toolbox() {
+            stop_process_group "$LAUNCH_PID"
+            clear_engine_pid_file "$LAUNCH_PID"
+            rm -f "$ENGINE_REQUEST" "$ENGINE_ARGS"
+        }
+        trap 'cleanup_slam_toolbox; exit 143' TERM INT
+        trap cleanup_slam_toolbox EXIT
+        while true; do
+            REQ=$(cat "$ENGINE_REQUEST" 2>/dev/null || true)
+            if [ "$REQ" = "idle" ]; then
+                # Deliberately nothing running: between a load and a confirmed
+                # relocalization no one should be publishing map -> odom, so a
+                # consumer cannot act on a pose nothing has checked.
+                sleep 1
+                continue
+            fi
+            if [ "$REQ" = "localization" ] && [ -s "$ENGINE_ARGS" ]; then
+                echo "[start_engine] slam_toolbox -> localization node"
+                # shellcheck disable=SC2046  # the args file is one arg per line
+                # The deployment's scan-matching overrides apply to both nodes.
+                setsid ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_localization.launch.py" \
+                    $(cat "$ENGINE_ARGS") $ST_ARGS &
+            else
+                echo "[start_engine] slam_toolbox -> mapping node"
+                setsid ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_2d.launch.py" \
+                    scan_topic:="$SCAN_TOPIC" \
+                    base_frame:="${BASE_FRAME:-base_link}" \
+                    odom_frame:="${ODOM_FRAME:-odom}" \
+                    map_mode:="${MAP_MODE:-mapping}" \
+                    use_sim_time:="${USE_SIM_TIME:-false}" \
+                    $ST_ARGS &
+            fi
+            LAUNCH_PID=$!
+            echo "$LAUNCH_PID" > "$ENGINE_PID_FILE"
+            # `|| true` matters: this script runs under `set -e`, the engine is
+            # stopped with SIGTERM whenever the mode is swapped, and an errexit
+            # on a 143 from `wait` ended the script -- which closed the pipe the
+            # entrypoint waits on and took the whole container down with it.
+            wait "$LAUNCH_PID" || true
+            clear_engine_pid_file "$LAUNCH_PID"
+            LAUNCH_PID=""
+            echo "[start_engine] slam_toolbox launch exited; restarting in 2s"
+            sleep 2
+        done
+        ;;
     dlio)
         # Direct LiDAR-Inertial Odometry — real-robot 3D livox path.
         # Requires the `dlio` ros2 package mounted/installed in the
@@ -203,7 +329,7 @@ PYEOF
         ;;
 
     *)
-        echo "[start_engine] unknown algo: $ALGO (supported: rtabmap | dlio | fastlio2)" >&2
+        echo "[start_engine] unknown algo: $ALGO (supported: rtabmap | slam_toolbox | dlio | fastlio2)" >&2
         exit 2
         ;;
 esac

@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -69,13 +70,16 @@ from map_mcp import (  # type: ignore  # noqa: E402
     GetPose_Request as McpGetPoseReq,
     GetPose_Response as McpGetPoseResp,
 )
+from mapping_rbnx import engines  # noqa: E402
 from mapping_rbnx import lifecycle  # noqa: E402
+from mapping_rbnx import localizers  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
     choose_provider_record,
     resolve_occupancy_sources,
     resolve_rtabmap_overrides,
+    resolve_slam_toolbox_overrides,
     select_rtabmap_inputs,
 )
 
@@ -114,14 +118,14 @@ def _sanitize_map_id(map_id: str) -> str:
 
 
 def _resolve_persistence(cfg: dict) -> dict[str, str]:
-    """Resolve a private runtime DB, and only read saved maps in localization.
+    """Validate the selected engine's saved artifact for the requested mode.
 
-    ``maps/<map_id>/rtabmap.db`` is an immutable published artifact. RTAB-Map
-    must never use it as its active writer database. A mapping session always
-    receives a fresh runtime DB; ``save_map`` snapshots that DB atomically into
-    a stable map id. Localization first copies the saved artifact to a runtime
-    DB, so even RTAB-Map bookkeeping cannot mutate the saved copy.
+    RTAB-Map persists a SQLite database and needs a private runtime copy because
+    it can update bookkeeping even in localization mode. Other engines own
+    different artifacts: slam_toolbox, for example, requires both posegraph
+    files. Never use the presence of ``rtabmap.db`` as a generic map check.
     """
+    algo = str(cfg.get("algo", "rtabmap")).strip()
     raw_id = cfg.get("map_id")
     map_id = _sanitize_map_id(str(raw_id)) if raw_id else ""
     mode = str(cfg.get("map_mode", "mapping")).strip().lower()
@@ -134,26 +138,46 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
         if not map_id:
             raise RuntimeError("map_mode=localization requires a saved map_id")
         map_dir = os.path.join(MAPS_DIR, map_id)
-        saved_db = os.path.join(map_dir, "rtabmap.db")
-        if not os.path.isfile(saved_db):
-            raise RuntimeError(
-                f"map_mode=localization but no saved map at {saved_db!r}. "
-                "Save a mapping session first, or check MAPPING_MAPS_DIR."
-            )
         if reset:
             raise RuntimeError("reset_map=true is meaningless in localization mode")
-        runtime_db = map_ops._runtime_db_copy(saved_db, map_id)
-        log.info("persistence: localization map_id=%s saved_db=%s runtime_db=%s",
-                 map_id, saved_db, runtime_db)
-        return {
+        saved_engine = map_ops.map_engine(map_dir)
+        if saved_engine and saved_engine != algo:
+            raise RuntimeError(
+                f"map {map_id!r} was built by {saved_engine}, but this "
+                f"deployment runs {algo}"
+            )
+        ops = engines.engine_for(algo)
+        if ops is None:
+            raise RuntimeError(f"algo={algo!r} does not support saved-map localization")
+        ready, detail = ops.graph_ready(map_dir)
+        if not ready:
+            raise RuntimeError(
+                f"map_mode=localization but saved {algo} map {map_id!r} is "
+                f"not loadable: {detail}. Save a mapping session first, or "
+                "check MAPPING_MAPS_DIR."
+            )
+        result = {
             "map_id": map_id,
             "map_mode": "localization",
-            "database_path": runtime_db,
             "reset_map": "false",
         }
+        if algo == "rtabmap":
+            saved_db = os.path.join(map_dir, "rtabmap.db")
+            runtime_db = map_ops._runtime_db_copy(saved_db, map_id)
+            result["database_path"] = runtime_db
+            log.info("persistence: localization map_id=%s saved_db=%s runtime_db=%s",
+                     map_id, saved_db, runtime_db)
+        else:
+            log.info("persistence: localization map_id=%s engine=%s artifact=%s",
+                     map_id, algo, detail)
+        return result
 
     # Mapping is always a new mutable session. Keep a supplied map_id out of
     # the runtime binding: it identifies a saved artifact, not a live session.
+    if algo != "rtabmap":
+        log.info("persistence: fresh %s mapping session requested_map_id=%s",
+                 algo, map_id or "<none>")
+        return {"map_mode": "mapping", "reset_map": "true"}
     os.makedirs(map_ops.RUNTIME_DB_DIR, exist_ok=True)
     runtime_db = os.path.join(
         map_ops.RUNTIME_DB_DIR,
@@ -166,6 +190,37 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
         "database_path": runtime_db,
         "reset_map": "true",
     }
+
+
+_STARTUP_LOAD_THREAD: Optional[threading.Thread] = None
+
+
+def _begin_startup_localization(map_id: str) -> None:
+    """Restore a validated non-RTABMap artifact after CMD_INIT returns.
+
+    RTAB-Map consumes its runtime database directly from launch arguments.
+    slam_toolbox instead needs the staged load_map handover: publish the saved
+    grid, recover the robot globally, then start its read-only localization
+    executable at the recovered pose. Recovery is asynchronous because it may
+    require scans and robot movement and must not block service INIT.
+    """
+    global _STARTUP_LOAD_THREAD
+    if _STARTUP_LOAD_THREAD is not None and _STARTUP_LOAD_THREAD.is_alive():
+        raise RuntimeError("saved-map startup localization is already running")
+
+    def restore() -> None:
+        try:
+            out = map_ops.load_map_impl(map_id, "localization")
+            if out.get("ok"):
+                log.info("startup localization: %s", out.get("detail", "started"))
+            else:
+                log.error("startup localization failed: %s", out.get("detail", out))
+        except Exception:  # noqa: BLE001
+            log.exception("startup localization crashed for map_id=%s", map_id)
+
+    _STARTUP_LOAD_THREAD = threading.Thread(
+        target=restore, name="startup-map-localization", daemon=True)
+    _STARTUP_LOAD_THREAD.start()
 
 
 def _write_rtabmap_overrides(cfg: dict, resolved: dict[str, str]) -> str:
@@ -267,6 +322,21 @@ _ALGO_TOPIC_BINDINGS: dict[str, dict[str, str]] = {
         # is running internally, this IS the odom source.
         "robonix/service/map/odom":           "/rtabmap/odom",
     },
+    "slam_toolbox": {
+        # Karto scan matching + pose graph, 2D lidar only. slam_toolbox owns
+        # /map and the map → odom transform itself; there is no 3D cloud, so the
+        # pointcloud contract is backed by the same adapter dlio uses in reverse
+        # — a laser-scan-to-cloud republisher in the launch — rather than left
+        # unbound, because every algo must back the whole exported surface.
+        "robonix/service/map/occupancy_grid": "/map",
+        "robonix/service/map/pointcloud":     "/robonix/map/cloud",
+        # Same tf_to_pose adapter as rtabmap: slam_toolbox publishes /pose only
+        # in localization mode, while map → base_link is always in tf.
+        "robonix/service/map/pose":           "/robonix/map/pose",
+        # No corrected-odometry stream of its own; the chassis odometry with the
+        # map → odom correction in tf is what consumers get.
+        "robonix/service/map/odom":           "/robonix/map/odom",
+    },
     "dlio": {
         # Direct LiDAR-Inertial Odometry: real-robot 3D livox path.
         # No native 2D OccupancyGrid — projected from /dlio's cloud
@@ -310,6 +380,7 @@ _SENSOR_CONTRACTS = [
     # (config-key,   contract,                                  yaml-key)
     ("lidar3d",  "robonix/primitive/lidar/lidar3d",       "lidar_topic"),
     ("lidar2d",  "robonix/primitive/lidar/lidar",         "scan_topic"),
+    ("scan_converter", "robonix/service/lidar/scan_converter/scan", "scan_topic"),
     ("imu",      "robonix/primitive/imu/imu",             "imu_topic"),
     ("depth",    "robonix/primitive/camera/depth",        "depth_topic"),
     ("rgb",      "robonix/primitive/camera/rgb",          "rgb_topic"),
@@ -335,6 +406,10 @@ def _enabled_sensors(cfg: dict) -> dict:
             raise RuntimeError(
                 f"unknown sensor provider role(s) {sorted(unknown)}; "
                 f"options: {sorted(supported)}"
+            )
+        if "lidar2d" in providers and "scan_converter" in providers:
+            raise RuntimeError(
+                "sensor_providers.lidar2d and scan_converter are mutually exclusive"
             )
         for key, provider_id in providers.items():
             if not isinstance(provider_id, str) or not provider_id.strip():
@@ -569,6 +644,50 @@ def init(cfg: dict):
     except RuntimeError as e:
         return Err(str(e))
     resolved.update(persist)
+    # Frames and clock reach the launch through the same resolved file the
+    # topics do; slam_toolbox takes them as launch arguments and rtabmap reads
+    # them from its own params, so writing them unconditionally is harmless.
+    resolved.setdefault("base_frame", str(cfg.get("base_frame") or "base_link"))
+    resolved.setdefault("odom_frame", str(cfg.get("odom_frame") or "odom"))
+    resolved.setdefault("use_sim_time", "true" if cfg.get("use_sim_time") else "false")
+
+    # Localization engine used by load_map (see localizers.py). Configured once
+    # the sensor topics are resolved, because the particle filter subscribes to
+    # the same scan the SLAM engine does. A bad name raises here, at init.
+    particles = cfg.get("localizer_particles") or {}
+    localizer_name = localizers.configure({
+        "localizer": cfg.get("localizer"),
+        "scan_topic": resolved.get("scan_topic"),
+        "base_frame": cfg.get("base_frame") or "base_link",
+        "odom_frame": cfg.get("odom_frame") or "odom",
+        "use_sim_time": bool(cfg.get("use_sim_time", False)),
+        "min_particles": particles.get("min"),
+        "max_particles": particles.get("max"),
+    })
+    if localizer_name != "none":
+        log.info("[mapping] localizer=%s on scan=%s (load_map without a pose will "
+                 "request global localization)", localizer_name, resolved.get("scan_topic"))
+    # The engine needs the same settings for a different reason: loading a map
+    # restarts slam_toolbox as its localization executable, and a new process
+    # has to be given the deployment's scan topic and frames rather than
+    # inheriting them.
+    engine_ops = engines.engine_for(algo)
+    if engine_ops is not None and hasattr(engine_ops, "configure"):
+        engine_ops.configure(
+            scan_topic=resolved.get("scan_topic") or "",
+            base_frame=cfg.get("base_frame") or "base_link",
+            odom_frame=cfg.get("odom_frame") or "odom",
+            map_frame=cfg.get("map_frame") or "map",
+            use_sim_time=bool(cfg.get("use_sim_time", False)))
+    if algo == "slam_toolbox":
+        # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
+        # They reach the launch through the resolved file like every other
+        # setting; unset keys keep the launch defaults.
+        try:
+            resolved.update(resolve_slam_toolbox_overrides(
+                cfg.get("slam_toolbox_params")))
+        except RuntimeError as e:
+            return Err(str(e))
     if algo == "rtabmap":
         try:
             overrides_path = _write_rtabmap_overrides(cfg, resolved)
@@ -640,6 +759,18 @@ def init(cfg: dict):
         cloud=resolved.get("lidar_topic", ""),
     )
     webui.maybe_start()
+    # Independent of the page: nothing else notices a pose that has drifted off
+    # the map, and a robot acting on one is the failure this guards against.
+    webui.start_supervisor()
+    # RTAB-Map opens its resolved runtime DB in start_engine.sh. Engines with
+    # typed artifacts require load_map's safe handover instead. The launcher is
+    # initialized to `idle` for this mode, so no empty mapping node can claim
+    # map -> odom while global localization is in progress.
+    if active_mode == "localization" and algo != "rtabmap":
+        try:
+            _begin_startup_localization(persist["map_id"])
+        except RuntimeError as e:
+            return Err(str(e))
     return Ok()
 
 

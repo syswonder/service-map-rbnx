@@ -9,6 +9,61 @@ function setStatus(t) {
 // ── scene-style world-centered canvas (proven model from scene webui) ──
 // fit() pins the canvas backing-store resolution to its CSS display size,
 // so pointer coords map 1:1 — this is what kept the click coords honest.
+let STALE = true;
+let CURTRUST = null;
+
+// The trust line answers "is my localization right?" from the map rather than
+// from the filter's own confidence, which is why it can disagree with the
+// spread shown beside it — and when it does, it is the one to believe.
+function applyTrust() {
+  const el = document.getElementById("trust");
+  if (!el) return;
+  const t = CURTRUST || {};
+  if (!t.verdict) {
+    el.classList.remove("on");
+    return;
+  }
+  el.classList.add("on");
+  el.classList.remove("ok", "suspect", "stale", "unknown");
+  el.classList.add(t.verdict);
+  // The median of the recent readings, not the latest one: a single scan
+  // dips whenever someone walks past the robot.
+  const pct = t.fit != null ? Math.round(t.fit * 100) + "%" : "—";
+  const gate = Math.round((t.threshold ?? 0) * 100) + "%";
+  const icon = document.getElementById("trusticon");
+  const text = document.getElementById("trusttext");
+  if (t.verdict == "ok") {
+    icon.textContent = "\u2713";
+    text.innerHTML = "<b>Localization checks out</b> — " + pct +
+      " of the laser lands on mapped walls (needs " + gate + ")";
+  } else if (t.verdict == "stale") {
+    icon.textContent = "!";
+    text.innerHTML = "<b>Nothing is tracking the robot</b> — " + (t.detail || "") +
+      ". The check cannot run, so the map frame is withdrawn rather than " +
+      "assumed good.";
+  } else if (t.verdict == "suspect") {
+    icon.textContent = "!";
+    text.innerHTML = t.withdrawn
+      ? "<b>Map frame withdrawn</b> — only " + pct +
+        " of the laser lands on mapped walls. Navigation and recording are " +
+        "stopped until this is settled; relocalizing."
+      : "<b>Localization does not match the map</b> — only " + pct +
+        " of the laser lands on mapped walls (needs " + gate +
+        "). The map frame is withdrawn if this holds.";
+  } else {
+    icon.textContent = "?";
+    text.innerHTML = "<b>Localization unverified</b> — " + (t.detail || "no evidence either way");
+  }
+  el.title = t.detail || "";
+}
+
+// The live geometry lives in its own chip: it is the one string on the page
+// that changes every poll, and sharing a chip with status made the whole row
+// (and the toolbar above it) shuffle a few pixels each second.
+function setPose(t) {
+  const el = document.getElementById("posechip");
+  if (el) el.textContent = t;
+}
 const cv = document.getElementById("mapcv"),
   cx = cv.getContext("2d");
 function fit() {
@@ -316,9 +371,14 @@ async function poll() {
     let s = await (await fetch("/api/state")).json();
     MI = s;
     if (s.mode) CURMODE = s.mode;
+    CURENGINE = s.engine || "";
+    CURLOCALIZER = s.localizer || "";
+    CURLOC = s.localization || null;
+    CURTRUST = s.trust || null;
     CURMAP = s.map_id || "";
     applyMode();
-    setStatus(
+    applyTrust();
+    setPose(
       s.has_map
         ? "map " +
             s.width +
@@ -339,8 +399,13 @@ async function poll() {
             (s.dist_from_seed != null ? "  Δseed=" + s.dist_from_seed + "m" : "")
         : "no map yet",
     );
+    if (STALE) {
+      STALE = false;
+      setStatus("live");
+    }
     draw();
   } catch (e) {
+    STALE = true;
     setStatus("disconnected");
   }
 }
@@ -351,35 +416,66 @@ async function loadLib() {
   let el = document.getElementById("lib");
   el.innerHTML = "";
   if (!m.length) {
-    el.innerHTML = '<div class="text-secondary small">no saved maps yet</div>';
+    el.innerHTML = '<div class="hint">no saved maps yet</div>';
     return;
   }
   for (const x of m) {
     let d = document.createElement("div");
     d.className = "mapitem";
-    d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}">
-   <div class="mi"><b class="text-truncate d-block" title="${x.map_id}">${x.map_id}</b><div class="text-secondary small">${(x.db_size / 1e6).toFixed(1)} MB${x.has_db ? "" : " · no db"}</div></div>
-   <button class="btn btn-sm btn-outline-light" onclick="doLoad('${x.map_id}')">Load</button>
-   <button class="btn btn-sm btn-outline-danger" onclick="doDelete('${x.map_id}')">Del</button>`;
+    d.innerHTML = `<img src="/api/maps/${x.map_id}/preview.png?${Date.now()}" alt="">
+   <div class="mi"><b title="${x.map_id}">${x.map_id}</b><div title="${x.detail || ""}">${(x.db_size / 1e6).toFixed(1)} MB · ${x.engine || "?"}${x.has_db ? "" : " · no map data"}${x.loadable_here ? "" : " · other backend"}</div></div>
+   <div class="acts"><button class="btn sm"${x.loadable_here ? "" : ` disabled title="${x.detail || "cannot be loaded here"}"`} onclick="doLoad('${x.map_id}')">Load</button>
+   <button class="btn sm danger" onclick="doDelete('${x.map_id}')">Del</button></div>`;
     el.appendChild(d);
   }
 }
 setInterval(() => {
-  if (document.getElementById("libpanel").classList.contains("on")) loadLib();
+  if (paneOpen("libpanel")) loadLib();
 }, 5000);
 
 // The map is the page; everything else is a panel raised over it from the
 // toolbar. Opening one refreshes it immediately rather than waiting for the
 // next poll, and closing it stops that poll.
 function togglePanel(id) {
-  const el = document.getElementById(id);
-  const on = el.classList.toggle("on");
+  const dock = document.getElementById("dock");
+  const pane = document.getElementById(id);
+  const already = pane.classList.contains("on") && dock.classList.contains("on");
+  for (const p of document.querySelectorAll(".pane")) p.classList.remove("on");
+  for (const t of document.querySelectorAll(".tab")) t.classList.remove("on");
+  for (const b of ["tool-save", "tool-library", "tool-log"]) {
+    const el = document.getElementById(b);
+    if (el) el.classList.remove("active");
+  }
+  if (already) {
+    dock.classList.remove("on");
+    return;
+  }
+  dock.classList.add("on");
+  pane.classList.add("on");
+  const tab = document.getElementById("tab-" + id);
+  if (tab) tab.classList.add("on");
   const tool = { savepanel: "tool-save", libpanel: "tool-library", logpanel: "tool-log" }[id];
-  if (tool) document.getElementById(tool).classList.toggle("active", on);
-  if (on && id == "libpanel") loadLib();
-  if (on && id == "logpanel") loadLog();
-  if (on && id == "savepanel") document.getElementById("saveid").focus();
+  if (tool) document.getElementById(tool).classList.add("active");
+  if (id == "libpanel") loadLib();
+  if (id == "logpanel") loadLog();
+  if (id == "savepanel") document.getElementById("saveid").focus();
 }
+
+function closeDock() {
+  document.getElementById("dock").classList.remove("on");
+  for (const p of document.querySelectorAll(".pane")) p.classList.remove("on");
+  for (const t of document.querySelectorAll(".tab")) t.classList.remove("on");
+  for (const b of ["tool-save", "tool-library", "tool-log"]) {
+    const el = document.getElementById(b);
+    if (el) el.classList.remove("active");
+  }
+}
+
+function paneOpen(id) {
+  const el = document.getElementById(id);
+  return !!el && el.classList.contains("on");
+}
+
 const KCOL = {
   save: "#5bd66f",
   load: "#5aa9ff",
@@ -391,18 +487,46 @@ async function loadLog() {
   try {
     let L = await (await fetch("/api/log")).json();
     let box = document.getElementById("logbox");
+    // An empty box reads as a broken panel, so say which it is: the log holds
+    // this session's actions and starts empty after every boot.
+    if (!L.length) {
+      box.innerHTML =
+        '<div class="hint">nothing yet — saves, loads, mode switches and pose ' +
+        "seeds from this session appear here</div>";
+      return;
+    }
     let atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
     box.innerHTML = L.map((e) => {
       let t = new Date(e.t * 1000).toLocaleTimeString();
       let c = KCOL[e.kind] || "#8b93a3";
-      return `<div><span class="text-secondary">${t}</span> <b style="color:${c}">${e.kind}</b> ${e.msg.replace(/</g, "&lt;")}</div>`;
+      return `<div><span class="t">${t}</span> <b style="color:${c}">${e.kind}</b> ${e.msg.replace(/</g, "&lt;")}</div>`;
     }).join("");
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (e) {}
 }
 setInterval(() => {
-  if (document.getElementById("logpanel").classList.contains("on")) loadLog();
+  if (paneOpen("logpanel")) loadLog();
 }, 1500);
+// A robot that has been carried is the case this exists for: its pose is wrong
+// and nothing in the running system knows it, because a scan matcher tracking
+// frame to frame follows the robot into the wrong place quite happily.
+async function doRelocalize() {
+  if (
+    !(await askConfirm(
+      "Find the robot again?",
+      "The map frame is withdrawn while this runs, so anything navigating or " +
+        "recording in it stops until the new pose has been checked. The robot " +
+        "does not need to be driven.",
+      { yes: "Relocalize" },
+    ))
+  )
+    return;
+  await runExclusive("Relocalizing", "matching what the laser sees against the map", async () => {
+    const r = await (await fetch("/api/relocalize", { method: "POST" })).json();
+    setStatus(r.detail || (r.ok ? "relocalizing" : "relocalize failed"));
+  });
+}
+
 async function doSave() {
   let id = document.getElementById("saveid").value.trim();
   if (!id) {
@@ -450,6 +574,9 @@ async function doLoad(id) {
       ).json(),
   );
   if (r) setStatus(r.detail || "loaded");
+  if (r && r.ok && /global localization/i.test(r.detail || "")) {
+    setStatus("relocalizing — particles scattered over the map; drive to converge");
+  }
 }
 async function doSwitch(mode) {
   // Switching a running RTAB-Map from localization to mapping is the one
@@ -547,6 +674,9 @@ async function doDelete(id) {
   }
 }
 let CURMODE = null,
+  CURENGINE = "",
+  CURLOC = null,
+  CURLOCALIZER = "",
   CURMAP = "",
   RANGE = {},
   BUSY = false;
@@ -632,6 +762,44 @@ function applyMode() {
     lo = document.getElementById("btn-localization");
   let bdg = document.getElementById("modebadge");
   if (bdg) bdg.textContent = CURMODE ? "mode: " + CURMODE : "mode: —";
+  // Saved maps belong to the engine that built them, so the running backend is
+  // named on screen next to the mode; the localizer is appended when one is on.
+  // Relocalization is the one thing on this page that is in flight rather than
+  // simply true or false: after a load with no pose the filter is spread over
+  // the whole map and the arrow is a guess. Say so, and show the spread
+  // shrinking, instead of leaving the operator to wonder.
+  let lb = document.getElementById("locbadge");
+  if (lb) {
+    let st = (CURLOC || {}).state || "off";
+    lb.classList.toggle("d-none", st == "off");
+    lb.classList.toggle("loc-converging", st == "converging" || st == "waiting");
+    lb.classList.toggle("loc-converged", st == "converged");
+    lb.classList.toggle("loc-failed", st == "failed");
+    if (st == "waiting") {
+      lb.textContent = "relocalizing — waiting for the filter";
+      lb.title = "The localizer has been asked to relocalize but has not published an estimate yet.";
+    } else if (st == "converging") {
+      lb.textContent = "relocalizing… ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title =
+        "Particles are still spread over the map (position ±" +
+        (CURLOC.position_stddev_m ?? 0).toFixed(2) +
+        " m, heading ±" +
+        (((CURLOC.yaw_stddev_rad ?? 0) * 180) / Math.PI).toFixed(0) +
+        "°). Drive the robot to help it converge — the pose shown is not settled yet.";
+    } else if (st == "failed") {
+      lb.textContent = "relocalization failed";
+      lb.title = (CURLOC || {}).detail || "The localizer could not find the robot on this map.";
+    } else if (st == "converged") {
+      lb.textContent = "localized ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.title = "The particle filter has converged; the pose shown is the filter's estimate.";
+    }
+  }
+  let eb = document.getElementById("enginebadge");
+  if (eb)
+    eb.textContent =
+      "backend: " +
+      (CURENGINE || "—") +
+      (CURLOCALIZER && CURLOCALIZER != "none" ? " + " + CURLOCALIZER : "");
   let sw = document.getElementById("modeswitch");
   if (sw) sw.classList.toggle("loc", CURMODE == "localization");
   if (mp && lo) {

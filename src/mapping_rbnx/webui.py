@@ -31,7 +31,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import lifecycle, map_ops
+from . import lifecycle, localizers, map_ops
 
 log = logging.getLogger("mapping_rbnx.webui")
 
@@ -45,7 +45,9 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 # own node. "scan" and "cloud" hold points already projected into the map
 # frame, so the page can draw them straight onto the occupancy canvas and an
 # operator can see whether the live returns line up with the saved map.
-_latest = {"grid": None, "pose": None, "scan": None, "cloud": None}
+_latest = {"grid": None, "pose": None, "scan": None, "cloud": None,
+           "localizer_pose": None, "localizer_pose_at": 0.0,
+           "scan_at": 0.0, "pose_at": 0.0}
 # Topics for the range sensors, resolved through Atlas by the bridge and
 # injected with set_sensor_topics(). Empty means the deployment has no such
 # capability bound, and the page simply has nothing to draw.
@@ -108,8 +110,16 @@ def _log_add(kind: str, msg: str) -> None:
 
 
 def _live_pose_xytheta():
-    """Current map-frame pose as (x, y, yaw) from the latest /pose, or None."""
-    ps = _latest.get("pose")
+    """Current map-frame pose as (x, y, yaw), or None.
+
+    In localization mode the engine is frozen on the saved map and the particle
+    filter is what tracks the robot, so its estimate is the live pose; the
+    engine's own topic still publishes, but it publishes the pose it was frozen
+    at.
+    """
+    ps = _latest.get("localizer_pose") if _localizer_is_live() else None
+    if ps is None:
+        ps = _latest.get("pose")
     if ps is None:
         return None
     pp = ps.pose.pose
@@ -179,10 +189,20 @@ def _ensure_subscriptions() -> None:
 
             def _on_pose(msg):
                 _latest["pose"] = msg
+                _latest["pose_at"] = time.time()
+
+            def _on_localizer_pose(msg):
+                # The particle filter's own estimate, kept for its covariance:
+                # that is what says whether it has converged yet.
+                _latest["localizer_pose"] = msg
+                _latest["localizer_pose_at"] = time.time()
 
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
             node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+            if localizers.enabled():
+                node.create_subscription(PoseWithCovarianceStamped, localizers.POSE_TOPIC,
+                                         _on_localizer_pose, 10)
             _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
@@ -394,6 +414,11 @@ def _subscribe_range_sensors(node) -> None:
             log.warning("webui overlay: tf2 unavailable, no range overlay: %s", e)
             _tf_buffer = None
 
+    def _on_scan(msg) -> None:
+        _latest["scan"] = _scan_points(msg)
+        _latest["scan_msg"] = msg
+        _latest["scan_at"] = time.time()
+
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""
     if _range_subscribed["scan"]:
@@ -405,7 +430,10 @@ def _subscribe_range_sensors(node) -> None:
             from sensor_msgs.msg import LaserScan
             node.create_subscription(
                 LaserScan, scan_topic,
-                lambda m: _latest.__setitem__("scan", _scan_points(m)),
+                # The projected points draw the overlay; the message itself is
+                # what the map check needs, and re-projecting it back would
+                # throw away the ranges that check depends on.
+                _on_scan,
                 qos_profile_sensor_data)
             _range_subscribed["scan"] = True
             log.info("webui overlay: subscribed scan %s", scan_topic)
@@ -426,7 +454,13 @@ def _subscribe_range_sensors(node) -> None:
 
 def _grid_to_png(grid, pose=None) -> bytes:
     """Render a nav_msgs/OccupancyGrid to a PNG (free=white, occ=black,
-    unknown=grey), origin bottom-left, with an optional robot pose marker."""
+    unknown=grey), origin bottom-left, with an optional robot pose marker.
+
+    The conventional palette, deliberately. An occupancy grid carries three
+    states and the whole of its meaning is telling them apart; a dark-theme
+    inversion tried here put free and unknown within twenty greys of each other
+    and left only wall outlines -- one state gone, and the map no longer read as
+    an occupancy grid at all."""
     from PIL import Image, ImageDraw
     w, h = grid.info.width, grid.info.height
     res = grid.info.resolution
@@ -466,32 +500,230 @@ def _grid_to_png(grid, pose=None) -> bytes:
     return buf.getvalue()
 
 
+# "Is my localization right?" is the one question this page must answer without
+# being asked, because acting on a wrong one is what makes a robot dangerous.
+# A particle filter cannot answer it — its covariance says how much the
+# particles agree with each other, not with the world — so the answer comes
+# from the map: the fraction of the current laser's beams that land on a wall
+# the saved map already has. The threshold is the same one relocalization is
+# gated on, so the page and the recovery agree about what "right" means.
+_trust: dict = {"grid_for": "", "grid": None, "fit": None, "at": 0.0, "detail": "",
+                "history": [], "bad_since": 0.0, "withdrawn": False}
+# Publishing `map -> odom` is a claim to know where the robot is. When the laser
+# has disagreed with the map for this long, the claim is withdrawn: the engine
+# stands down and a relocalization starts. Everything downstream then loses the
+# map frame and stops on its own -- nav2 reports `Localization: inactive` and
+# refuses goals, Scene's tf lookups return nothing and it records nothing --
+# without mapping having to reach into either of them. A page that only says
+# "do not send goals" is advice, and a robot driving on a pose known to be wrong
+# is exactly what this exists to prevent.
+WITHDRAW_AFTER_S = float(os.environ.get("MAPPING_TRUST_WITHDRAW_AFTER_S", "12"))
+TRUST_PERIOD_S = 2.0
+# One scan is a noisy witness: a person walking past, or a moment facing a wall
+# the map only half covers, drops a single reading well below the gate while the
+# robot is perfectly localized. Reporting the median of the last few readings
+# says what the last quarter-minute looked like, which is what an operator
+# glancing at the page needs to know.
+TRUST_WINDOW = 7
+
+
+def _localizer_is_live(max_age_s: float = 5.0) -> bool:
+    """Is the particle filter currently the thing tracking the robot?"""
+    if not localizers.enabled():
+        return False
+    at = float(_latest.get("localizer_pose_at") or 0.0)
+    return at > 0.0 and (time.time() - at) <= max_age_s
+
+
+# How long either input may go missing before the check refuses to speak for it.
+# Longer than any real gap between scans, short enough that a robot cannot cross
+# a room on a pose nothing is updating.
+STALE_AFTER_S = float(os.environ.get("MAPPING_TRUST_STALE_AFTER_S", "5"))
+
+
+def _stale_inputs(now: float) -> str:
+    """Why the check cannot run right now, or "" when both inputs are current."""
+    scan_age = now - float(_latest.get("scan_at") or 0.0)
+    pose_at = max(float(_latest.get("pose_at") or 0.0),
+                  float(_latest.get("localizer_pose_at") or 0.0))
+    pose_age = now - pose_at
+    if not _latest.get("scan_at"):
+        return "no laser has arrived yet"
+    if scan_age > STALE_AFTER_S:
+        return f"no laser for {scan_age:.0f}s"
+    if not pose_at:
+        return "no pose has arrived yet"
+    if pose_age > STALE_AFTER_S:
+        return f"no pose for {pose_age:.0f}s"
+    return ""
+
+
+def _localization_trust() -> dict:
+    """Whether the live pose is supported by the map, recomputed periodically.
+
+    Returns {} outside localization mode; otherwise a verdict of `ok`,
+    `suspect` or `unknown` with the measured fraction. `unknown` means the
+    laser cannot speak — the robot is looking at ground the map never covered —
+    which is not the same as a bad fix and must not be shown as one.
+    """
+    # The lifecycle is what knows which map is loaded; get_mode_impl reports the
+    # engine's mode and carries no map id, so reading the id from there returned
+    # nothing and the check silently never ran.
+    live = lifecycle.current()
+    if (live.get("mode") or "") != "localization":
+        return {}
+    map_id = live.get("map_id") or ""
+    if not map_id:
+        return {}
+    map_dir = os.path.join(MAPS_DIR, map_id)
+    if _trust["grid_for"] != map_id:
+        _trust.update(grid_for=map_id, grid=localizers.load_grid(map_dir),
+                      fit=None, at=0.0, detail="")
+    now = time.time()
+    if now - float(_trust["at"] or 0.0) >= TRUST_PERIOD_S:
+        # Comparing a stale scan against a stale pose measures nothing: the two
+        # were captured together and agree with each other for as long as both
+        # sit still in memory. A run that carried the robot for real read
+        # `ok 100%` for two minutes after the laser stopped arriving, while the
+        # true error was 2.97 m -- a system that has stopped listening reporting
+        # perfect confidence. So silence is its own verdict, and it withdraws
+        # the map frame on the same timer a wrong pose does: a robot nobody is
+        # tracking must not keep being navigated.
+        stale = _stale_inputs(now)
+        pose = None if stale else _live_pose_xytheta()
+        scan = None if stale else _latest.get("scan_msg")
+        if stale:
+            _trust.update(fit=None, at=now, history=[], detail=stale)
+        elif pose is not None and scan is not None and _trust["grid"] is not None:
+            fit, detail = localizers.scan_fit_of(_trust["grid"], scan, pose)
+            history = _trust["history"]
+            if fit >= 0.0:
+                history.append(fit)
+                del history[:-TRUST_WINDOW]
+            _trust.update(fit=fit, detail=detail, at=now)
+        else:
+            _trust.update(fit=None, at=now, history=[],
+                          detail="waiting for a pose, a scan and the saved map")
+    history = _trust["history"]
+    if not history:
+        stale = _stale_inputs(time.time())
+        if stale:
+            _enforce_trust(False, map_id, 0.0)
+            out = {"verdict": "stale", "threshold": localizers.SCAN_FIT_MIN,
+                   "detail": stale}
+            if _trust["withdrawn"]:
+                out["withdrawn"] = True
+            return out
+        return {"verdict": "unknown", "threshold": localizers.SCAN_FIT_MIN,
+                "detail": _trust["detail"] or "no reading yet"}
+    ordered = sorted(history)
+    fit = ordered[len(ordered) // 2]
+    good = fit >= localizers.SCAN_FIT_MIN
+    _enforce_trust(good, map_id, fit)
+    out = {"verdict": "ok" if good else "suspect",
+           "threshold": localizers.SCAN_FIT_MIN,
+           "fit": round(fit, 3),
+           "latest": round(history[-1], 3),
+           "samples": len(history),
+           "detail": _trust["detail"]}
+    if _trust["withdrawn"]:
+        out["withdrawn"] = True
+    return out
+
+
+def _enforce_trust(good: bool, map_id: str, fit: float) -> None:
+    """Withdraw the map frame while the laser says the pose is wrong.
+
+    Hysteresis, not a hair trigger: a single bad reading is a person walking
+    past, and pulling the frame for that would stop a healthy robot. Sustained
+    disagreement is a robot that has been moved or has slipped, and driving on
+    is the dangerous option.
+    """
+    now = time.time()
+    if good:
+        _trust["bad_since"] = 0.0
+        if _trust["withdrawn"]:
+            _trust["withdrawn"] = False
+        return
+    if not _trust["bad_since"]:
+        _trust["bad_since"] = now
+        return
+    if _trust["withdrawn"] or now - _trust["bad_since"] < WITHDRAW_AFTER_S:
+        return
+    _trust["withdrawn"] = True
+    _log_add("load", f"✗ the laser has disagreed with '{map_id}' for "
+                     f"{WITHDRAW_AFTER_S:.0f}s ({fit:.0%}); withdrawing the map frame "
+                     f"and relocalizing")
+    out = map_ops.relocalize_impl()
+    if not out.get("ok"):
+        _log_add("load", f"✗ automatic relocalization refused: {out.get('detail','')}")
+
+
+def _localization_state() -> dict:
+    """How the particle filter is doing, for the page to say so.
+
+    `off` when no localizer is configured, `waiting` when one is running but has
+    not published an estimate yet (it has just been asked to relocalize), then
+    `converging` while the particle cloud is still spread out and `converged`
+    once it is tight enough to act on. The spread is reported too, so the page
+    can show it shrinking rather than just flipping between two words.
+    """
+    if not localizers.enabled():
+        return {"state": "off"}
+    # Configured is not running: in mapping mode the SLAM engine owns the pose
+    # and the particle filter is not up, so there is nothing to wait for.
+    if map_ops.get_mode_impl().get("mode", "") != "localization":
+        return {"state": "off"}
+    reloc = localizers.relocalization()
+    msg = _latest.get("localizer_pose")
+    if msg is None:
+        # No filter estimate is the normal case now: a scan matched against the
+        # map standing still never starts one. The recorded outcome is then the
+        # only thing that knows how the relocalization went.
+        state = {"done": "converged", "running": "converging",
+                 "failed": "failed"}.get(reloc.get("state"), "waiting")
+        return {"state": state, "localizer": localizers.name(),
+                "detail": reloc.get("detail", "")}
+    position_stddev, yaw_stddev = localizers.spread(msg)
+    state = localizers.convergence_state(position_stddev, yaw_stddev)
+    if reloc.get("state") == "failed":
+        # The filter's own numbers are stale once it has been stopped; the
+        # recorded outcome is what actually happened.
+        state = "failed"
+    return {
+        "state": state,
+        "detail": reloc.get("detail", ""),
+        "localizer": localizers.name(),
+        "position_stddev_m": round(position_stddev, 3),
+        "yaw_stddev_rad": round(yaw_stddev, 3),
+        "age_s": round(time.time() - float(_latest.get("localizer_pose_at") or 0.0), 1),
+    }
+
+
 def _list_saved_maps() -> list[dict]:
+    """Library rows for the page, taken from the capability's own listing.
+
+    `map_ops.list_maps_impl` already knows which engine wrote each map and which
+    files are that engine's graph, so the page reads the same rows every other
+    consumer does instead of re-deriving them from `rtabmap.db`. The `has_db` /
+    `db_size` key names stay as they were so the page's rendering is unchanged.
+    """
     out = []
-    if not os.path.isdir(MAPS_DIR):
+    res = map_ops.list_maps_impl()
+    if not res.get("ok"):
+        log.warning("map library listing failed: %s", res.get("detail", ""))
         return out
-    for name in sorted(os.listdir(MAPS_DIR)):
-        d = os.path.join(MAPS_DIR, name)
-        if not os.path.isdir(d):
-            continue
-        db = os.path.join(d, "rtabmap.db")
-        meta = {}
-        mp = os.path.join(d, "meta.yaml")
-        if os.path.isfile(mp):
-            try:
-                for line in open(mp):
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        meta[k.strip()] = v.strip()
-            except Exception:  # noqa: BLE001
-                pass
+    for row in json.loads(res.get("maps_json") or "[]"):
         out.append({
-            "map_id": name,
-            "has_db": os.path.isfile(db),
-            "has_preview": os.path.isfile(os.path.join(d, "occupancy.png")),
-            "db_size": os.path.getsize(db) if os.path.isfile(db) else 0,
-            "updated": int(os.path.getmtime(db)) if os.path.isfile(db) else 0,
-            "meta": meta,
+            "map_id": row["map_id"],
+            "engine": row.get("engine", ""),
+            "loadable_here": bool(row.get("loadable_here", True)),
+            "detail": row.get("artifact_detail", ""),
+            "has_db": bool(row.get("has_spatial_artifact")),
+            "has_preview": bool(row.get("has_preview")),
+            "db_size": int(row.get("artifact_size", 0)),
+            "updated": int(row.get("updated", 0)),
+            "meta": row.get("meta", {}),
         })
     return out
 
@@ -565,6 +797,13 @@ class _Handler(BaseHTTPRequestHandler):
                 live = lifecycle.current()
                 st = {"has_map": g is not None,
                       "mode": map_ops.get_mode_impl().get("mode", ""),
+                      # Which SLAM engine is running decides what a saved map
+                      # means, so the page names it instead of leaving the
+                      # operator to guess from the deployment config.
+                      "engine": map_ops.active_algo(),
+                      "localizer": localizers.name(),
+                      "localization": _localization_state(),
+                      "trust": _localization_trust(),
                       "map_id": live.get("map_id", "")}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
@@ -650,6 +889,10 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     _log_add("pose", f"✗ pose estimate: {out.get('detail','')}")
                 return self._json(out)
+            if p == "/api/relocalize":
+                out = map_ops.relocalize_impl()
+                _log_add("load", f"{'✓' if out.get('ok') else '✗'} relocalize: {out.get('detail','')}")
+                return self._json(out)
             if p == "/api/switch_mode":
                 mode = body.get("mode", "")
                 out = map_ops.switch_mode_impl(mode)
@@ -664,6 +907,36 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 _server = None
+
+
+_supervisor = None
+
+
+def start_supervisor() -> None:
+    """Keep checking the localization with nobody watching the page.
+
+    The reading and the withdrawal it drives are a property of the running
+    system, not a feature of the status page: a robot whose pose has gone wrong
+    is dangerous whether or not an operator has a browser open. Started
+    unconditionally by atlas_bridge, so a deployment that disables the web UI
+    still gets the check. The page reads the same state this loop maintains.
+    """
+    global _supervisor
+    if _supervisor is not None:
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(TRUST_PERIOD_S)
+            try:
+                _ensure_subscriptions()
+                _localization_trust()
+            except Exception as e:  # noqa: BLE001
+                log.warning("localization supervisor: %s", e)
+
+    _supervisor = threading.Thread(target=_loop, daemon=True, name="loc-supervisor")
+    _supervisor.start()
+    log.info("localization supervisor running every %.1fs", TRUST_PERIOD_S)
 
 
 def maybe_start() -> None:

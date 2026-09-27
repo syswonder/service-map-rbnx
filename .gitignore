@@ -12,6 +12,9 @@ __pycache__/
 *.egg-info/
 .eggs/
 dist/
+.venv/
+/benchmark_results/
+/benchmark_data/
 
 # Proto generated (should be regenerated via build)
 proto_gen/

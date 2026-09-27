@@ -111,6 +111,16 @@ keys its semantic objects to.
   saved map in localization mode through a private runtime copy, keeping the
   published artifact immutable and its map frame stable across runs. Pass
   `has_initial_pose` + `x,y,theta` to seed convergence.
+**Localization engine (`localizer:`).** With the default `none` the SLAM engine
+localizes in its own map, which needs a pose seed close enough for scan matching
+to converge. Setting `amcl` (nav2) or `beluga` (beluga_amcl, interface
+compatible) makes `load_map` serve the saved occupancy grid through
+`map_server` and run a particle filter over it. The difference that matters:
+**`load_map` without an initial pose then triggers global localization** — the
+filter scatters particles over the whole free space and converges as the robot
+drives, instead of requiring an operator to supply a pose first. Cost is CPU
+only: 500-2000 particles, tens of MB, no database, no GPU.
+
 - **pose_estimate** `(x, y, theta)` → `(ok, detail)`. Publish a pose guess
   (map frame) to `/initialpose` so rtabmap's localization re-converges — global
   relocalization, kidnapped-robot recovery, or refining a rough operator guess.
@@ -122,13 +132,21 @@ A named map is stored under `{MAPPING_MAPS_DIR}/{map_id}/`:
 
 ```
 maps/lab_3f/
-  rtabmap.db       SLAM graph (relocalization + continued mapping)
+  rtabmap.db       SLAM graph, algo: rtabmap (relocalization + continued mapping)
+  posegraph.*      SLAM graph, algo: slam_toolbox (.posegraph + .data)
   occupancy.pgm    nav2 map_server image (0=occ, 254=free, 205=unknown)
   occupancy.yaml   nav2 map_server metadata
   occupancy.png    same image, double-click to preview offline
   cloud.pcd        fused 3D cloud
-  meta.yaml        map_id, saved_at, frame_id, resolution, size, origin
+  meta.yaml        map_id, engine, saved_at, frame_id, resolution, size, origin
 ```
+
+Only the graph file differs between engines; everything else in the directory
+has the same name and meaning, so consumers do not branch on the engine.
+`meta.yaml` records which engine wrote the map (`engine:`), `list_maps` reports
+it per map, and `load_map` refuses a map built by another engine, naming both
+sides. Maps saved before the field existed hold an `rtabmap.db` and are read as
+`rtabmap`.
 
 - **`map_mode: mapping`** always builds a fresh private runtime database.
   Call `save_map(map_id)` to atomically publish an immutable spatial artifact.

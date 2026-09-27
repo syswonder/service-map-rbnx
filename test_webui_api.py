@@ -133,8 +133,8 @@ class StaticAssetTest(unittest.TestCase):
         self.assertIn("runExclusive", js)        # map ops are single-flight
         self.assertIn("posehint", html)
         self.assertIn("/static/app.js", html)
-        # Bootstrap is vendored, never fetched: the robot has no internet.
-        self.assertIn("/static/vendor/bootstrap.min.css", html)
+        # Styles are served from disk, never fetched: the robot has no internet.
+        self.assertIn("/static/style.css", html)
         self.assertNotIn("http://", html)
         self.assertNotIn("https://", html.replace("https://getbootstrap.com", ""))
 

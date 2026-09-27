@@ -18,15 +18,16 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-# Coarse pass: every 0.4 m and 10 degrees. Fine pass: 0.1 m and 2 degrees around
+# Coarse pass: every 0.2 m and 10 degrees. Fine pass: 0.1 m and 2 degrees around
 # the best coarse candidates. Beams are subsampled because a 640-beam scan says
 # little more about a pose than 90 well-spread beams do, and costs seven times
 # as much to score.
-COARSE_STEP_M = 0.4
+COARSE_STEP_M = 0.2
 COARSE_YAW_STEP_RAD = math.radians(10.0)
 FINE_STEP_M = 0.1
 FINE_YAW_STEP_RAD = math.radians(2.0)
 FINE_CANDIDATES = 24
+TOP_K = 5
 BEAMS = 90
 # A rival pose this far away is a different place, not the same answer nudged.
 DISTINCT_M = 0.8
@@ -40,21 +41,31 @@ MARGIN = 0.06
 # Width of the likelihood field. A beam landing this far from the nearest mapped
 # wall is worth about 60% of one landing on it.
 SIGMA_M = 0.10
+COARSE_SIGMA_M = 0.25
 # What a beam ending in ground the map never observed is worth. Not zero -- the
 # map's silence is not evidence against a pose -- and not one, or a pose facing
 # unmapped space would score as well as one facing a wall it matches.
 UNKNOWN_WEIGHT = 0.35
 
 
+class Candidate:
+    """One global-localization hypothesis."""
+
+    def __init__(self, pose, score: float) -> None:
+        self.pose = pose
+        self.score = score
+
+
 class Match:
     """A scored pose. `ok` is the caller's verdict, not the matcher's."""
 
-    def __init__(self, pose, score: float, runner_up: float, detail: str) -> None:
+    def __init__(self, pose, score: float, runner_up: float, detail: str,
+                 candidates=None) -> None:
         self.pose = pose
         self.score = score
         self.runner_up = runner_up
         self.detail = detail
-
+        self.candidates = candidates or [Candidate(pose, score)]
 
 def _scan_beams(msg, limit: int = BEAMS):
     """(ranges, angles) of up to `limit` valid beams, evenly spread."""
@@ -111,7 +122,8 @@ def distance_field(occ, resolution: float):
     return d * resolution
 
 
-def _score(grid, field, known, ranges, angles, xs, ys, yaws, sensor_xy=(0.0, 0.0)):
+def _score(grid, field, known, ranges, angles, xs, ys, yaws,
+           sensor_xy=(0.0, 0.0), sigma_m: float = SIGMA_M):
     """Likelihood of the scan at every (x, y, yaw) given, in [0, 1].
 
     (x, y, yaw) is the ROBOT's pose and `sensor_xy` is where the laser is
@@ -143,12 +155,51 @@ def _score(grid, field, known, ranges, angles, xs, ys, yaws, sensor_xy=(0.0, 0.0
     col = np.clip(col, 0, grid.width - 1)
     row = np.clip(row, 0, grid.height - 1)
     d = field[row, col]
-    like = np.exp(-(d * d) / (2.0 * SIGMA_M * SIGMA_M))
+    like = np.exp(-(d * d) / (2.0 * sigma_m * sigma_m))
     seen = known[row, col]
     like = np.where(seen, like, UNKNOWN_WEIGHT)
     like = np.where(inside, like, 0.0)
     return like.mean(axis=1), inside.sum(axis=1)
 
+def _yaw_distance(a: float, b: float) -> float:
+    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+
+def _top_distinct_candidates(refined, limit: int):
+    """Return distinct hypotheses without changing the search itself."""
+    kept = []
+
+    for sc, x, y, yaw in refined:
+        duplicate = False
+
+        for candidate in kept:
+            px, py, pyaw = candidate.pose
+
+            close_pos = math.hypot(x - px, y - py) < DISTINCT_M
+            close_yaw = _yaw_distance(yaw, pyaw) < DISTINCT_RAD
+
+            if close_pos and close_yaw:
+                duplicate = True
+                break
+
+        if duplicate:
+            continue
+
+        normalized_yaw = math.atan2(
+            math.sin(yaw),
+            math.cos(yaw),
+        )
+
+        kept.append(
+            Candidate(
+                (x, y, normalized_yaw),
+                sc,
+            )
+        )
+
+        if len(kept) >= limit:
+            break
+
+    return kept
 
 def global_scan_match(grid, msg, tolerance_cells: int = 3,
                      sensor_xy: tuple = (0.0, 0.0)) -> Optional[Match]:
@@ -192,7 +243,8 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
     for yaw in yaws:
         s, _ = _score(grid, field, known, ranges, angles,
                       px.astype(np.float32), py.astype(np.float32),
-                      np.full(len(px), yaw, dtype=np.float32), sensor_xy)
+                      np.full(len(px), yaw, dtype=np.float32), sensor_xy,
+                      sigma_m=COARSE_SIGMA_M)
         for i in np.argsort(s)[-FINE_CANDIDATES:]:
             best.append((float(s[i]), float(px[i]), float(py[i]), float(yaw)))
     best.sort(reverse=True)
@@ -212,35 +264,63 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
             i = int(np.argmax(s))
             refined.append((float(s[i]), float(gx[i]), float(gy[i]), float(cyaw + dy)))
     refined.sort(reverse=True)
+
+    # Pick the best distinct fine hypotheses first. Unlike the original
+    # matcher, polish every Top-K hypothesis instead of polishing only the
+    # current winner.
+    fine_candidates = _top_distinct_candidates(refined, TOP_K)
+
     # One more pass at a quarter of the fine step. The fine grid alone leaves a
     # residual of its own size, and this is the cheapest place to spend it.
     polish = np.arange(-FINE_STEP_M, FINE_STEP_M + 1e-6, FINE_STEP_M / 4.0, dtype=np.float32)
     pyaws = np.arange(-FINE_YAW_STEP_RAD, FINE_YAW_STEP_RAD + 1e-6,
                       FINE_YAW_STEP_RAD / 4.0, dtype=np.float32)
-    ps, px0, py0, pyaw0 = refined[0]
-    gx, gy = np.meshgrid(polish + px0, polish + py0)
-    gx, gy = gx.ravel(), gy.ravel()
-    for dy in pyaws:
-        sc, _ = _score(grid, field, known, ranges, angles, gx, gy,
-                       np.full(len(gx), pyaw0 + dy, dtype=np.float32), sensor_xy)
-        i = int(np.argmax(sc))
-        refined.append((float(sc[i]), float(gx[i]), float(gy[i]), float(pyaw0 + dy)))
-    refined.sort(reverse=True)
-    top = refined[0]
-    rival = 0.0
-    rival_pose = None
-    for sc, x, y, ry in refined[1:]:
-        far = math.hypot(x - top[1], y - top[2]) >= DISTINCT_M
-        turned = abs(math.atan2(math.sin(ry - top[3]), math.cos(ry - top[3]))) >= DISTINCT_RAD
-        if far or turned:
-            rival = sc
-            rival_pose = (x, y, ry)
-            break
-    yaw = math.atan2(math.sin(top[3]), math.cos(top[3]))
+
+    polished = []
+
+    for candidate in fine_candidates:
+        px0, py0, pyaw0 = candidate.pose
+        best_local = (candidate.score, px0, py0, pyaw0)
+
+        gx, gy = np.meshgrid(polish + px0, polish + py0)
+        gx, gy = gx.ravel(), gy.ravel()
+
+        for dy in pyaws:
+            sc, _ = _score(grid, field, known, ranges, angles, gx, gy,
+                           np.full(len(gx), pyaw0 + dy, dtype=np.float32), sensor_xy)
+            i = int(np.argmax(sc))
+
+            local = (
+                float(sc[i]),
+                float(gx[i]),
+                float(gy[i]),
+                float(pyaw0 + dy),
+            )
+
+            if local[0] > best_local[0]:
+                best_local = local
+
+        polished.append(best_local)
+
+    # Keep the original fine hypotheses in the pool as well. This matters if
+    # two polished hypotheses converge to the same basin: another distinct fine
+    # hypothesis can still fill the remaining Top-K slot.
+    final_pool = refined + polished
+    final_pool.sort(reverse=True)
+
+    candidates = _top_distinct_candidates(final_pool, TOP_K)
+
+    top = candidates[0]
+
+    rival = candidates[1].score if len(candidates) > 1 else 0.0
     rival_where = ""
-    if rival_pose is not None:
+
+    if len(candidates) > 1:
+        rx, ry, ryaw = candidates[1].pose
         rival_where = (" at (%.1f, %.1f, %.0f deg)"
-                       % (rival_pose[0], rival_pose[1], math.degrees(rival_pose[2])))
-    return Match((top[1], top[2], yaw), top[0], rival,
-                 f"{top[0]:.0%} likelihood over {len(ranges)} beams, "
-                 f"best rival{rival_where} {rival:.0%}")
+                       % (rx, ry, math.degrees(ryaw)))
+
+    return Match(top.pose, top.score, rival,
+                 f"{top.score:.0%} likelihood over {len(ranges)} beams, "
+                 f"best rival{rival_where} {rival:.0%}",
+                 candidates=candidates)

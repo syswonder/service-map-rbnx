@@ -49,6 +49,11 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from mapping_rbnx.profiles import (
+    normalize_rtabmap_overrides,
+    select_icp_odometry_overrides,
+)
+
 
 _NONE = "<none>"  # sentinel for "no such topic in this deploy"
 
@@ -227,11 +232,9 @@ def _make_nodes(context, *args, **kwargs):
             for key, value in overrides.items()
         ):
             raise RuntimeError("rtabmap_overrides_file must contain a JSON object of scalar parameters")
-        # RTAB-Map parameters are forwarded by the ROS wrapper as strings.
-        deploy_overrides = {
-            key: str(value).lower() if isinstance(value, bool) else str(value)
-            for key, value in overrides.items()
-        }
+        # Slash-named RTAB-Map parameters are strings, while native ROS
+        # parameters must keep their decoded scalar types.
+        deploy_overrides = normalize_rtabmap_overrides(overrides)
         rtabmap_params.update(deploy_overrides)
         print(f"[rtabmap.launch] applied {len(overrides)} deploy override(s) from {overrides_file}")
 
@@ -384,25 +387,22 @@ def _make_nodes(context, *args, **kwargs):
         }
         if have_imu:
             icp_odom_params["wait_imu_to_init"] = True
-        if "publish_null_when_lost" in overrides:
-            if not isinstance(overrides["publish_null_when_lost"], bool):
-                raise RuntimeError(
-                    "publish_null_when_lost must be a YAML boolean "
-                    "(true or false, without quotes)"
-                )
-            icp_odom_params["publish_null_when_lost"] = overrides[
-                "publish_null_when_lost"
-            ]
-        # icp_odometry is a separate process, so parameters passed to the SLAM
-        # node above do not reach it automatically. Merge the complete deploy
-        # dictionary after this node's defaults as well: existing keys are
-        # overridden and additional keys are left for RTAB-Map to accept or
-        # ignore according to the version running on the robot.
-        icp_odom_params.update({
-            key: value
-            for key, value in deploy_overrides.items()
-            if key != "publish_null_when_lost"
-        })
+        if "publish_null_when_lost" in overrides and not isinstance(
+            overrides["publish_null_when_lost"], bool
+        ):
+            raise RuntimeError(
+                "publish_null_when_lost must be a YAML boolean "
+                "(true or false, without quotes)"
+            )
+        # icp_odometry is a separate process. Forward shared Icp/Odom/Reg
+        # parameters plus native parameters that this node already declares;
+        # keep Grid/Rtabmap parameters with the SLAM node.
+        icp_odom_params.update(
+            select_icp_odometry_overrides(
+                deploy_overrides,
+                set(icp_odom_params),
+            )
+        )
         if have_imu:
             icp_odom_remappings.append(("imu", filtered_imu_topic))
         icp_odom = Node(

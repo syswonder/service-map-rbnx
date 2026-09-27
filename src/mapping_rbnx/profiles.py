@@ -217,3 +217,35 @@ def resolve_slam_toolbox_overrides(raw: object | None) -> dict[str, str]:
             raise RuntimeError(f"slam_toolbox_params.{key} must be positive, got {number}")
         out[SLAM_TOOLBOX_KEYS[key]] = str(number)
     return out
+
+
+def normalize_rtabmap_overrides(
+    overrides: dict[str, object],
+) -> dict[str, object]:
+    """Preserve native ROS types while normalizing RTAB-Map parameters.
+
+    RTAB-Map's slash-named parameters are declared by its ROS wrapper as
+    strings. Native ROS parameters, such as ``deskewing`` and
+    ``publish_null_when_lost``, must retain their decoded scalar type.
+    """
+    return {
+        key: (
+            str(value).lower() if isinstance(value, bool) else str(value)
+        )
+        if "/" in key
+        else value
+        for key, value in overrides.items()
+    }
+
+
+def select_icp_odometry_overrides(
+    overrides: dict[str, object],
+    native_parameters: set[str],
+) -> dict[str, object]:
+    """Select overrides accepted by the separate ICP odometry node."""
+    shared_prefixes = ("Icp/", "Odom/", "Reg/")
+    return {
+        key: value
+        for key, value in overrides.items()
+        if key.startswith(shared_prefixes) or key in native_parameters
+    }

@@ -222,13 +222,15 @@ def _pgm_shape(path: str):
         return None
 
 
-def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None):
+def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None,
+                     newer_than=None):
     """Wait for a published OccupancyGrid whose (width, height) is `want`.
 
-    Returns (ok, observed_shape_or_None). `deserialize_map` answers with an
-    empty message, so the map the engine publishes afterwards is the only
-    evidence that the request was accepted rather than silently refused;
-    `differs_from` lets the caller ignore the grid that was already latched.
+    Returns (ok, observed_shape_or_None, stamp_ns_or_None). `deserialize_map`
+    answers with an empty message, so the map the engine publishes afterwards
+    is the only evidence that the request was accepted rather than silently
+    refused; `differs_from` (a shape) or `newer_than` (a stamp) lets the caller
+    ignore the grid that was already latched.
     """
     import threading
 
@@ -236,7 +238,7 @@ def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None
     from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                            ReliabilityPolicy)
 
-    seen = {"shape": None}
+    seen = {"shape": None, "stamp": None}
     hit = threading.Event()
     # Re-rasterizing a graph can land a cell or two either way, so the match is
     # a tolerance rather than equality; it still separates the saved map from
@@ -245,9 +247,12 @@ def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None
 
     def on_map(msg):
         shape = (int(msg.info.width), int(msg.info.height))
+        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         if differs_from is not None and shape == differs_from:
             return
-        seen["shape"] = shape
+        if newer_than is not None and stamp <= newer_than:
+            return
+        seen["shape"], seen["stamp"] = shape, stamp
         if want is None or (abs(shape[0] - want[0]) <= slack
                             and abs(shape[1] - want[1]) <= slack):
             hit.set()
@@ -260,7 +265,7 @@ def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None
         hit.wait(timeout_s)
     finally:
         node.destroy_subscription(sub)
-    return hit.is_set(), seen["shape"]
+    return hit.is_set(), seen["shape"], seen["stamp"]
 
 
 class SlamToolboxOps:
@@ -366,7 +371,7 @@ class SlamToolboxOps:
 
         topic = os.environ.get("MAPPING_OCCUPANCY_TOPIC", "/map")
         want = _pgm_shape(os.path.join(map_dir, "occupancy.pgm"))
-        _, before = _await_map_shape(node, topic, None, 2.0)
+        _, before, before_stamp = _await_map_shape(node, topic, None, 2.0)
 
         mode = _get_remote_parameter(node, self._ns, "mode", 5.0)
         req = DeserializePoseGraph.Request()
@@ -387,8 +392,10 @@ class SlamToolboxOps:
         if not ok:
             return False, str(resp)
 
-        loaded, shape = _await_map_shape(node, topic, want, min(timeout_s, 30.0),
-                                         differs_from=before)
+        # The saved map may be the size of the live one (a reload, or a session
+        # that has barely moved), so "a newer grid" is the evidence, not size.
+        loaded, shape, _ = _await_map_shape(node, topic, want, min(timeout_s, 30.0),
+                                            newer_than=before_stamp)
         if not loaded:
             return False, (f"deserialize_map accepted {req.filename} but the map "
                            f"{'stayed at ' + str(before) if shape is None else 'came back ' + str(shape)}, "
@@ -412,9 +419,9 @@ class SlamToolboxOps:
             ok, detail = self._toggle_pause(node, timeout_s, "held")
             if not ok:
                 return False, detail
-            _, first = _await_map_shape(node, topic, None, 3.0)
-            changed, second = _await_map_shape(node, topic, None, 4.0,
-                                               differs_from=first)
+            _, first, _ = _await_map_shape(node, topic, None, 3.0)
+            changed, second, _ = _await_map_shape(node, topic, None, 4.0,
+                                                  differs_from=first)
             if not changed:
                 return True, f"engine frozen (grid steady at {first})"
             log.info("[engine] pause toggle %d left the map moving (%s -> %s); "

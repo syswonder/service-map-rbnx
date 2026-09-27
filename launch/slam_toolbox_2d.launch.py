@@ -108,8 +108,18 @@ def _launch_setup(context, *args, **kwargs):
     # entrypoints registered in a setup.py, so they are run the same way
     # rtabmap_2d.launch.py runs tf_to_pose: ExecuteProcess with python3.
     return [
+        # The engine's grid goes through map_cover_robot, which publishes /map.
         Node(package="slam_toolbox", executable="async_slam_toolbox_node",
-             name="slam_toolbox", output="screen", parameters=[slam_params]),
+             name="slam_toolbox", output="screen", parameters=[slam_params],
+             remappings=[("/map", "/slam_toolbox/map"),
+                         ("/map_metadata", "/slam_toolbox/map_metadata")]),
+        ExecuteProcess(
+            cmd=["python3", os.path.join(_PKG_DIR, "scripts", "map_cover_robot.py"),
+                 "--ros-args",
+                 "-p", f"use_sim_time:={sim_time}",
+                 "-p", f"map_frame:={map_frame}",
+                 "-p", f"base_frame:={base_frame}"],
+            name="map_cover_robot", output="screen"),
         ExecuteProcess(
             cmd=["python3", os.path.join(_PKG_DIR, "scripts", "tf_to_pose.py"),
                  "--ros-args",

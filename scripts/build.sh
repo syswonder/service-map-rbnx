@@ -51,17 +51,24 @@ if command -v rbnx >/dev/null 2>&1; then
     FLAGS=(--mcp --ros2)
     [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
     echo "[build] rbnx codegen ${FLAGS[*]}"
-    RBNX_CODEGEN_PYTHON="$PYBIN" \
-        rbnx codegen -p "$PKG" "${FLAGS[@]}"
-
-    CODEGEN_PYTHONPATH="$PKG/$BUILD/codegen/proto_gen:$PKG/$BUILD/codegen/robonix_mcp_types"
-    PYTHONPATH="$CODEGEN_PYTHONPATH:${PYTHONPATH:-}" "$PYBIN" - <<'PY'
+    if [[ "$TARGET" == "jetson-native" ]]; then
+        # Native runs on the host Python, so generate and check with it.
+        RBNX_CODEGEN_PYTHON="$PYBIN" \
+            rbnx codegen -p "$PKG" "${FLAGS[@]}"
+        CODEGEN_PYTHONPATH="$PKG/$BUILD/codegen/proto_gen:$PKG/$BUILD/codegen/robonix_mcp_types"
+        PYTHONPATH="$CODEGEN_PYTHONPATH:${PYTHONPATH:-}" "$PYBIN" - <<'PY'
 import atlas_pb2_grpc
 import map_mcp
 import robonix_contracts_pb2_grpc
 
 print("[build] generated Mapping gRPC and MCP imports OK")
 PY
+    else
+        # Docker images regenerate their runtime stubs at start; here rbnx
+        # picks (and validates) its own pinned Python, so a fresh host needs
+        # no grpcio-tools.
+        rbnx codegen -p "$PKG" "${FLAGS[@]}"
+    fi
 
     if [[ "$TARGET" == "jetson-native" ]]; then
         set +u

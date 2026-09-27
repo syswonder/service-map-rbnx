@@ -13,6 +13,7 @@ SLAM engine.
 
 - Capability surface, config schema, and persistence layout: **[CAPABILITY.md](CAPABILITY.md)**.
 - Provider instance configuration reference: **[config.spec](config.spec)**.
+- Offline global-localization benchmark, dataset setup, and results: **[BENCHMARK.md](BENCHMARK.md)**.
 
 ## SLAM engines (`algo`)
 

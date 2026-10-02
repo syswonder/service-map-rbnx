@@ -649,7 +649,8 @@ def init(cfg: dict):
     # them from its own params, so writing them unconditionally is harmless.
     resolved.setdefault("base_frame", str(cfg.get("base_frame") or "base_link"))
     resolved.setdefault("odom_frame", str(cfg.get("odom_frame") or "odom"))
-    resolved.setdefault("use_sim_time", "true" if cfg.get("use_sim_time") else "false")
+    sim_time = _truthy(cfg.get("use_sim_time", False))
+    resolved.setdefault("use_sim_time", "true" if sim_time else "false")
 
     # Localization engine used by load_map (see localizers.py). Configured once
     # the sensor topics are resolved, because the particle filter subscribes to
@@ -660,7 +661,7 @@ def init(cfg: dict):
         "scan_topic": resolved.get("scan_topic"),
         "base_frame": cfg.get("base_frame") or "base_link",
         "odom_frame": cfg.get("odom_frame") or "odom",
-        "use_sim_time": bool(cfg.get("use_sim_time", False)),
+        "use_sim_time": sim_time,
         "min_particles": particles.get("min"),
         "max_particles": particles.get("max"),
     })
@@ -678,7 +679,7 @@ def init(cfg: dict):
             base_frame=cfg.get("base_frame") or "base_link",
             odom_frame=cfg.get("odom_frame") or "odom",
             map_frame=cfg.get("map_frame") or "map",
-            use_sim_time=bool(cfg.get("use_sim_time", False)))
+            use_sim_time=sim_time)
     if algo == "slam_toolbox":
         # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
         # They reach the launch through the resolved file like every other

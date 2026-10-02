@@ -115,7 +115,9 @@ keys its semantic objects to.
 localizes in its own map, which needs a pose seed close enough for scan matching
 to converge. Setting `amcl` (nav2) or `beluga` (beluga_amcl, interface
 compatible) makes `load_map` serve the saved occupancy grid through
-`map_server` and run a particle filter over it. The difference that matters:
+`map_server` and run a particle filter over it (slam_toolbox only: RTAB-Map
+relocalizes against its own database and ignores `localizer`). The difference
+that matters:
 **`load_map` without an initial pose then triggers global localization** — the
 filter scatters particles over the whole free space and converges as the robot
 drives, instead of requiring an operator to supply a pose first. Cost is CPU

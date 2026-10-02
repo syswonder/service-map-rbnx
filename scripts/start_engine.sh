@@ -68,7 +68,8 @@ case "$ALGO" in
         #   rgb_topic        ← robonix/primitive/camera/rgb
         #   depth_topic      ← robonix/primitive/camera/depth
         # Webots tiago = lidar2d + rgb + depth + odom.
-        # Real robot   = lidar3d + rgb + depth + odom (+ imu, unused by rtabmap).
+        # Real robot   = lidar3d + rgb + depth + odom (+ imu, which rtabmap uses
+        #                for ICP odometry when no odom provider is bound).
         # Anything not present in resolved.yaml passes through as the
         # `<none>` sentinel and the launch file disables that subscription.
         SCAN_TOPIC=$(read_y scan_topic)

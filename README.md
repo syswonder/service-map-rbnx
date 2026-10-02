@@ -50,7 +50,9 @@ a slow indoor platform in a room-scale map; an unknown key fails at init.
 Building a map and localizing in a saved one are separate jobs, and the second
 one is where "click 2D Pose Estimate, then click again" comes from: a scan
 matcher can only refine a guess it is already given. A particle filter over the
-saved occupancy grid can start from no guess at all.
+saved occupancy grid can start from no guess at all. This applies to
+slam_toolbox; RTAB-Map relocalizes against its own database and ignores
+`localizer`.
 
 The localizer never publishes `map → odom` (`tf_broadcast: false`): one node
 owns that frame at every instant, which is the SLAM engine. `load_map` uses the
@@ -71,7 +73,7 @@ calls (`hold`, `activate(pose)`, `resume`).
 service:
   - name: mapping
     config:
-      algo: rtabmap          # unchanged: mapping still runs on the SLAM engine
+      algo: slam_toolbox     # mapping still runs on the SLAM engine
       localizer: amcl        # localization on saved maps, global relocalization
       localizer_particles: {min: 500, max: 2000}
 ```

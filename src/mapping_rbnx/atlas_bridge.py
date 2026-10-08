@@ -441,12 +441,17 @@ def _enabled_sensors(cfg: dict) -> dict:
 
 
 # ── Atlas helpers (use Capability's wrapped stub) ────────────────────────────
+# One open channel per sensor contract. The SLAM nodes subscribe to these
+# topics for as long as the service runs, so the channels stay open too: they
+# are how Atlas knows mapping consumes the sensor, and a sensor fault can then
+# be traced to mapping. Service teardown closes them.
+_sensor_channels: dict[str, object] = {}
+
+
 def _resolve_sensor_endpoint(cap: Service, contract_id: str, provider_id: str = "") -> Optional[str]:
     """ATLAS.find_capability + connect_capability for one ROS2 contract. Returns the topic
-    string atlas resolved, or None when no provider is online yet.
-    The opened Channel is closed immediately — we just want the
-    endpoint string, atlas's bookkeeping for "I'm consuming this"
-    is the side benefit."""
+    string atlas resolved, or None when no provider is online yet. The channel
+    stays open; resolving the same provider again reuses it."""
     recs = ATLAS.find_capability(
         contract_id=contract_id,
         transport="ros2",
@@ -457,14 +462,18 @@ def _resolve_sensor_endpoint(cap: Service, contract_id: str, provider_id: str = 
         if provider_id:
             log.warning("sensor provider %s has no %s on atlas", provider_id, contract_id)
         return None
+    held = _sensor_channels.get(contract_id)
+    if held is not None and held.provider_id == rec.provider_id:
+        return (held.endpoint or "").strip() or None
     try:
         ch = mapping.connect_capability(rec, contract_id=contract_id, transport="ros2")
     except Exception as e:  # noqa: BLE001
         log.warning("connect %s/%s failed: %s", rec.provider_id, contract_id, e)
         return None
-    endpoint = (ch.endpoint or "").strip()
-    ch.close()
-    return endpoint or None
+    if held is not None:
+        held.close()
+    _sensor_channels[contract_id] = ch
+    return (ch.endpoint or "").strip() or None
 
 
 def _sensor_provider(cfg: dict, sensor_key: str) -> str:

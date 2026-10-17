@@ -24,6 +24,7 @@
 # spin_once + sys.exit instead of spin() because spin+shutdown-in-cb hangs
 # rclpy in Humble.
 import argparse
+import json
 import os
 import sys
 import time
@@ -33,6 +34,8 @@ import rclpy
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import OccupancyGrid
+
+from mapping_rbnx import reference_time
 
 # Candidate latched topics, tried in order. The robonix contract topics are
 # what consumers see; the engine-native ones (/map, /rtabmap/cloud_map) are
@@ -126,19 +129,30 @@ def collect(occ_topics, cloud_topics, timeout_s, settle_s):
         node.create_subscription(OccupancyGrid, t, on_grid, latched)
     for t in cloud_topics:
         node.create_subscription(PointCloud2, t, on_cloud, latched)
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        rclpy.spin_once(node, timeout_sec=0.1)
-        if got["cloud"] is not None and got["grid"] is not None:
-            if first_complete_at is None:
-                first_complete_at = time.time()
-            if time.time() - first_complete_at >= settle_s:
-                break
-    node.destroy_node()
+    progress_fd = os.environ.get("MAPPING_SNAPSHOT_PROGRESS_FD")
     try:
-        rclpy.shutdown()
-    except Exception:  # noqa: BLE001
-        pass
+        config = json.loads(os.environ.get("MAPPING_REFERENCE_CONFIG", "{}"))
+        ready_by = time.monotonic() + 5.0
+        while not reference_time.configure(config, f"map_snapshotter_{os.getpid()}"):
+            if time.monotonic() >= ready_by:
+                raise TimeoutError("snapshot reference unavailable")
+            time.sleep(0.05)
+        deadline = reference_time.Deadline(timeout_s)
+        while not deadline.expired():
+            if progress_fd is not None:
+                os.write(int(progress_fd), b"c")
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if got["cloud"] is not None and got["grid"] is not None:
+                if first_complete_at is None:
+                    first_complete_at = reference_time.Deadline(settle_s)
+                if first_complete_at.expired():
+                    break
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        finally:
+            reference_time.close()
     return got
 
 

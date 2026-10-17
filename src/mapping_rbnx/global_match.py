@@ -16,6 +16,9 @@ the only case where the robot has to move at all.
 from __future__ import annotations
 
 import math
+import time
+
+from mapping_rbnx import reference_time
 from typing import Optional
 
 # Coarse pass: every 0.2 m and 10 degrees. Fine pass: 0.1 m and 2 degrees around
@@ -81,7 +84,7 @@ def _scan_beams(msg, limit: int = BEAMS):
     return ranges, angles
 
 
-def distance_field(occ, resolution: float):
+def distance_field(occ, resolution: float, deadline=None):
     """Metres from each cell to the nearest occupied cell (chamfer, two passes).
 
     A binary "did the beam land within N cells of a wall" test cannot rank
@@ -91,11 +94,14 @@ def distance_field(occ, resolution: float):
     """
     import numpy as np
 
+    if deadline is None:
+        deadline = time.monotonic() + 60.0
     h, w = occ.shape
     big = float(h + w)
     d = np.where(occ, 0.0, big).astype(np.float32)
     diag = float(np.sqrt(2.0))
     for r in range(h):
+        _check(deadline)
         row = d[r]
         if r > 0:
             prev = d[r - 1]
@@ -108,6 +114,7 @@ def distance_field(occ, resolution: float):
                 row[c] = v
         d[r] = row
     for r in range(h - 1, -1, -1):
+        _check(deadline)
         row = d[r]
         if r < h - 1:
             nxt = d[r + 1]
@@ -201,6 +208,13 @@ def _top_distinct_candidates(refined, limit: int):
 
     return kept
 
+
+def _check(deadline):
+    reference_time.reading()
+    if time.monotonic() >= deadline:
+        raise TimeoutError("scan matching exceeded 60 real seconds")
+
+
 def global_scan_match(grid, msg, tolerance_cells: int = 3,
                      sensor_xy: tuple = (0.0, 0.0)) -> Optional[Match]:
     """Best pose for `msg` on `grid`, or None when the scan says nothing.
@@ -216,9 +230,10 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
     if grid is None or msg is None:
         return None
 
+    deadline = time.monotonic() + 60.0
     occ = np.frombuffer(bytes(grid.cells), dtype=np.uint8).reshape(grid.height, grid.width).astype(bool)
     known = np.frombuffer(bytes(grid.known), dtype=np.uint8).reshape(grid.height, grid.width).astype(bool)
-    field = distance_field(occ, grid.resolution)
+    field = distance_field(occ, grid.resolution, deadline)
     k = 2 * tolerance_cells + 1
     near = sliding_window_view(np.pad(occ, tolerance_cells), (k, k)).any(axis=(2, 3))
 
@@ -241,6 +256,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
 
     best = []
     for yaw in yaws:
+        _check(deadline)
         s, _ = _score(grid, field, known, ranges, angles,
                       px.astype(np.float32), py.astype(np.float32),
                       np.full(len(px), yaw, dtype=np.float32), sensor_xy,
@@ -259,6 +275,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
         gx, gy = np.meshgrid(offs + cx, offs + cy)
         gx, gy = gx.ravel(), gy.ravel()
         for dy in dyaws:
+            _check(deadline)
             s, _ = _score(grid, field, known, ranges, angles, gx, gy,
                           np.full(len(gx), cyaw + dy, dtype=np.float32), sensor_xy)
             i = int(np.argmax(s))
@@ -286,6 +303,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
         gx, gy = gx.ravel(), gy.ravel()
 
         for dy in pyaws:
+            _check(deadline)
             sc, _ = _score(grid, field, known, ranges, angles, gx, gy,
                            np.full(len(gx), pyaw0 + dy, dtype=np.float32), sensor_xy)
             i = int(np.argmax(sc))
@@ -320,6 +338,7 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
         rival_where = (" at (%.1f, %.1f, %.0f deg)"
                        % (rx, ry, math.degrees(ryaw)))
 
+    _check(deadline)
     return Match(top.pose, top.score, rival,
                  f"{top.score:.0%} likelihood over {len(ranges)} beams, "
                  f"best rival{rival_where} {rival:.0%}",

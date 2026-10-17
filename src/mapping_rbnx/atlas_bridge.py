@@ -76,6 +76,7 @@ from mapping_rbnx import engines  # noqa: E402
 from mapping_rbnx import lifecycle  # noqa: E402
 from mapping_rbnx import localizers  # noqa: E402
 from mapping_rbnx import map_ops  # noqa: E402
+from mapping_rbnx import reference_time  # noqa: E402
 from mapping_rbnx import webui  # noqa: E402
 from mapping_rbnx.profiles import (  # noqa: E402
     choose_provider_record,
@@ -512,9 +513,10 @@ def _retry_resolve(cap: Service, cfg: dict, deadline_s: float = 30.0,
                    settle_s: float = 8.0) -> dict[str, str]:
     """Wait until at least one sensor lands, then absorb late arrivals
     for `settle_s` so all enabled inputs end up in resolved.yaml."""
-    deadline = time.time() + deadline_s
+    deadline = time.monotonic() + deadline_s
     resolved: dict[str, str] = {}
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
+        reference_time.reading()
         resolved = _resolve_sensors(cap, cfg)
         if resolved:
             break
@@ -522,8 +524,9 @@ def _retry_resolve(cap: Service, cfg: dict, deadline_s: float = 30.0,
     if not resolved:
         log.warning("no sensors discovered within %.1fs — launch will use defaults", deadline_s)
         return {}
-    settle_until = time.time() + settle_s
-    while time.time() < settle_until:
+    settle_until = time.monotonic() + settle_s
+    while time.monotonic() < settle_until:
+        reference_time.reading()
         time.sleep(2.0)
         more = _resolve_sensors(cap, cfg)
         if len(more) > len(resolved):
@@ -588,8 +591,44 @@ def _write_resolved_yaml(algo: str, resolved: dict[str, str]) -> str:
 mapping = Service(id=CAP_ID, namespace=NAMESPACE)
 
 
+_INIT_THREAD = None
+_INIT_RESULT = None
+_INIT_CONFIG = None
+
+
 @mapping.on_init
 def init(cfg: dict):
+    global _INIT_THREAD, _INIT_RESULT, _INIT_CONFIG
+    if _INIT_CONFIG is not None and cfg != _INIT_CONFIG:
+        return Err("mapping config changed during initialization; restart mapping")
+    if _INIT_THREAD is None:
+        reference_config = cfg.get("reference") or {
+            "kind": "ros_time" if _truthy(cfg.get("use_sim_time", False)) else "linux_system"
+        }
+        try:
+            if not reference_time.configure(reference_config, f"{mapping.id}/reference"):
+                return Deferred("waiting for Chronos reference time")
+        except (ValueError, RuntimeError) as exc:
+            return Err(str(exc))
+        _INIT_CONFIG = dict(cfg)
+
+        def run():
+            global _INIT_RESULT
+            try:
+                with reference_time.operation():
+                    _INIT_RESULT = _initialize(cfg)
+            except Exception as exc:
+                log.exception("mapping initialization failed")
+                _INIT_RESULT = Err(str(exc))
+
+        _INIT_THREAD = threading.Thread(target=run, name="mapping-init", daemon=True)
+        _INIT_THREAD.start()
+    if _INIT_THREAD.is_alive():
+        return Deferred("waiting for mapping initialization")
+    return _INIT_RESULT
+
+
+def _initialize(cfg: dict):
     """REGISTERED → INITIALIZED. Receives the config dict from
     rbnx via Driver(CMD_INIT, config_json). The mapping cap NEVER reads
     config from disk / env — this gRPC channel is the only sanctioned
@@ -615,6 +654,9 @@ def init(cfg: dict):
     if algo == "fastlio2":
         log.warning("algo=fastlio2 is BROKEN (drift); use only for repro/debug")
 
+    reference_config = cfg.get("reference") or {
+        "kind": "ros_time" if _truthy(cfg.get("use_sim_time", False)) else "linux_system"
+    }
     log.info("CMD_INIT: algo=%s atlas=%s cap=%s", algo, ATLAS_ENDPOINT, CAP_ID)
 
     # Persist algo for start_engine.sh.
@@ -660,7 +702,7 @@ def init(cfg: dict):
     # them from its own params, so writing them unconditionally is harmless.
     resolved.setdefault("base_frame", str(cfg.get("base_frame") or "base_link"))
     resolved.setdefault("odom_frame", str(cfg.get("odom_frame") or "odom"))
-    sim_time = _truthy(cfg.get("use_sim_time", False))
+    sim_time = _truthy(cfg.get("use_sim_time", reference_config.get("kind") == "ros_time"))
     resolved.setdefault("use_sim_time", "true" if sim_time else "false")
 
     # Localization engine used by load_map (see localizers.py). Configured once
@@ -718,6 +760,7 @@ def init(cfg: dict):
     })
     map_ops.set_active_db(active_db)
 
+    reference_time.reading()
     _write_resolved_yaml(algo, resolved)
 
     # Declare outputs (after resolved.yaml so launch can start in parallel).
@@ -770,6 +813,7 @@ def init(cfg: dict):
              or resolved.get("scan_topic", ""),
         cloud=resolved.get("lidar_topic", ""),
     )
+    reference_time.reading()
     webui.maybe_start()
     # Independent of the page: nothing else notices a pose that has drifted off
     # the map, and a robot acting on one is the failure this guards against.
@@ -802,6 +846,35 @@ def shutdown():
     itself is already persistent (rtabmap writes it live at database_path);
     this only adds the portable artifacts. Never fail shutdown on a save
     error — the db is the source of truth."""
+    errors = []
+    try:
+        reference_time.close()
+    except Exception as error:
+        errors.append(str(error))
+    try:
+        map_ops._LOCALIZATION.cancel()
+    except Exception as error:
+        errors.append(str(error))
+    for worker in (_INIT_THREAD, _STARTUP_LOAD_THREAD):
+        if worker is not None:
+            worker.join(timeout=8.0)
+            if worker.is_alive():
+                errors.append(f"mapping worker {worker.name} did not stop")
+    from . import webui
+    for close in (lifecycle._stop, webui.stop, map_ops._close_runtime):
+        try:
+            close()
+        except Exception as error:
+            errors.append(str(error))
+    ros = sys.modules.get("rclpy")
+    if ros is not None:
+        try:
+            if ros.ok():
+                ros.shutdown()
+        except Exception as error:
+            errors.append(str(error))
+    if errors:
+        return Err("; ".join(errors))
     map_dir = _ACTIVE.get("map_dir")
     live = lifecycle.current()
     map_id, mode = live.get("map_id"), live.get("mode")
@@ -903,7 +976,11 @@ def _list_maps_contract_response(out: dict) -> dict:
 
 class _SaveMapServicer(contracts_grpc.RobonixServiceMapSaveMapServicer):
     def SaveMap(self, request, context):
-        out = map_ops.save_map_impl(request.map_id, request.note)
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.save_map_impl(request.map_id, request.note)
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
         return map_pb2.SaveMap_Response(**_save_map_contract_response(out))
 
 
@@ -918,31 +995,43 @@ class _GetPoseCandidatesServicer(contracts_grpc.RobonixServiceMapGetPoseCandidat
 
 class _LoadMapServicer(contracts_grpc.RobonixServiceMapLoadMapServicer):
     def LoadMap(self, request, context):
-        out = map_ops.load_map_impl(request.map_id, request.mode,
-                                    request.has_initial_pose,
-                                    request.x, request.y, request.theta)
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.load_map_impl(request.map_id, request.mode,
+                                           request.has_initial_pose,
+                                           request.x, request.y, request.theta)
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
         return map_pb2.LoadMap_Response(**_load_map_contract_response(out))
 
 
 class _PoseEstimateServicer(contracts_grpc.RobonixServiceMapPoseEstimateServicer):
     def PoseEstimate(self, request, context):
-        out = map_ops.pose_estimate_impl(request.x, request.y, request.theta,
-                                         request.cov_xy, request.cov_theta)
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.pose_estimate_impl(request.x, request.y, request.theta,
+                                                 request.cov_xy, request.cov_theta)
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
         return map_pb2.PoseEstimate_Response(**out)
 
 
 class _SwitchModeServicer(contracts_grpc.RobonixServiceMapSwitchModeServicer):
     def SwitchMode(self, request, context):
-        out = map_ops.switch_mode_impl(request.mode)
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.switch_mode_impl(request.mode)
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
         return map_pb2.SwitchMode_Response(**out)
 
 
 @mapping.mcp("robonix/service/map/save_map")
-def save_map(req: McpSaveMapReq) -> McpSaveMapResp:
+async def save_map(req: McpSaveMapReq) -> McpSaveMapResp:
     """Snapshot the current SLAM map to disk under a stable map_id so it can be
     reloaded later (load_map) and shared with scene's semantic map. Roam the
     space first to build coverage, then call this to checkpoint it."""
-    out = map_ops.save_map_impl(req.map_id, req.note)
+    out = await reference_time.run(map_ops.save_map_impl, req.map_id, req.note)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
     return McpSaveMapResp(**_save_map_contract_response(out))
@@ -971,7 +1060,7 @@ def get_pose_candidates(req: McpGetPoseCandidatesReq) -> McpGetPoseCandidatesRes
 
 
 @mapping.mcp("robonix/service/map/load_map")
-def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
+async def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
     """Switch SLAM onto a previously-saved map and relocalize against it, so the
     map frame is the saved one. Set has_initial_pose + x/y/theta when you
     roughly know where the robot is, for fast convergence. mode is accepted for
@@ -979,27 +1068,27 @@ def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
     the saved occupancy grid when the database is opened that way. To extend a
     map, load it and then switch_mode('mapping') — and read that capability's
     caveat first."""
-    out = map_ops.load_map_impl(req.map_id, req.mode, req.has_initial_pose,
-                                req.x, req.y, req.theta)
+    out = await reference_time.run(map_ops.load_map_impl, req.map_id, req.mode,
+                                   req.has_initial_pose, req.x, req.y, req.theta)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
     return McpLoadMapResp(**_load_map_contract_response(out))
 
 
 @mapping.mcp("robonix/service/map/pose_estimate")
-def pose_estimate(req: McpPoseReq) -> McpPoseResp:
+async def pose_estimate(req: McpPoseReq) -> McpPoseResp:
     """Tell SLAM roughly where the robot is (map frame x/y/theta) so its
     localization re-converges — global relocalization or kidnapped-robot
     recovery. rtabmap refines the guess to the true pose via scan matching."""
-    out = map_ops.pose_estimate_impl(req.x, req.y, req.theta,
-                                     req.cov_xy, req.cov_theta)
+    out = await reference_time.run(map_ops.pose_estimate_impl, req.x, req.y, req.theta,
+                                   req.cov_xy, req.cov_theta)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
     return McpPoseResp(**out)
 
 
 @mapping.mcp("robonix/service/map/switch_mode")
-def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
+async def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     """Flip SLAM between 'mapping' (build/extend the current map) and
     'localization' (relocalize read-only against it) at runtime — no map load,
     no restart. The config's map_mode is only the startup default.
@@ -1010,7 +1099,7 @@ def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     and the loaded map leaves the published map until a loop closure joins
     them. Nothing is deleted. Prefer restarting with map_mode: mapping when the
     goal is a new map."""
-    out = map_ops.switch_mode_impl(req.mode)
+    out = await reference_time.run(map_ops.switch_mode_impl, req.mode)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
     return McpSwitchResp(**out)
@@ -1025,12 +1114,12 @@ def get_mode(req: McpGetModeReq) -> McpGetModeResp:
 
 
 @mapping.mcp("robonix/service/map/get_pose")
-def get_pose(req: McpGetPoseReq) -> McpGetPoseResp:
+async def get_pose(req: McpGetPoseReq) -> McpGetPoseResp:
     """Read the robot's current pose (x, y, theta=yaw) in the SLAM map frame.
     Read-only — use it to record a named waypoint, report where the robot is,
     or decide an action by location. Complements pose_estimate, which SEEDS a
     pose for relocalization rather than reading the current one."""
-    return McpGetPoseResp(**map_ops.get_pose_impl())
+    return McpGetPoseResp(**(await reference_time.run(map_ops.get_pose_impl)))
 
 
 @mapping.mcp("robonix/service/map/delete_map")
@@ -1045,11 +1134,11 @@ def delete_map(req: McpDeleteReq) -> McpDeleteResp:
 
 
 @mapping.mcp("robonix/service/map/reset_map")
-def reset_map(req: McpResetReq) -> McpResetResp:
+async def reset_map(req: McpResetReq) -> McpResetResp:
     """Clear the LIVE SLAM map and rebuild from the robot's current pose (the
     map-frame origin moves). Does NOT delete saved maps on disk — use this when
     the running map has diverged and you want a clean restart without redeploy."""
-    out = map_ops.reset_map_impl()
+    out = await reference_time.run(map_ops.reset_map_impl)
     if not out["ok"]:
         raise RuntimeError(out["detail"])
     return McpResetResp(**out)
@@ -1062,7 +1151,12 @@ class _GetModeServicer(contracts_grpc.RobonixServiceMapGetModeServicer):
 
 class _GetPoseServicer(contracts_grpc.RobonixServiceMapGetPoseServicer):
     def GetPose(self, request, context):
-        return map_pb2.GetPose_Response(**map_ops.get_pose_impl())
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.get_pose_impl()
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
+        return map_pb2.GetPose_Response(**out)
 
 
 class _DeleteMapServicer(contracts_grpc.RobonixServiceMapDeleteMapServicer):
@@ -1072,7 +1166,12 @@ class _DeleteMapServicer(contracts_grpc.RobonixServiceMapDeleteMapServicer):
 
 class _ResetMapServicer(contracts_grpc.RobonixServiceMapResetMapServicer):
     def ResetMap(self, request, context):
-        return map_pb2.ResetMap_Response(**map_ops.reset_map_impl())
+        try:
+            with reference_time.grpc_operation(context):
+                out = map_ops.reset_map_impl()
+        except (RuntimeError, ValueError) as exc:
+            out = {"ok": False, "detail": str(exc)}
+        return map_pb2.ResetMap_Response(**out)
 
 
 mapping.attach_grpc_servicer("robonix/service/map/save_map", _SaveMapServicer())

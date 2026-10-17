@@ -15,6 +15,31 @@ SLAM engine.
 - Provider instance configuration reference: **[config.spec](config.spec)**.
 - Offline global-localization benchmark, dataset setup, and results: **[BENCHMARK.md](BENCHMARK.md)**.
 
+## Reference time
+
+Managed deployments pass `reference` with the Chronos `kind` and `provider_id`.
+`ros_time` follows the Chronos stream through Atlas without extrapolating
+pauses. Standalone configurations with `use_sim_time: true` select `ros_time`
+from provider `chronos` when `reference` is absent. Rebuild bindings and use
+the current `robonix-api` before enabling this path.
+
+INIT returns `Deferred` while waiting for the first reference reading and
+background initialization. Grid,
+scan and pose waits and localization convergence use reference time. Zero is
+valid. Reference loss, reconnection or a generation change aborts the current
+wait; gRPC cancellation and shutdown stop pending waits. Individual ROS service
+calls, scan-matching computation, disk operations and process shutdown keep
+real deadlines. Preview collection and settling follow reference time; its
+parent checks collection progress and bounds writing in real time. MCP map
+save/load and pose reads run off the event loop and propagate cancellation.
+Localization trust uses reference age and counts each scan delivery once.
+For configured slam_toolbox localization, loading returns after the old engine
+stops and the saved map is selected; the owned background run then searches,
+accepts an operator choice and verifies the pose. Its waits keep the reference
+generation from admission through handover. Reference interruption ends the
+run and clears candidates; shutdown cancels and joins its workers. Wait for the
+localization run to finish before using its pose for navigation.
+
 ## SLAM engines (`algo`)
 
 | algo | use | inputs |
@@ -439,3 +464,7 @@ mapping_rbnx/
   restart instead of a runtime switch.
 
 License: MulanPSL-2.0
+
+Shutdown cancels reference waits, joins operation, localization, convergence and
+ROS workers, cancels lifecycle retries, and closes the map HTTP listener and its
+accepted sockets. HTTP reads also keep a five-real-second inactivity timeout.

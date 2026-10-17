@@ -12,6 +12,8 @@ import copy
 import threading
 import time
 
+from mapping_rbnx import reference_time
+
 
 class Cancelled(Exception):
     pass
@@ -26,10 +28,14 @@ class Run:
     cancelled: threading.Event = field(default_factory=threading.Event)
     signal: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    reference: tuple = field(default_factory=reference_time.reading)
 
     def check(self):
         if self.cancelled.is_set():
             raise Cancelled()
+        current = reference_time.reading()
+        if current[1:] != self.reference[1:] or current[0] < self.reference[0]:
+            raise RuntimeError("Chronos reference changed during localization")
 
 
 class LocalizationFlow:
@@ -37,6 +43,7 @@ class LocalizationFlow:
         self._lock = threading.RLock()
         self._execution = threading.Lock()
         self._run = None
+        self._workers = set()
         self._state = {"run_id": 0, "state": "idle", "phase": "idle",
                        "map_id": "", "generation": 0, "candidates": [],
                        "detail": "", "filter_state": "off", "started_at": 0.0,
@@ -53,12 +60,19 @@ class LocalizationFlow:
                 self._run.cancelled.set()
                 self._run.signal.set()
             self._state.update(state="idle", phase="idle", candidates=[], filter_state="off")
-        with self._execution:
-            pass
+            workers = list(self._workers)
+        deadline = time.monotonic() + 8.0
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
+                raise RuntimeError("localization worker did not stop")
 
     def _update(self, run, phase=None, **values):
         with self._lock:
-            run.check()
+            if phase != "failed":
+                run.check()
+            elif run.cancelled.is_set():
+                raise Cancelled()
             if self._run is not run:
                 raise Cancelled()
             if phase is not None:
@@ -70,6 +84,9 @@ class LocalizationFlow:
 
     def start(self, backend, map_id, generation, seed=None):
         with self._lock:
+            self._workers = {worker for worker in self._workers if worker.is_alive()}
+            if len(self._workers) >= 8:
+                raise RuntimeError("localization workers are busy; retry after cancellation")
             previous = self._run
             if previous:
                 previous.cancelled.set()
@@ -84,6 +101,7 @@ class LocalizationFlow:
                            "filter_state": "off", "started_at": now, "phase_started_at": now}
             run.thread = threading.Thread(target=self._work, args=(run, backend),
                                           name=f"localize-{run.run_id}", daemon=True)
+            self._workers.add(run.thread)
             run.thread.start()
             return run.run_id
 
@@ -94,6 +112,7 @@ class LocalizationFlow:
                 return False, "localization run changed; refresh before choosing a pose"
             if self._state["phase"] not in {"searching", "choosing", "restarting"}:
                 return False, "initial poses are accepted only while searching or choosing"
+            run.check()
             run.seed = tuple(pose)
             run.signal.set()
             # Stop offering alternatives as soon as a selection is accepted.
@@ -112,61 +131,63 @@ class LocalizationFlow:
         # start an engine. No two runs manipulate the ROS processes together.
         with self._execution:
             try:
-                run.check()
-                backend.prepare(run)
-                run.check()
-                pose = self._selected(run)
-                detail = "Using the supplied initial pose"
-                if pose is None:
-                    self._update(run, "searching", detail="Matching the scan against the saved map")
-                    match, detail = backend.match(run)
+                with reference_time.operation(lambda: not run.cancelled.is_set()):
+                    run.check()
+                    backend.prepare(run)
                     run.check()
                     pose = self._selected(run)
-                    if pose is None and match is not None and backend.conclusive(match):
-                        pose, detail = match.pose, f"Clear automatic match: {match.detail}"
+                    detail = "Using the supplied initial pose"
                     if pose is None:
-                        candidates = [dict(rank=i, x=float(c.pose[0]), y=float(c.pose[1]),
-                                           theta=float(c.pose[2]), score=float(c.score))
-                                      for i, c in enumerate(match.candidates[:5], 1)] if match else []
-                        with self._lock:
-                            pose = self._selected(run)
-                            if pose is None:
-                                self._update(run, "choosing", candidates=candidates,
-                                             detail="Choose a pose or move the robot manually to help the particle filter converge",
-                                             filter_state="starting")
-                        if pose is None:
-                            pose, detail = backend.filter(run)
+                        self._update(run, "searching", detail="Matching the scan against the saved map")
+                        match, detail = backend.match(run)
                         run.check()
-                        pose = self._selected(run) or pose
+                        pose = self._selected(run)
+                        if pose is None and match is not None and backend.conclusive(match):
+                            pose, detail = match.pose, f"Clear automatic match: {match.detail}"
                         if pose is None:
-                            self._update(run, filter_state="stopped", detail=detail + "; choose an initial pose or restart localization")
-                            # The user can still choose after filter timeout.
-                            run.signal.wait()
+                            candidates = [dict(rank=i, x=float(c.pose[0]), y=float(c.pose[1]),
+                                               theta=float(c.pose[2]), score=float(c.score))
+                                          for i, c in enumerate(match.candidates[:5], 1)] if match else []
+                            with self._lock:
+                                pose = self._selected(run)
+                                if pose is None:
+                                    self._update(run, "choosing", candidates=candidates,
+                                                 detail="Choose a pose or move the robot manually to help the particle filter converge",
+                                                 filter_state="starting")
+                            if pose is None:
+                                pose, detail = backend.filter(run)
                             run.check()
-                            pose = self._selected(run)
-                    detail = "Using the operator's initial pose" if self._selected(run) else detail
-                run.check()
-                with self._lock:
-                    # Atomically close selection before claiming a pose; a
-                    # simultaneous filter result and user choice has one winner.
-                    pose = self._selected(run) or pose
-                    self._update(run, "verifying", detail="Verifying the initial pose against the live laser", filter_state="off")
-                backend.stop_filter()
-                ok, verified = backend.verify(run, pose)
-                run.check()
-                if not ok:
-                    raise RuntimeError(verified)
-                self._update(run, "starting", detail="Starting the map engine at the verified pose")
-                ok, handover = backend.handover(run, pose)
-                run.check()
-                if not ok:
-                    raise RuntimeError(handover)
-                self._update(run, "ready", detail=f"{detail}; {verified}; {handover}")
+                            pose = self._selected(run) or pose
+                            if pose is None:
+                                self._update(run, filter_state="stopped", detail=detail + "; choose an initial pose or restart localization")
+                                # The user can still choose after filter timeout.
+                                while not run.signal.wait(0.05):
+                                    run.check()
+                                run.check()
+                                pose = self._selected(run)
+                        detail = "Using the operator's initial pose" if self._selected(run) else detail
+                    run.check()
+                    with self._lock:
+                        # Atomically close selection before claiming a pose; a
+                        # simultaneous filter result and user choice has one winner.
+                        pose = self._selected(run) or pose
+                        self._update(run, "verifying", detail="Verifying the initial pose against the live laser", filter_state="off")
+                    backend.stop_filter()
+                    ok, verified = backend.verify(run, pose)
+                    run.check()
+                    if not ok:
+                        raise RuntimeError(verified)
+                    self._update(run, "starting", detail="Starting the map engine at the verified pose")
+                    ok, handover = backend.handover(run, pose)
+                    run.check()
+                    if not ok:
+                        raise RuntimeError(handover)
+                    self._update(run, "ready", detail=f"{detail}; {verified}; {handover}")
             except Cancelled:
                 pass
             except Exception as exc:
                 try:
-                    self._update(run, "failed", detail=str(exc), filter_state="off")
+                    self._update(run, "failed", detail=str(exc), filter_state="off", candidates=[])
                 except Cancelled:
                     pass
             finally:

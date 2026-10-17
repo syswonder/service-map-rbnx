@@ -487,12 +487,12 @@ class TrustEnforcementTests(unittest.TestCase):
         map_ops.relocalize_impl = lambda: (self.calls.append(1), {"ok": True})[1]
         self._after = webui.WITHDRAW_AFTER_S
         webui.WITHDRAW_AFTER_S = 0.0     # the timer itself is not what is under test
-        webui._trust.update(bad_since=0.0, withdrawn=False)
+        webui._trust.update(bad_since=None, withdrawn=False)
 
     def tearDown(self):
         self.map_ops.relocalize_impl = self._relocalize
         self.webui.WITHDRAW_AFTER_S = self._after
-        self.webui._trust.update(bad_since=0.0, withdrawn=False)
+        self.webui._trust.update(bad_since=None, withdrawn=False)
 
     def test_one_bad_reading_does_not_stand_the_robot_down(self):
         # Somebody walking past the laser is not a lost robot.

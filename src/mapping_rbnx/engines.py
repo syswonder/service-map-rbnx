@@ -23,10 +23,11 @@ import subprocess
 import time
 from typing import Callable, Optional, Protocol
 
+from mapping_rbnx import reference_time
+
 log = logging.getLogger("mapping.engines")
 
-# `localizers` imports nothing from here and `map_ops` imports both; rather than
-# add a cycle, the two calls an engine needs are handed in at import time.
+# map_ops binds the configured localizer after both modules are initialized.
 localizers_enabled: Callable[[], bool] = lambda: False
 start_localizer: Callable[..., tuple[bool, str]] = (
     lambda map_dir, map_id, owns_tf=False, initial_pose=None: (False, "no localizer bound"))
@@ -172,19 +173,32 @@ def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
 def _call_service(node, srv_type, name: str, request, timeout_s: float):
     """Call a ROS service, returning (ok, response_or_detail). Kept local so
     this module does not import map_ops (which imports this one)."""
+    client = None
+    future = None
     try:
         client = node.create_client(srv_type, name)
-        if not client.wait_for_service(timeout_sec=min(timeout_s, 10.0)):
-            return False, f"service {name} unavailable"
+        deadline = time.monotonic() + min(timeout_s, 10.0)
+        while not client.wait_for_service(timeout_sec=0.1):
+            reference_time.reading()
+            if time.monotonic() >= deadline:
+                return False, f"service {name} unavailable"
+        reference_time.reading()
         future = client.call_async(request)
         deadline = time.monotonic() + timeout_s
         while not future.done() and time.monotonic() < deadline:
+            reference_time.reading()
             time.sleep(0.05)
+        reference_time.reading()
         if not future.done():
             return False, f"service {name} timed out after {timeout_s:.0f}s"
         return True, future.result()
     except Exception as e:  # noqa: BLE001
         return False, f"service {name} raised {e}"
+    finally:
+        if future is not None and not future.done():
+            future.cancel()
+        if client is not None:
+            node.destroy_client(client)
 
 
 def _get_remote_parameter(node, node_name: str, name: str, timeout_s: float):
@@ -223,15 +237,8 @@ def _pgm_shape(path: str):
 
 
 def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None,
-                     newer_than=None):
-    """Wait for a published OccupancyGrid whose (width, height) is `want`.
-
-    Returns (ok, observed_shape_or_None, stamp_ns_or_None). `deserialize_map`
-    answers with an empty message, so the map the engine publishes afterwards
-    is the only evidence that the request was accepted rather than silently
-    refused; `differs_from` (a shape) or `newer_than` (a stamp) lets the caller
-    ignore the grid that was already latched.
-    """
+                     request=None):
+    """Observe map delivery, subscribing before a request can publish its result."""
     import threading
 
     from nav_msgs.msg import OccupancyGrid
@@ -240,29 +247,45 @@ def _await_map_shape(node, topic: str, want, timeout_s: float, differs_from=None
 
     seen = {"shape": None, "stamp": None}
     hit = threading.Event()
-    # Re-rasterizing a graph can land a cell or two either way, so the match is
-    # a tolerance rather than equality; it still separates the saved map from
-    # the session that was live before it.
-    slack = 4
+    received = threading.Event()
+    baseline = reference_time.reading()
 
     def on_map(msg):
+        try:
+            current = reference_time.reading()
+        except RuntimeError:
+            return
+        if current[1:] != baseline[1:] or current[0] < baseline[0]:
+            return
         shape = (int(msg.info.width), int(msg.info.height))
-        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         if differs_from is not None and shape == differs_from:
+            received.set()
             return
-        if newer_than is not None and stamp <= newer_than:
-            return
-        seen["shape"], seen["stamp"] = shape, stamp
-        if want is None or (abs(shape[0] - want[0]) <= slack
-                            and abs(shape[1] - want[1]) <= slack):
+        seen["shape"] = shape
+        seen["stamp"] = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        # Rasterization can move the map boundary by a few cells.
+        if want is None or (abs(shape[0] - want[0]) <= 4
+                            and abs(shape[1] - want[1]) <= 4):
             hit.set()
+        received.set()
 
     qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL,
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     sub = node.create_subscription(OccupancyGrid, topic, on_map, qos)
     try:
-        hit.wait(timeout_s)
+        if request is not None:
+            # Receiving the depth-one replay acknowledges the existing writer
+            # before arming delivery for the request; ROS stamps may be zero.
+            if not reference_time.wait(received, timeout_s):
+                return False, None, None
+            reference_time.reading()
+            hit.clear()
+            seen.update(shape=None, stamp=None)
+            ok, detail = request()
+            if not ok:
+                raise RuntimeError(str(detail))
+        reference_time.wait(hit, timeout_s)
     finally:
         node.destroy_subscription(sub)
     return hit.is_set(), seen["shape"], seen["stamp"]
@@ -339,6 +362,7 @@ class SlamToolboxOps:
             return False, str(resp)
         deadline = time.monotonic() + max(5.0, timeout_s / 4.0)
         while time.monotonic() < deadline:
+            reference_time.reading()
             ready, detail = self.graph_ready(staging_dir)
             if ready:
                 return True, f"serialized pose graph ({detail})"
@@ -371,23 +395,25 @@ class SlamToolboxOps:
 
         topic = os.environ.get("MAPPING_OCCUPANCY_TOPIC", "/map")
         want = _pgm_shape(os.path.join(map_dir, "occupancy.pgm"))
-        _, before, before_stamp = _await_map_shape(node, topic, None, 2.0)
 
         mode = _get_remote_parameter(node, self._ns, "mode", 5.0)
-        if mode == "localization":
+        if mode == "localization" or self._supervised_pid() is None:
             # The localization node refuses every other match type ("non-
             # localization deserialization in localization mode"), and its
             # LOCALIZE_AT_POSE searches near the map it already holds. Another
             # map is a node started on that map.
+            ok, detail = self.stop_engine()
+            if not ok:
+                return False, detail
+            reference_time.reading()
             ok, detail = self._start_localization_node(map_dir, map_id, pose)
             if not ok:
                 return False, detail
-            loaded, shape, _ = _await_map_shape(node, topic, want, min(timeout_s, 60.0),
-                                                newer_than=before_stamp)
+            loaded, shape, _ = _await_map_shape(node, topic, want, min(timeout_s, 60.0))
             if not loaded:
                 return False, (f"the localization node started on {map_id} published "
                                f"{shape}, not the saved {want}")
-            return True, detail
+            return True, f"localization node published {shape} for {map_id}"
         req = DeserializePoseGraph.Request()
         req.filename = os.path.join(map_dir, SLAM_TOOLBOX_STEM)
         if pose is None:
@@ -399,18 +425,13 @@ class SlamToolboxOps:
         if pose is not None:
             req.initial_pose.x, req.initial_pose.y, req.initial_pose.theta = (
                 float(pose[0]), float(pose[1]), float(pose[2]))
-        ok, resp = _call_service(node, DeserializePoseGraph, self._srv("deserialize_map"), req, timeout_s)
-        if not ok:
-            return False, str(resp)
-
-        # The saved map may be the size of the live one (a reload, or a session
-        # that has barely moved), so "a newer grid" is the evidence, not size.
-        loaded, shape, _ = _await_map_shape(node, topic, want, min(timeout_s, 30.0),
-                                            newer_than=before_stamp)
+        loaded, shape, _ = _await_map_shape(
+            node, topic, want, min(timeout_s, 30.0),
+            request=lambda: _call_service(
+                node, DeserializePoseGraph, self._srv("deserialize_map"), req, timeout_s))
         if not loaded:
-            return False, (f"deserialize_map accepted {req.filename} but the map "
-                           f"{'stayed at ' + str(before) if shape is None else 'came back ' + str(shape)}, "
-                           f"not the saved {want} -- slam_toolbox refused the request "
+            return False, (f"deserialize_map returned for {req.filename}, but no matching "
+                           f"map was delivered: observed={shape}, saved={want} "
                            f"(mode={mode or 'unknown'}, match_type={req.match_type})")
         return True, f"loaded {req.filename} at its {placed}, {shape[0]}x{shape[1]} cells"
 

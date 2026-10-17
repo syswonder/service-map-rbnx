@@ -25,13 +25,14 @@ import json
 import logging
 import math
 import os
+import socket
 import threading
 import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import lifecycle, localizers, map_ops
+from . import lifecycle, localizers, map_ops, reference_time
 
 log = logging.getLogger("mapping_rbnx.webui")
 
@@ -46,8 +47,46 @@ POSE_TOPIC = os.environ.get("MAPPING_POSE_TOPIC", "/robonix/map/pose")
 # frame, so the page can draw them straight onto the occupancy canvas and an
 # operator can see whether the live returns line up with the saved map.
 _latest = {"grid": None, "pose": None, "scan": None, "cloud": None,
-           "localizer_pose": None, "localizer_pose_at": 0.0,
-           "scan_at": 0.0, "pose_at": 0.0}
+           "localizer_pose": None, "localizer_pose_at": None,
+           "scan_at": None, "pose_at": None}
+_reference = None
+_map_frame = None
+_reference_lock = threading.RLock()
+
+
+def _reference_now():
+    global _reference, _map_frame
+    with _reference_lock:
+        sample = reference_time.reading()
+        state = lifecycle.current()
+        frame = (state.get("map_id"), state.get("generation"))
+        if ((_reference is not None and (sample[1:] != _reference[1:]
+                                        or sample[0] < _reference[0]))
+                or (_map_frame is not None and frame != _map_frame)):
+            for key in _latest:
+                _latest[key] = None
+            _trust.update(grid_for="", grid=None, fit=None, at=None, detail="",
+                          history=[], bad_since=None, withdrawn=False, evidence=None)
+        _reference, _map_frame = sample, frame
+        return sample[0] / 1e9
+
+
+def _receive(name, msg, baseline=None):
+    with _reference_lock:
+        try:
+            now = _reference_now()
+        except RuntimeError:
+            return False
+        if baseline is not None and (_reference[1:] != baseline[1:]
+                                     or _reference[0] < baseline[0]):
+            return False
+        if name in ("scan", "cloud"):
+            msg["t"] = now
+        _latest[name] = msg
+        _latest[name + "_at"] = now
+        return True
+
+
 # Topics for the range sensors, resolved through Atlas by the bridge and
 # injected with set_sensor_topics(). Empty means the deployment has no such
 # capability bound, and the page simply has nothing to draw.
@@ -89,6 +128,11 @@ _sub_lock = threading.Lock()
 # Keep the dedicated node + executor alive for the process lifetime.
 _webui_node = None
 _webui_exec = None
+_webui_thread = None
+_stop_evt = threading.Event()
+_convergence_worker = None
+_convergence_cancel = threading.Event()
+_convergence_lock = threading.Lock()
 
 # ── activity log ──────────────────────────────────────────────────────────────
 # A small in-memory ring of timestamped action records so the operator can see,
@@ -132,18 +176,37 @@ def _track_convergence(sx: float, sy: float, stheta: float, settle_s: float = 4.
     """After seeding a pose, wait settle_s for rtabmap to relocalize, then log
     where the robot actually settled and its offset from the clicked estimate
     (distance in metres + heading delta in degrees)."""
-    def _check():
-        time.sleep(settle_s)
-        cur = _live_pose_xytheta()
-        if cur is None:
-            _log_add("pose", "no live pose — cannot measure convergence")
+    def _check(cancel):
+        try:
+            with reference_time.operation():
+                reference_time.wait(cancel, settle_s)
+                if cancel.is_set():
+                    return
+                cur = _live_pose_xytheta()
+                if cur is None:
+                    _log_add("pose", "no live pose — cannot measure convergence")
+                    return
+                cx, cy, cyaw = cur
+                dist = math.hypot(cx - sx, cy - sy)
+                dth = abs((cyaw - stheta + math.pi) % (2 * math.pi) - math.pi)
+                _log_add("pose", f"converged → ({cx:.2f}, {cy:.2f}, {math.degrees(cyaw):.0f}°)  "
+                                 f"Δ from estimate = {dist:.2f} m / {math.degrees(dth):.0f}°")
+        except RuntimeError as exc:
+            _log_add("pose", f"convergence check interrupted: {exc}")
+    global _convergence_worker, _convergence_cancel
+    with _convergence_lock:
+        if _stop_evt.is_set():
             return
-        cx, cy, cyaw = cur
-        dist = math.hypot(cx - sx, cy - sy)
-        dth = abs((cyaw - stheta + math.pi) % (2 * math.pi) - math.pi)
-        _log_add("pose", f"pose after seed → ({cx:.2f}, {cy:.2f}, {math.degrees(cyaw):.0f}°)  "
-                         f"Δ from estimate = {dist:.2f} m / {math.degrees(dth):.0f}°")
-    threading.Thread(target=_check, daemon=True).start()
+        _convergence_cancel.set()
+        if _convergence_worker is not None:
+            _convergence_worker.join(timeout=2)
+            if _convergence_worker.is_alive():
+                raise RuntimeError("mapping convergence worker did not stop")
+        _convergence_cancel = threading.Event()
+        cancel = _convergence_cancel
+        _convergence_worker = threading.Thread(target=lambda: _check(cancel), daemon=True)
+        _convergence_worker.start()
+
 
 
 def _ensure_subscriptions() -> None:
@@ -159,9 +222,9 @@ def _ensure_subscriptions() -> None:
     subscriptions are created BEFORE this node's executor starts spinning, so
     they are always serviced.
     """
-    global _subscribed, _webui_node, _webui_exec
+    global _subscribed, _webui_node, _webui_exec, _webui_thread
     with _sub_lock:
-        if _subscribed:
+        if _subscribed or _stop_evt.is_set():
             return
         try:
             import rclpy
@@ -188,14 +251,12 @@ def _ensure_subscriptions() -> None:
                 _latest["grid"] = msg
 
             def _on_pose(msg):
-                _latest["pose"] = msg
-                _latest["pose_at"] = time.time()
+                _receive("pose", msg)
 
             def _on_localizer_pose(msg):
                 # The particle filter's own estimate, kept for its covariance:
                 # that is what says whether it has converged yet.
-                _latest["localizer_pose"] = msg
-                _latest["localizer_pose_at"] = time.time()
+                _receive("localizer_pose", msg)
 
             node = Node("mapping_webui")
             node.create_subscription(OccupancyGrid, MAP_TOPIC, _on_grid, latched)
@@ -206,8 +267,9 @@ def _ensure_subscriptions() -> None:
             _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
-            threading.Thread(target=ex.spin, daemon=True).start()
             _webui_node, _webui_exec = node, ex
+            _webui_thread = threading.Thread(target=ex.spin, daemon=True)
+            _webui_thread.start()
             _subscribed = True
             log.info("webui subscribed (dedicated node): map=%s pose=%s", MAP_TOPIC, POSE_TOPIC)
         except Exception as e:  # noqa: BLE001
@@ -239,7 +301,7 @@ def _scan_points(msg) -> dict:
         if i % step == 0 and lo <= r <= hi and math.isfinite(r):
             a = ang + i * msg.angle_increment
             pts.append((r * math.cos(a), r * math.sin(a)))
-    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+    return {"frame": msg.header.frame_id, "pts": pts}
 
 
 def _cloud_points(msg) -> dict:
@@ -249,7 +311,7 @@ def _cloud_points(msg) -> dict:
     try:
         from sensor_msgs_py import point_cloud2
     except Exception:  # noqa: BLE001
-        return {"frame": msg.header.frame_id, "pts": [], "t": time.time()}
+        return {"frame": msg.header.frame_id, "pts": []}
     pts = []
     total = max(1, msg.width * msg.height)
     step = max(1, total // (MAX_OVERLAY_POINTS * 4))
@@ -262,7 +324,7 @@ def _cloud_points(msg) -> dict:
             pts.append((x, y))
             if len(pts) >= MAX_OVERLAY_POINTS:
                 break
-    return {"frame": msg.header.frame_id, "pts": pts, "t": time.time()}
+    return {"frame": msg.header.frame_id, "pts": pts}
 
 
 def _frame_to_map(frame: str):
@@ -306,7 +368,7 @@ def _overlay_in_map(kind: str) -> dict:
     if not data or not data.get("pts"):
         return {"pts": [], "frame": "", "stale": True,
                 "why": "no data on %s" % topic}
-    age = time.time() - data.get("t", 0)
+    age = _reference_now() - data.get("t", 0)
     tf = _frame_to_map(data.get("frame", ""))
     if tf is None:
         return {"pts": [], "frame": data.get("frame", ""), "stale": True,
@@ -415,9 +477,25 @@ def _subscribe_range_sensors(node) -> None:
             _tf_buffer = None
 
     def _on_scan(msg) -> None:
-        _latest["scan"] = _scan_points(msg)
-        _latest["scan_msg"] = msg
-        _latest["scan_at"] = time.time()
+        with _reference_lock:
+            try:
+                _reference_now()
+                baseline = _reference
+                points = _scan_points(msg)
+            except RuntimeError:
+                return
+            if _receive("scan", points, baseline):
+                _latest["scan_msg"] = msg
+
+    def _on_cloud(msg):
+        with _reference_lock:
+            try:
+                _reference_now()
+                baseline = _reference
+                points = _cloud_points(msg)
+            except RuntimeError:
+                return
+            _receive("cloud", points, baseline)
 
     scan_topic = _sensor_topics.get("scan") or ""
     cloud_topic = _sensor_topics.get("cloud") or ""
@@ -444,7 +522,7 @@ def _subscribe_range_sensors(node) -> None:
             from sensor_msgs.msg import PointCloud2
             node.create_subscription(
                 PointCloud2, cloud_topic,
-                lambda m: _latest.__setitem__("cloud", _cloud_points(m)),
+                _on_cloud,
                 qos_profile_sensor_data)
             _range_subscribed["cloud"] = True
             log.info("webui overlay: subscribed cloud %s", cloud_topic)
@@ -507,8 +585,8 @@ def _grid_to_png(grid, pose=None) -> bytes:
 # from the map: the fraction of the current laser's beams that land on a wall
 # the saved map already has. The threshold is the same one relocalization is
 # gated on, so the page and the recovery agree about what "right" means.
-_trust: dict = {"grid_for": "", "grid": None, "fit": None, "at": 0.0, "detail": "",
-                "history": [], "bad_since": 0.0, "withdrawn": False}
+_trust: dict = {"grid_for": "", "grid": None, "fit": None, "at": None, "detail": "",
+                "history": [], "bad_since": None, "withdrawn": False, "evidence": None}
 # Publishing `map -> odom` is a claim to know where the robot is. When the laser
 # has disagreed with the map for this long, the claim is withdrawn: the engine
 # stands down and a relocalization starts. Everything downstream then loses the
@@ -531,8 +609,9 @@ def _localizer_is_live(max_age_s: float = 5.0) -> bool:
     """Is the particle filter currently the thing tracking the robot?"""
     if not localizers.enabled():
         return False
-    at = float(_latest.get("localizer_pose_at") or 0.0)
-    return at > 0.0 and (time.time() - at) <= max_age_s
+    now = _reference_now()
+    at = _latest.get("localizer_pose_at")
+    return at is not None and now - at <= max_age_s
 
 
 # How long either input may go missing before the check refuses to speak for it.
@@ -543,16 +622,17 @@ STALE_AFTER_S = float(os.environ.get("MAPPING_TRUST_STALE_AFTER_S", "5"))
 
 def _stale_inputs(now: float) -> str:
     """Why the check cannot run right now, or "" when both inputs are current."""
-    scan_age = now - float(_latest.get("scan_at") or 0.0)
-    pose_at = max(float(_latest.get("pose_at") or 0.0),
-                  float(_latest.get("localizer_pose_at") or 0.0))
-    pose_age = now - pose_at
-    if not _latest.get("scan_at"):
+    scan_at = _latest.get("scan_at")
+    poses = [at for at in (_latest.get("pose_at"), _latest.get("localizer_pose_at"))
+             if at is not None]
+    if scan_at is None:
         return "no laser has arrived yet"
+    scan_age = now - scan_at
     if scan_age > STALE_AFTER_S:
         return f"no laser for {scan_age:.0f}s"
-    if not pose_at:
+    if not poses:
         return "no pose has arrived yet"
+    pose_age = now - max(poses)
     if pose_age > STALE_AFTER_S:
         return f"no pose for {pose_age:.0f}s"
     return ""
@@ -566,6 +646,7 @@ def _localization_trust() -> dict:
     laser cannot speak — the robot is looking at ground the map never covered —
     which is not the same as a bad fix and must not be shown as one.
     """
+    now = _reference_now()
     # The lifecycle is what knows which map is loaded; get_mode_impl reports the
     # engine's mode and carries no map id, so reading the id from there returned
     # nothing and the check silently never ran.
@@ -578,14 +659,13 @@ def _localization_trust() -> dict:
     map_dir = os.path.join(MAPS_DIR, map_id)
     if _trust["grid_for"] != map_id:
         _trust.update(grid_for=map_id, grid=localizers.load_grid(map_dir),
-                      fit=None, at=0.0, detail="")
+                      fit=None, at=None, detail="", history=[], evidence=None)
     run_id = (map_ops._LOCALIZATION.snapshot()["run_id"]
               if map_ops.active_algo() == "slam_toolbox" else None)
     if _trust.get("run_id") != run_id:
-        _trust.update(run_id=run_id, fit=None, at=0.0, detail="", history=[],
-                      bad_since=0.0, withdrawn=False)
-    now = time.time()
-    if now - float(_trust["at"] or 0.0) >= TRUST_PERIOD_S:
+        _trust.update(run_id=run_id, fit=None, at=None, detail="", history=[],
+                      evidence=None, bad_since=None, withdrawn=False)
+    if _trust["at"] is None or now - _trust["at"] >= TRUST_PERIOD_S:
         # Comparing a stale scan against a stale pose measures nothing: the two
         # were captured together and agree with each other for as long as both
         # sit still in memory. A run that carried the robot for real read
@@ -602,16 +682,17 @@ def _localization_trust() -> dict:
         elif pose is not None and scan is not None and _trust["grid"] is not None:
             fit, detail = localizers.scan_fit_of(_trust["grid"], scan, pose)
             history = _trust["history"]
-            if fit >= 0.0:
+            if fit >= 0.0 and scan is not _trust.get("evidence"):
                 history.append(fit)
                 del history[:-TRUST_WINDOW]
+            _trust["evidence"] = scan
             _trust.update(fit=fit, detail=detail, at=now)
         else:
             _trust.update(fit=None, at=now, history=[],
                           detail="waiting for a pose, a scan and the saved map")
     history = _trust["history"]
     if not history:
-        stale = _stale_inputs(time.time())
+        stale = _stale_inputs(_reference_now())
         if stale:
             _enforce_trust(False, map_id, 0.0)
             out = {"verdict": "stale", "threshold": localizers.SCAN_FIT_MIN,
@@ -650,15 +731,15 @@ def _enforce_trust(good: bool, map_id: str, fit: float) -> None:
     if session["map_id"] == map_id and session["state"] == "running":
         # Initial localization already withdrew the engine. Never restart its
         # search just because it has not produced a verified pose yet.
-        _trust["bad_since"] = 0.0
+        _trust["bad_since"] = None
         return
-    now = time.time()
+    now = _reference_now()
     if good:
-        _trust["bad_since"] = 0.0
+        _trust["bad_since"] = None
         if _trust["withdrawn"]:
             _trust["withdrawn"] = False
         return
-    if not _trust["bad_since"]:
+    if _trust["bad_since"] is None:
         _trust["bad_since"] = now
         return
     if _trust["withdrawn"] or now - _trust["bad_since"] < WITHDRAW_AFTER_S:
@@ -910,7 +991,38 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 
+class _MapHTTPServer(ThreadingHTTPServer):
+    daemon_threads = False
+
+    def __init__(self, *args):
+        self._clients = set()
+        self._clients_lock = threading.Lock()
+        super().__init__(*args)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(5)
+        with self._clients_lock:
+            self._clients.add(connection)
+        return connection, address
+
+    def close_request(self, request):
+        with self._clients_lock:
+            self._clients.discard(request)
+        super().close_request(request)
+
+    def server_close(self):
+        with self._clients_lock:
+            for connection in self._clients:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass  # The peer or its handler may have already closed it.
+        super().server_close()
+
+
 _server = None
+_server_thread = None
 
 
 _supervisor = None
@@ -928,10 +1040,10 @@ def start_supervisor() -> None:
     global _supervisor
     if _supervisor is not None:
         return
+    _stop_evt.clear()
 
     def _loop() -> None:
-        while True:
-            time.sleep(TRUST_PERIOD_S)
+        while not _stop_evt.wait(TRUST_PERIOD_S):
             try:
                 _ensure_subscriptions()
                 _localization_trust()
@@ -945,7 +1057,7 @@ def start_supervisor() -> None:
 
 def maybe_start() -> None:
     """Start the web UI iff MAPPING_WEBUI_PORT is set. Idempotent; non-fatal."""
-    global _server
+    global _server, _server_thread
     port = os.environ.get("MAPPING_WEBUI_PORT", "").strip()
     if not port or _server is not None:
         return
@@ -954,10 +1066,39 @@ def maybe_start() -> None:
     # network may opt into another host explicitly through `webui_host`.
     host = os.environ.get("MAPPING_WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
-        srv = ThreadingHTTPServer((host, int(port)), _Handler)
+        srv = _MapHTTPServer((host, int(port)), _Handler)
     except Exception as e:  # noqa: BLE001
         log.warning("webui: cannot bind %s:%s: %s", host, port, e)
         return
     _server = srv
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _server_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    _server_thread.start()
     log.info("map web UI on http://%s:%s", host, port)
+
+
+def stop():
+    global _server, _server_thread, _supervisor, _subscribed
+    global _webui_node, _webui_exec, _webui_thread, _convergence_worker
+    _stop_evt.set()
+    _convergence_cancel.set()
+    if _server is not None:
+        _server.shutdown()
+        _server.server_close()
+        _server = None
+    for worker in (_server_thread, _supervisor, _convergence_worker):
+        if worker is not None:
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise RuntimeError(f"mapping worker {worker.name} did not stop")
+    _server_thread = _supervisor = _convergence_worker = None
+    with _sub_lock:
+        if _webui_exec is not None:
+            _webui_exec.shutdown(timeout_sec=2)
+        if _webui_thread is not None:
+            _webui_thread.join(timeout=3)
+            if _webui_thread.is_alive():
+                raise RuntimeError("mapping web UI ROS worker did not stop")
+        if _webui_node is not None:
+            _webui_node.destroy_node()
+        _webui_node = _webui_exec = _webui_thread = None
+        _subscribed = False

@@ -169,6 +169,59 @@ class LocalizationFlowTests(unittest.TestCase):
         self.wait(flow, 'ready')
         self.assertEqual(backend.handed, [backend.result.pose])
 
+    def test_reference_zero_keeps_verification_pending_until_new_scan(self):
+        from unittest.mock import patch
+        from mapping_rbnx import reference_time
+        flow, backend = LocalizationFlow(), Backend()
+        gate = threading.Event()
+        entered = threading.Event()
+        def verify(run, pose):
+            entered.set()
+            return reference_time.wait(gate, .01), 'fresh scan'
+        backend.verify = verify
+        with patch.object(reference_time, '_clock', SimpleNamespace(read=lambda: (0, 1, 1))):
+            try:
+                flow.start(backend, 'lab', 1)
+                self.assertTrue(entered.wait(1))
+                time.sleep(.04)
+                self.assertEqual(flow.snapshot()['phase'], 'verifying')
+                self.assertEqual(backend.handed, [])
+                gate.set()
+                self.wait(flow, 'ready')
+            finally:
+                flow.cancel()
+
+    def test_reference_reset_while_choosing_discards_candidates_and_joins(self):
+        from unittest.mock import patch
+        from mapping_rbnx import reference_time
+        flow, backend = LocalizationFlow(), Backend(match(.9,.88))
+        backend.filter = lambda run: (None, 'filter timeout')
+        sample = [(0, 1, 1)]
+        with patch.object(reference_time, '_clock', SimpleNamespace(read=lambda: sample[0])):
+            try:
+                flow.start(backend, 'lab', 1)
+                self.wait(flow, 'choosing')
+                sample[0] = (0, 2, 1)
+                state = self.wait(flow, 'failed')
+                self.assertEqual(state['candidates'], [])
+                self.assertEqual(backend.handed, [])
+                self.assertFalse(flow.submit((1,2,0))[0])
+            finally:
+                flow.cancel()
+            self.assertTrue(all(not worker.is_alive() for worker in flow._workers))
+
+    def test_cancel_joins_manual_selection_wait_during_pause(self):
+        from unittest.mock import patch
+        from mapping_rbnx import reference_time
+        flow, backend = LocalizationFlow(), Backend(match(.9,.88))
+        backend.filter = lambda run: (None, 'filter timeout')
+        with patch.object(reference_time, '_clock', SimpleNamespace(read=lambda: (0, 1, 1))):
+            flow.start(backend, 'lab', 1)
+            self.wait(flow, 'choosing')
+            flow.cancel()
+            self.assertEqual(backend.handed, [])
+            self.assertTrue(all(not worker.is_alive() for worker in flow._workers))
+
 
 class LocalizationPresentationTests(unittest.TestCase):
     def test_completed_flow_ignores_old_particle_covariance(self):

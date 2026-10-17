@@ -30,7 +30,7 @@ import time
 
 import logging
 
-from mapping_rbnx import engines, lifecycle, localizers
+from mapping_rbnx import engines, lifecycle, localizers, reference_time
 from mapping_rbnx.localization_flow import LocalizationFlow
 
 log = logging.getLogger("mapping_rbnx.map_ops")
@@ -66,6 +66,8 @@ def _sqlite_quick_check(db_path: str) -> tuple[bool, str]:
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
         try:
+            deadline = time.monotonic() + 30.0
+            con.set_progress_handler(lambda: time.monotonic() >= deadline, 10000)
             row = con.execute("PRAGMA quick_check").fetchone()
             msg = str(row[0]) if row else "no quick_check result"
             return msg.lower() == "ok", msg
@@ -92,7 +94,14 @@ def _sqlite_backup(src: str, dst: str) -> tuple[bool, str]:
         src_con = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=60.0)
         dst_con = sqlite3.connect(tmp, timeout=60.0)
         try:
-            src_con.backup(dst_con, pages=1024, sleep=0.05)
+            deadline = time.monotonic() + 60.0
+
+            def progress(_status, _remaining, _total):
+                reference_time.reading()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("SQLite backup exceeded 60 real seconds")
+
+            src_con.backup(dst_con, pages=1024, progress=progress, sleep=0.05)
         finally:
             dst_con.close()
             src_con.close()
@@ -125,14 +134,19 @@ def _get_node():
     (e.g. ROS not sourced) — callers degrade to a clear error."""
     global _node
     with _node_lock:
+        if reference_time._stopping.is_set():
+            return None
         if _node is not None:
             return _node
         try:
             import rclpy
             from rclpy.executors import SingleThreadedExecutor
+            from rclpy.parameter import Parameter
             if not rclpy.ok():
                 rclpy.init(args=None)
-            node = rclpy.create_node("mapping_map_ops")
+            node = rclpy.create_node("mapping_map_ops", parameter_overrides=[
+                Parameter("use_sim_time", value=(reference_time._config or {}).get("kind") == "ros_time")
+            ])
             ex = SingleThreadedExecutor()
             ex.add_node(node)
             t = threading.Thread(target=ex.spin, daemon=True)
@@ -147,22 +161,27 @@ def _get_node():
             return None
 
 
+def _close_runtime():
+    global _node
+    with _node_lock:
+        node, _node = _node, None
+        if node is None:
+            return
+        executor = node._robonix_executor
+        executor.shutdown(timeout_sec=2)
+        node._robonix_spin.join(timeout=3)
+        if node._robonix_spin.is_alive():
+            raise RuntimeError("mapping ROS worker did not stop")
+        node.destroy_node()
+
+
 def _yaw_to_quat(theta: float):
     return (0.0, 0.0, math.sin(theta / 2.0), math.cos(theta / 2.0))
 
 
 def _call_service(node, srv_type, name: str, request, timeout_s: float = 5.0):
     """Blocking service call from the spinning node. Returns (ok, result_or_err)."""
-    cli = node.create_client(srv_type, name)
-    if not cli.wait_for_service(timeout_sec=timeout_s):
-        return False, f"service {name} unavailable"
-    fut = cli.call_async(request)
-    deadline = time.time() + timeout_s
-    while not fut.done() and time.time() < deadline:
-        time.sleep(0.02)
-    if not fut.done():
-        return False, f"service {name} timed out"
-    return True, fut.result()
+    return engines._call_service(node, srv_type, name, request, timeout_s)
 
 
 # One owner for startup, operator selection and Relocalize.
@@ -170,6 +189,7 @@ _LOCALIZATION = LocalizationFlow()
 
 
 # ── pose_estimate ─────────────────────────────────────────────────────────────
+@reference_time.operation()
 def pose_estimate_impl(x: float, y: float, theta: float,
                        cov_xy: float = 0.0, cov_theta: float = 0.0,
                        run_id: int | None = None) -> dict:
@@ -225,11 +245,14 @@ def pose_estimate_impl(x: float, y: float, theta: float,
         msg.pose.covariance = cov
         # Latch one publish; a fresh publisher each call keeps this stateless.
         pub = node.create_publisher(PoseWithCovarianceStamped, INITIALPOSE_TOPIC, 1)
-        # DDS needs a beat to match the subscriber before the sample is kept.
-        time.sleep(0.3)
-        pub.publish(msg)
-        time.sleep(0.2)
-        node.destroy_publisher(pub)
+        try:
+            # DDS needs a beat to match the subscriber before the sample is kept.
+            time.sleep(0.3)
+            reference_time.reading()
+            pub.publish(msg)
+            time.sleep(0.2)
+        finally:
+            node.destroy_publisher(pub)
         return {"ok": True, "detail": f"seeded pose ({x:.2f}, {y:.2f}, {theta:.2f}) on {INITIALPOSE_TOPIC}"}
     except Exception as e:  # noqa: BLE001
         log.exception("pose_estimate failed")
@@ -442,10 +465,10 @@ def live_pose(node, timeout_s: float = 5.0):
         return None
     buf = tf2_ros.Buffer()
     listener = tf2_ros.TransformListener(buf, node, spin_thread=False)
-    deadline = time.monotonic() + timeout_s
+    deadline = reference_time.Deadline(timeout_s)
     base = os.environ.get("MAPPING_BASE_FRAME", "base_link")
     frame = os.environ.get("MAPPING_MAP_FRAME", "map")
-    while time.monotonic() < deadline:
+    while not deadline.expired():
         try:
             tf = buf.lookup_transform(frame, base, Time(), Duration(seconds=0.2))
         except Exception:  # noqa: BLE001
@@ -544,7 +567,7 @@ class _LocalizationBackend:
         run.check()
         if not ok:
             return False, ready
-        if run.cancelled.wait(3.0):
+        if reference_time.wait(run.cancelled, 3.0):
             run.check()
         ok, verified = _confirm_engine_pose(self.node, self.grid)
         return ok, f"{detail}; {verified}"
@@ -567,7 +590,7 @@ def _begin_relocalization(node, ops, map_dir: str, map_id: str, seed) -> tuple[b
 
 
 def _begin_target_map_wait(node) -> dict:
-    """Wait for the latched occupancy published after a successful map load."""
+    """Observe fresh delivery while ignoring the previous map's cached replay."""
     from nav_msgs.msg import OccupancyGrid
     from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                            ReliabilityPolicy)
@@ -586,7 +609,7 @@ def _begin_target_map_wait(node) -> dict:
 
     qos = QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
@@ -602,7 +625,20 @@ def _begin_target_map_wait(node) -> dict:
 
 def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool, str]:
     try:
-        matched = barrier["event"].wait(timeout=max(0.0, timeout_s))
+        deadline = reference_time.Deadline(max(0.0, timeout_s))
+        publish_at = time.monotonic() + 5.0
+        while not barrier["event"].is_set() and not deadline.expired():
+            if time.monotonic() >= publish_at:
+                # A volatile reader can miss a one-shot publish during DDS
+                # discovery; requesting the current map again is idempotent.
+                ok, detail = _publish_full_map(
+                    node, timeout_s=float(os.environ.get("MAPPING_PUBLISH_MAP_TIMEOUT_S", "45")))
+                if not ok:
+                    return False, detail
+                publish_at = time.monotonic() + 5.0
+            barrier["event"].wait(0.05)
+        reference_time.reading()
+        matched = barrier["event"].is_set()
     finally:
         node.destroy_subscription(barrier["subscription"])
     if not matched:
@@ -616,6 +652,7 @@ def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool
     )
 
 
+@reference_time.operation()
 def load_map_impl(map_id: str, mode: str = "localization",
                   has_initial_pose: bool = False,
                   x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> dict:
@@ -682,6 +719,12 @@ def load_map_impl(map_id: str, mode: str = "localization",
             #      the recovered pose. It holds only the saved graph, does not
             #      add to it, and owns /map and map -> odom from then on.
             #
+            _LOCALIZATION.cancel()
+            reference_time.reading()
+            ok_s, detail_s = ops.stop_engine()
+            if not ok_s:
+                return {"ok": False, "detail": f"{algo} would not stand down for the load: {detail_s}"}
+            reference_time.reading()
             # The call returns after stage 1, because an operator who loads a
             # map wants to see the map rather than a minute of nothing.
             lifecycle.set_mode("localization")
@@ -691,13 +734,14 @@ def load_map_impl(map_id: str, mode: str = "localization",
             lifecycle.mark_reset("localization")
             seed = (x, y, theta) if has_initial_pose else None
             started, detail_reloc = _begin_relocalization(node, ops, map_dir, map_id, seed)
+            if not started:
+                return {"ok": False, "detail": detail_reloc}
             return {
                 "ok": True,
                 "detail": f"loaded {map_id}; {detail_reloc}",
                 "map_id": map_id,
                 "mode": "localization",
                 "localizer": localizers.name(),
-                "relocalizing": started,
             }
         if algo != "rtabmap":
             # Engine-owned restore: slam_toolbox deserializes its pose graph and
@@ -709,6 +753,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
                 (x, y, theta) if has_initial_pose else None)
             if not ok_e:
                 return {"ok": False, "detail": f"{algo} failed to load {map_id!r}: {detail_e}"}
+            reference_time.reading()
             lifecycle.set_mode(mode)
             lifecycle.set_state(map_id, mode, bump=False)
             return {"ok": True, "detail": detail_e, "map_id": map_id,
@@ -734,6 +779,7 @@ def load_map_impl(map_id: str, mode: str = "localization",
         if not ok:
             return {"ok": False,
                     "detail": f"load_database failed: {load_detail} after {load_timeout_s:.0f}s"}
+        reference_time.reading()
         # The swap succeeded: runtime_db is the live database now. Record it
         # here rather than in the callers, so a save_map issued after a web UI
         # load snapshots this database and not the pre-load one.
@@ -746,8 +792,14 @@ def load_map_impl(map_id: str, mode: str = "localization",
 
         publish_timeout_s = float(os.environ.get("MAPPING_PUBLISH_MAP_TIMEOUT_S", "45"))
         log.info("load_map[%s] stage=publish_map timeout=%.1fs", map_id, publish_timeout_s)
-        pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
+        barrier = _begin_target_map_wait(node)
+        try:
+            pub_ok, pub_detail = _publish_full_map(node, timeout_s=publish_timeout_s)
+        except BaseException:
+            node.destroy_subscription(barrier["subscription"])
+            raise
         if not pub_ok:
+            node.destroy_subscription(barrier["subscription"])
             # The database swap already happened via _load_database above --
             # rtabmap is genuinely serving runtime_db now even though the
             # preview publish failed. Surface it so callers (atlas_bridges
@@ -755,9 +807,6 @@ def load_map_impl(map_id: str, mode: str = "localization",
             # leaving save_map pointed at the stale pre-load database.
             return {"ok": False, "runtime_db_path": runtime_db,
                     "detail": f"loaded {map_id}, but full map publish failed: {pub_detail}"}
-        # /map is transient-local. Subscribing after publish receives the
-        # latest grid and avoids accepting the previous map's latched sample.
-        barrier = _begin_target_map_wait(node)
         verify_timeout_s = float(os.environ.get("MAPPING_VERIFY_MAP_TIMEOUT_S", "30"))
         verified, verify_detail = _finish_target_map_wait(node, barrier, verify_timeout_s)
         if not verified:
@@ -945,21 +994,31 @@ def get_pose_impl(timeout_s: float = 2.0) -> dict:
         from geometry_msgs.msg import PoseWithCovarianceStamped
         from rclpy.qos import (QoSProfile, ReliabilityPolicy,
                                DurabilityPolicy, HistoryPolicy)
-        got = threading.Event()
-        holder: dict = {}
+        from mapping_rbnx import webui
 
-        def _cb(msg):
-            holder["msg"] = msg
-            got.set()
+        with webui._reference_lock:
+            now = webui._reference_now()
+            cached = webui._latest.get("pose")
+            at = webui._latest.get("pose_at")
+            use_cached = cached is not None and at is not None and now - at <= timeout_s
+        if use_cached:
+            holder = {"msg": cached}
+        else:
+            got = threading.Event()
+            holder: dict = {}
 
-        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                         durability=DurabilityPolicy.VOLATILE,
-                         history=HistoryPolicy.KEEP_LAST, depth=1)
-        sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _cb, qos)
-        try:
-            got.wait(timeout=timeout_s)
-        finally:
-            node.destroy_subscription(sub)
+            def _cb(msg):
+                holder["msg"] = msg
+                got.set()
+
+            qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.VOLATILE,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
+            sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _cb, qos)
+            try:
+                reference_time.wait(got, timeout_s)
+            finally:
+                node.destroy_subscription(sub)
         if "msg" not in holder:
             return {"ok": False, "x": 0.0, "y": 0.0, "theta": 0.0, "frame_id": "",
                     "detail": f"no pose on {POSE_TOPIC} within {timeout_s:.1f}s "
@@ -988,6 +1047,7 @@ def _set_mode(node, mode: str) -> tuple[bool, str]:
     return (ok, srv if ok else f"{res} after {mode_timeout_s:.0f}s")
 
 
+@reference_time.operation()
 def relocalize_impl() -> dict:
     """Find the robot again on the map it is already localized on.
 
@@ -1010,6 +1070,7 @@ def relocalize_impl() -> dict:
     if ops is None:
         return {"ok": False, "detail": f"{active_algo()} cannot relocalize"}
     map_dir = os.path.join(MAPS_DIR, map_id)
+    reference_time.reading()
     # The controller cancels the old run and serializes engine teardown before
     # the new search. HTTP never waits for a previous CPU search to finish.
     lifecycle.mark_reset("localization")
@@ -1018,6 +1079,7 @@ def relocalize_impl() -> dict:
             "detail": detail}
 
 
+@reference_time.operation()
 def switch_mode_impl(mode: str) -> dict:
     """Flip the running engine between mapping and localization on the map it
     already has — no map load, no restart. Returns {ok, detail}.
@@ -1047,6 +1109,7 @@ def switch_mode_impl(mode: str) -> dict:
         ok, detail = ops.switch_mode(node, mode, map_dir, map_id, 20.0)
         if not ok:
             return {"ok": False, "detail": detail}
+        reference_time.reading()
         # Mode flip only — the live frame does not move, so no generation bump.
         lifecycle.set_mode(mode)
         return {"ok": True, "detail": f"switched to {mode} mode: {detail}"}
@@ -1056,6 +1119,7 @@ def switch_mode_impl(mode: str) -> dict:
 
 
 # ── reset_map ─────────────────────────────────────────────────────────────────
+@reference_time.operation()
 def reset_map_impl() -> dict:
     """Wipe the running rtabmap's map (working memory + live database) and
     restart SLAM from scratch — for when mapping has diverged and you want a
@@ -1082,6 +1146,7 @@ def reset_map_impl() -> dict:
             ok_e, detail_e = ops.reset(node, 10.0)
             if not ok_e:
                 return {"ok": False, "detail": f"{algo} reset failed: {detail_e}"}
+            reference_time.reading()
             lifecycle.mark_reset()
             lifecycle.set_mode("mapping")
             return {"ok": True, "detail": f"map cleared — rebuilding from current pose "
@@ -1171,6 +1236,7 @@ def _atomic_publish_map_dir(staging_dir: str, map_dir: str) -> None:
     existing directory, so keep the old map beside it until the staged directory
     is in place. If publishing fails, restore the old map when possible.
     """
+    reference_time.reading()
     previous_dir = f"{map_dir}.previous-{os.getpid()}-{int(time.time() * 1000)}"
     if os.path.exists(previous_dir):
         shutil.rmtree(previous_dir, ignore_errors=True)
@@ -1212,20 +1278,54 @@ def _run_preview_snapshot(map_dir: str) -> bool:
         log.warning("save_map.py not found in candidates %s", candidates)
         return False
     try:
-        proc = subprocess.run(
-            ["python3", script, "--out-dir", map_dir, "--timeout", "12"],
-            check=False, timeout=40, text=True, capture_output=True,
-        )
+        import tempfile
+
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        env = dict(os.environ, MAPPING_SNAPSHOT_PROGRESS_FD=str(write_fd))
+        proc = None
+        try:
+            with tempfile.TemporaryFile() as output:
+                proc = subprocess.Popen(
+                    ["python3", script, "--out-dir", map_dir, "--timeout", "12"],
+                    env=env, pass_fds=(write_fd,), stdout=output, stderr=subprocess.STDOUT,
+                )
+                os.close(write_fd)
+                write_fd = None
+                last_progress = time.monotonic()
+                while proc.poll() is None:
+                    reference_time.reading()
+                    if output.tell() > 1024 * 1024:
+                        output.seek(0)
+                        output.truncate()
+                    try:
+                        if os.read(read_fd, 4096):
+                            last_progress = time.monotonic()
+                    except BlockingIOError:
+                        pass
+                    if time.monotonic() - last_progress >= 40.0:
+                        raise TimeoutError("map snapshot made no collection progress for 40 real seconds")
+                    time.sleep(0.05)
+                output.seek(0, os.SEEK_END)
+                output.seek(max(0, output.tell() - 4000))
+                detail = output.read().decode("utf-8", errors="replace")
+        finally:
+            if write_fd is not None:
+                os.close(write_fd)
+            os.close(read_fd)
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5.0)
         occupancy_ok = os.path.isfile(os.path.join(map_dir, "occupancy.png"))
         if proc.returncode != 0 and not occupancy_ok:
             log.warning("save_map.py failed for %s rc=%s stdout=%s stderr=%s",
-                        map_dir, proc.returncode, proc.stdout[-1000:], proc.stderr[-1000:])
+                        map_dir, proc.returncode, detail[-1000:], "")
             return False
         if proc.returncode != 0:
             log.info("save_map.py wrote occupancy preview for %s but optional artifacts were incomplete: %s",
-                     map_dir, proc.stdout[-1000:])
+                     map_dir, detail[-1000:])
         else:
-            log.info("save_map.py wrote preview for %s: %s", map_dir, proc.stdout[-1000:])
+            log.info("save_map.py wrote preview for %s: %s", map_dir, detail[-1000:])
         return occupancy_ok
     except Exception as e:  # noqa: BLE001
         log.warning("save_map.py failed for %s: %s", map_dir, e)
@@ -1283,6 +1383,7 @@ def _save_map_via_engine(map_id: str, map_dir: str, algo: str, note: str = "") -
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
+@reference_time.operation()
 def save_map_impl(map_id: str, note: str = "") -> dict:
     """Snapshot the current SLAM map under {MAPS_DIR}/<map_id>/.
 

@@ -54,6 +54,8 @@ _disabled = False      # set when the msg type is unavailable (permanent)
 # later resends the latest identity. Bounded so a permanently broken RMW
 # doesn't retry forever.
 _retry_pending = False
+_retry_timer = None
+_stopping = threading.Event()
 _retry_attempts = 0
 _RETRY_PERIOD_S = 5.0
 _RETRY_MAX = 24  # ~2 minutes
@@ -158,7 +160,7 @@ def _get_publisher():
     two racing first-publishes must not create two publishers."""
     global _pub, _msg_cls, _disabled
     with _lock:
-        if _disabled:
+        if _disabled or _stopping.is_set():
             return None
         if _pub is not None:
             return _pub
@@ -194,16 +196,7 @@ def _schedule_retry() -> None:
     source of truth, so a later publish resends the latest identity —
     needed when CMD_INIT lands before the ROS graph is ready and no further
     lifecycle transition would otherwise re-trigger the broadcast."""
-    global _retry_pending, _retry_attempts
-    with _lock:
-        if _retry_pending or _disabled or _retry_attempts >= _RETRY_MAX:
-            if _retry_attempts >= _RETRY_MAX:
-                log.error("lifecycle broadcast still failing after %d retries — "
-                          "giving up; consumers fall back to static binding",
-                          _RETRY_MAX)
-            return
-        _retry_pending = True
-        _retry_attempts += 1
+    global _retry_pending, _retry_attempts, _retry_timer
 
     def _fire():
         global _retry_pending
@@ -211,9 +204,29 @@ def _schedule_retry() -> None:
             _retry_pending = False
         _publish()
 
-    t = threading.Timer(_RETRY_PERIOD_S, _fire)
-    t.daemon = True
-    t.start()
+    with _lock:
+        if _stopping.is_set() or _retry_pending or _disabled or _retry_attempts >= _RETRY_MAX:
+            if _retry_attempts >= _RETRY_MAX:
+                log.error("lifecycle broadcast still failing after %d retries", _RETRY_MAX)
+            return
+        _retry_pending = True
+        _retry_attempts += 1
+        _retry_timer = threading.Timer(_RETRY_PERIOD_S, _fire)
+        _retry_timer.daemon = True
+        _retry_timer.start()
+
+
+def _stop():
+    global _retry_pending, _retry_timer
+    with _lock:
+        _stopping.set()
+        timer, _retry_timer = _retry_timer, None
+        _retry_pending = False
+    if timer is not None:
+        timer.cancel()
+        timer.join(timeout=3)
+        if timer.is_alive():
+            raise RuntimeError("mapping lifecycle worker did not stop")
 
 
 def _publish() -> None:

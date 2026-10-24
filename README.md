@@ -139,6 +139,20 @@ only a starting template. Copy it into the robot deployment repository and set
 `params_file`; Mapping never loads the upstream template at runtime. Inline
 `rtabmap_params` applies after the deploy-owned file.
 
+RTAB-Map runs its existing `rtabmap_slam::CoreWrapper` component in ROS 2's
+single-threaded `component_container`. The engine retains the `/rtabmap` node
+name, sensor remappings, persistence parameters, and fail-fast shutdown.
+The launch log records the merged parameters before loading the component.
+The standard `ros2 component load` command loads it, with a 120-second
+wall-clock deadline. A rejected or timed-out load terminates the launch
+instead of leaving an empty container running.
+This avoids the standalone executable's hardware-sized executor and the input
+stalls observed with its multithreaded executor over `rmw_zenoh_cpp`.
+The engine defaults `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and
+`MKL_NUM_THREADS` to one when unset; existing engine environment values win.
+Run `python3 -m unittest test_rtabmap_launch` in a sourced ROS 2 Humble
+environment to check component configuration and database reset semantics.
+
 With external odometry, `deskew_lidar` compensates each PointCloud2 point in
 the odom frame before SLAM. Bind only the sensor roles Mapping should consume.
 

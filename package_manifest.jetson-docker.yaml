@@ -28,14 +28,25 @@ stop: ROBONIX_MAPPING_FORCE=docker bash scripts/stop.sh
 
 capabilities:
   - name: robonix/service/map/occupancy_grid
+    transport: ros2
   - name: robonix/service/map/pointcloud
+    transport: ros2
   - name: robonix/service/map/pose
+    transport: ros2
   - name: robonix/service/map/odom
+    transport: ros2
   - name: robonix/service/map/lifecycle
+    transport: ros2
   - name: robonix/service/map/save_map
+    transport: [mcp, grpc]
   - name: robonix/service/map/list_maps
+    transport: [mcp, grpc]
   - name: robonix/service/map/get_pose_candidates
+    transport: [mcp, grpc]
     path: capabilities/get_pose_candidates.v1.toml
   - name: robonix/service/map/load_map
+    transport: [mcp, grpc]
   - name: robonix/service/map/pose_estimate
+    transport: [mcp, grpc]
   - name: robonix/service/map/switch_mode
+    transport: [mcp, grpc]

@@ -36,6 +36,8 @@ Outputs (declared on atlas by atlas_bridge — see _ALGO_TOPIC_BINDINGS):
 import json
 import os
 
+import yaml
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -44,7 +46,7 @@ from launch.actions import (
     OpaqueFunction,
     RegisterEventHandler,
 )
-from launch.event_handlers import OnProcessExit
+from launch.event_handlers import OnProcessExit, OnProcessStart
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -277,26 +279,40 @@ def _make_nodes(context, *args, **kwargs):
     if database_path:
         rtabmap_params["database_path"] = database_path
 
-    # --delete_db_on_start wipes the db. Ephemeral (no named map) always
-    # wipes — legacy temp-db behaviour. With a named map, wipe ONLY for an
-    # explicit fresh start (mapping + reset_map); a normal mapping run
-    # extends the existing db, and localization must never wipe.
     if not database_path or (map_mode == "mapping" and reset_map):
-        rtabmap_args = ["--delete_db_on_start"]
+        rtabmap_params["delete_db_on_start"] = True
     else:
-        rtabmap_args = []
+        rtabmap_params.setdefault("delete_db_on_start", False)
     print(f"[rtabmap.launch] map_mode={map_mode or 'ephemeral'} "
           f"db={database_path or '(default temp)'} "
-          f"localization={localization} delete_db={bool(rtabmap_args)}")
+          f"localization={localization} delete_db={rtabmap_params['delete_db_on_start']}")
+    print(f"[rtabmap.launch] effective parameters: {json.dumps(rtabmap_params, sort_keys=True)}",
+          flush=True)
 
     rtabmap_node = Node(
-        package="rtabmap_slam",
-        executable="rtabmap",
-        name="rtabmap",
+        package="rclcpp_components",
+        executable="component_container",
+        name="rtabmap_container",
+        namespace="",
         output="screen",
-        parameters=[rtabmap_params],
-        arguments=rtabmap_args,
-        remappings=rtabmap_remappings,
+    )
+    load_command = [
+        "timeout", "--kill-after=5s", "120s",
+        "ros2", "component", "load", "--no-daemon", "--spin-time", "3",
+        "--node-name", "rtabmap", "--node-namespace", "/",
+        "/rtabmap_container", "rtabmap_slam", "rtabmap_slam::CoreWrapper",
+    ]
+    for key, value in rtabmap_params.items():
+        encoded = yaml.safe_dump(value, default_flow_style=True).removesuffix("...\n").rstrip()
+        load_command.extend(["-p", f"{key}:={encoded}"])
+    for source, target in rtabmap_remappings:
+        load_command.extend(["-r", f"{source}:={target}"])
+    load_component = ExecuteProcess(cmd=load_command, output="screen")
+    component_load_start = RegisterEventHandler(
+        OnProcessStart(target_action=rtabmap_node, on_start=[load_component])
+    )
+    component_load_guard = RegisterEventHandler(
+        OnProcessExit(target_action=load_component, on_exit=_on_component_load_exit)
     )
 
     # RTAB-Map is the mapping engine, not an optional sidecar. If it exits,
@@ -357,7 +373,9 @@ def _make_nodes(context, *args, **kwargs):
             ],
         ))
 
-    nodes.extend([rtabmap_node, rtabmap_exit_guard])
+    nodes.extend([
+        component_load_start, component_load_guard, rtabmap_exit_guard, rtabmap_node,
+    ])
 
     # When the deploy didn't supply external odom, run RTAB-Map's own
     # odometry from the strongest available sensor path. Prefer LiDAR ICP
@@ -519,6 +537,12 @@ def _make_nodes(context, *args, **kwargs):
     nodes.append(tf_adapter)
 
     return nodes
+
+
+def _on_component_load_exit(event, context):
+    if event.returncode != 0:
+        return [EmitEvent(event=Shutdown(reason="RTAB-Map component failed to load"))]
+    return []
 
 
 def _derive_camera_info(rgb_topic: str) -> str:

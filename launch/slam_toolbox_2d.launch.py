@@ -104,14 +104,29 @@ def _launch_setup(context, *args, **kwargs):
         travel_distance=travel_distance, travel_heading=travel_heading,
         scan_buffer=scan_buffer, loop_distance=loop_distance)
     sim_time = "true" if use_sim_time else "false"
+    bootstrap = {name: LaunchConfiguration(name).perform(context) for name in (
+        "map_file_name", "start_x", "start_y", "start_yaw",
+        "anchor_odom_x", "anchor_odom_y", "anchor_odom_yaw", "sensor_signature")}
+    gate_args = []
+    for key, value in bootstrap.items():
+        if value != "":
+            gate_args += ["-p", f"{key}:={value}"]
+    slam_params["scan_topic"] = "/slam_toolbox/input_scan"
     # The two adapters are standalone scripts under scripts/, not ros2
     # entrypoints registered in a setup.py, so they are run the same way
     # rtabmap_2d.launch.py runs tf_to_pose: ExecuteProcess with python3.
     return [
+        ExecuteProcess(cmd=["python3", os.path.join(_PKG_DIR, "scripts", "slam_scan_gate.py"),
+                            "--ros-args", "-p", f"use_sim_time:={sim_time}",
+                            "-p", f"scan_topic:={scan_topic}",
+                            "-p", f"map_frame:={map_frame}",
+                            "-p", f"odom_frame:={odom_frame}", "-p", f"base_frame:={base_frame}",
+                            *gate_args], name="slam_scan_gate", output="screen"),
         # The engine's grid goes through map_cover_robot, which publishes /map.
         Node(package="slam_toolbox", executable="async_slam_toolbox_node",
              name="slam_toolbox", output="screen", parameters=[slam_params],
              remappings=[("/map", "/slam_toolbox/map"),
+                         ("/tf", "/slam_toolbox/internal_tf"),
                          ("/map_metadata", "/slam_toolbox/map_metadata")]),
         ExecuteProcess(
             cmd=["python3", os.path.join(_PKG_DIR, "scripts", "map_cover_robot.py"),
@@ -147,6 +162,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("map_frame", default_value="map"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("map_mode", default_value="mapping"),
+        DeclareLaunchArgument("map_file_name", default_value=""),
+        DeclareLaunchArgument("sensor_signature", default_value=""),
+        *[DeclareLaunchArgument(name, default_value="0.0") for name in (
+            "start_x", "start_y", "start_yaw", "anchor_odom_x", "anchor_odom_y", "anchor_odom_yaw")],
         DeclareLaunchArgument("resolution", default_value="0.05"),
         DeclareLaunchArgument("max_laser_range", default_value="12.0"),
         # Sized for a slow indoor platform in a room-scale map; start_engine.sh

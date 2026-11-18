@@ -280,13 +280,17 @@ PYEOF
                     $(cat "$ENGINE_ARGS") $ST_ARGS &
             else
                 echo "[start_engine] slam_toolbox -> mapping node"
+                RESUME_ARGS=()
+                if [ "$REQ" = "mapping" ] && [ -s "$ENGINE_ARGS" ]; then
+                    mapfile -t RESUME_ARGS < "$ENGINE_ARGS"
+                fi
                 setsid ros2 launch "${MAPPING_LAUNCH_DIR:-/mapping/launch}/slam_toolbox_2d.launch.py" \
                     scan_topic:="$SCAN_TOPIC" \
                     base_frame:="${BASE_FRAME:-base_link}" \
                     odom_frame:="${ODOM_FRAME:-odom}" \
-                    map_mode:="${MAP_MODE:-mapping}" \
+                    map_mode:="mapping" \
                     use_sim_time:="${USE_SIM_TIME:-false}" \
-                    $ST_ARGS &
+                    $ST_ARGS "${RESUME_ARGS[@]}" &
             fi
             LAUNCH_PID=$!
             echo "$LAUNCH_PID" > "$ENGINE_PID_FILE"

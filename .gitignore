@@ -39,3 +39,5 @@ Thumbs.db
 
 # Runtime map store (per-map_id: rtabmap.db + occupancy.* + cloud.pcd)
 /maps/
+# Runtime graph checkpoint history (the default sits alongside maps/).
+slam-checkpoints/

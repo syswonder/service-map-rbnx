@@ -58,6 +58,8 @@ RUN apt-get update \
         python3-pip \
         python3-numpy \
         python3-yaml \
+        build-essential cmake libeigen3-dev libboost-serialization-dev \
+        libboost-filesystem-dev libboost-system-dev libboost-thread-dev libtbb-dev \
         ros-humble-rtabmap-ros \
         ros-humble-imu-filter-madgwick \
         ros-humble-tf2-ros \

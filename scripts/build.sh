@@ -110,6 +110,11 @@ case "$TARGET" in
         fi
         echo "[build] docker build -f $DF -t $IMG"
         docker build "${DOCKER_BUILD_FLAGS[@]}" -f "$DF" -t "$IMG" docker/
+        # Graph checkpoints do not need a live map_saver or a paused engine.
+        # Build their cold-load verifier against this image's actual ABI.
+        docker run --rm --entrypoint bash --user "$(id -u):$(id -g)" \
+            -v "$PKG":/mapping "$IMG" -lc \
+            'source /opt/ros/${ROS_DISTRO:-humble}/setup.bash; if ros2 pkg prefix slam_toolbox >/dev/null 2>&1; then bash /mapping/scripts/build_slam_graph_tool.sh; fi'
 
         # colcon-build the ros2_idl overlay (map interface package for the
         # lifecycle broadcast) inside the image we just built, so the

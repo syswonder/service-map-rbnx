@@ -220,7 +220,8 @@ def _allowed_positions(grid, standable, xs, ys):
 
 
 def global_scan_match(grid, msg, tolerance_cells: int = 3,
-                     sensor_xy: tuple = (0.0, 0.0)) -> Optional[Match]:
+                     sensor_xy: tuple = (0.0, 0.0), *,
+                     fine_candidate_budget: Optional[int] = None) -> Optional[Match]:
     """Best pose for `msg` on `grid`, or None when the scan says nothing.
 
     `grid` is `localizers._Grid`; the search runs over its free cells, since a
@@ -244,6 +245,13 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
     if len(ranges) < 20:
         return None
 
+    # Partial maps can have many similar coarse maxima in the old room.
+    # Incremental startup may spend more work to retain a remote hypothesis;
+    # scoring, acceptance, and the ordinary localization default stay intact.
+    budget = FINE_CANDIDATES if fine_candidate_budget is None else fine_candidate_budget
+    if not isinstance(budget, int) or not 1 <= budget <= 512:
+        raise ValueError("fine candidate budget must be an integer in [1,512]")
+
     # Candidate positions: free cells on a coarse lattice, with room for the
     # robot's own footprint so it is not placed against a wall it would be
     # touching.
@@ -263,10 +271,10 @@ def global_scan_match(grid, msg, tolerance_cells: int = 3,
                       px.astype(np.float32), py.astype(np.float32),
                       np.full(len(px), yaw, dtype=np.float32), sensor_xy,
                       sigma_m=COARSE_SIGMA_M)
-        for i in np.argsort(s)[-FINE_CANDIDATES:]:
+        for i in np.argsort(s)[-budget:]:
             best.append((float(s[i]), float(px[i]), float(py[i]), float(yaw)))
     best.sort(reverse=True)
-    best = best[:FINE_CANDIDATES]
+    best = best[:budget]
 
     # Fine pass around each surviving candidate.
     offs = np.arange(-COARSE_STEP_M, COARSE_STEP_M + 1e-6, FINE_STEP_M, dtype=np.float32)

@@ -553,7 +553,7 @@ def _global_match_module():
     return global_match
 
 
-def match_statically(node, grid, timeout_s: float = 8.0):
+def match_statically(node, grid, timeout_s: float = 8.0, *, fine_candidate_budget=None):
     """Return the raw Top-K scan match, including ambiguous or low-score fits.
 
     Both automatic relocalization and the public candidate query use this
@@ -574,13 +574,15 @@ def match_statically(node, grid, timeout_s: float = 8.0):
     if msg is None:
         return None, f"no scan on {topic} within {timeout_s:.0f}s"
     try:
+        search = {} if fine_candidate_budget is None else {"fine_candidate_budget": fine_candidate_budget}
         match = matcher.global_scan_match(
-            grid, msg, sensor_xy=sensor_offset_xy(node, msg.header.frame_id))
+            grid, msg, sensor_xy=sensor_offset_xy(node, msg.header.frame_id), **search)
     except Exception as e:  # noqa: BLE001
         log.exception("[localizer] static scan matching failed")
         return None, f"static matching failed: {e}"
     if match is None:
         return None, "the scan does not cover enough of the map to place the robot"
+    match.scan_stamp = msg.header.stamp
     return match, ""
 
 

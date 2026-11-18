@@ -161,6 +161,15 @@ if [[ -n "${MAPPING_MAPS_DIR:-}" ]]; then
     EXTRA_MOUNTS+=(-v "${MAPPING_MAPS_DIR}:${MAPPING_MAPS_DIR}")
 fi
 
+
+# Explicit external checkpoint storage needs its own persistent mount.
+# Otherwise /mapping/slam-checkpoints lives in the existing package bind mount.
+if [[ -n "${MAPPING_CHECKPOINT_DIR:-}" ]]; then
+    mkdir -p "$MAPPING_CHECKPOINT_DIR"
+    MAPPING_CHECKPOINT_DIR="$(cd "$MAPPING_CHECKPOINT_DIR" && pwd -P)"
+    EXTRA_MOUNTS+=(-v "${MAPPING_CHECKPOINT_DIR}:${MAPPING_CHECKPOINT_DIR}")
+fi
+
 # X11 is an explicit opt-in. In particular, a missing DISPLAY must not cause
 # an unattended/headless deployment to discover a desktop and widen its X
 # server ACL. Any ACL entry we add is revoked by cleanup after docker exits.
@@ -209,6 +218,7 @@ docker run --rm \
     -e MAPPING_GRPC_PORT="${MAPPING_GRPC_PORT:-50120}" \
     -e MAPPING_ENABLE_VIZ="$MAPPING_ENABLE_VIZ" \
     -e MAPPING_WEBUI_HOST="${MAPPING_WEBUI_HOST:-127.0.0.1}" \
+    -e MAPPING_CHECKPOINT_DIR="${MAPPING_CHECKPOINT_DIR:-/mapping/slam-checkpoints}" \
     -e MAPPING_MAPS_DIR="${MAPPING_MAPS_DIR:-/mapping/maps}" \
     -e MAPPING_STATIC_MATCH_MIN="${MAPPING_STATIC_MATCH_MIN:-0.75}" \
     "${DEPLOY_ARGS[@]}" \

@@ -134,8 +134,9 @@ properties:
     enum: [mapping, localization]
     description: >-
       Startup mode; switch_mode and load_map can change it while the service runs.
-      mapping always starts a fresh mutable session (a new runtime database for
-      rtabmap). localization loads the saved map selected by map_id: rtabmap copies
+      mapping starts a fresh mutable session (a new runtime database for
+      rtabmap); slam_toolbox can continue mapping_base_map_id after verified
+      localization. localization loads the saved map selected by map_id: rtabmap copies
       its rtabmap.db into a runtime database and localizes against that copy, so
       the saved artifact is not modified; slam_toolbox starts idle and runs the
       load_map handover in the background. localization requires algo rtabmap or
@@ -277,6 +278,42 @@ properties:
     description: >-
       Frame owned by the chassis navigation odometry; used only when
       navigation_odom_bridge is true, and then must differ from odom_frame.
+
+  mapping_base_map_id:
+    type: string
+    x-group: slam_toolbox
+    default: ""
+    description: >-
+      Optional saved map to continue when map_mode is mapping. slam_toolbox only.
+      Initial localization is verified before mapping starts. Empty starts a new graph.
+
+  checkpoint_area_m2:
+    type: number
+    x-group: slam_toolbox
+    default: 20
+    exclusiveMinimum: 0
+    description: Newly known area in square metres between automatic graph checkpoints.
+
+  checkpoint_min_interval_s:
+    type: number
+    x-group: slam_toolbox
+    default: 15
+    minimum: 1
+    description: Minimum wall-clock seconds between automatic checkpoints.
+
+  checkpoint_max_interval_s:
+    type: number
+    x-group: slam_toolbox
+    default: 60
+    minimum: 1
+    description: Also checkpoint after this interval when revisiting already known space.
+
+  checkpoint_keep:
+    type: integer
+    x-group: slam_toolbox
+    default: 20
+    minimum: 1
+    description: Number of rolling checkpoints kept per mapping session.
 
   slam_toolbox_params:
     type: object

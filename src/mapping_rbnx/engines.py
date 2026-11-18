@@ -16,11 +16,13 @@ RTAB-Map, `<map_id>.posegraph` + `<map_id>.data` for slam_toolbox.
 from __future__ import annotations
 
 import logging
+import base64
 import math
 import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from typing import Callable, Optional, Protocol
 
@@ -121,6 +123,30 @@ def _children_of(pid: int) -> list[int]:
     return out
 
 
+def _running(pid):
+    """Zombie processes have exited even if PID 1 has not reaped them yet."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return f.read().rsplit(b")", 1)[1].split()[0] not in (b"Z", b"X")
+    except (OSError, IndexError):
+        return False
+
+
+def _group_members(pgid):
+    members = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                fields = f.read().rsplit(b")",1)[1].split()
+            if int(fields[2]) == pgid and fields[0] not in (b"Z",b"X"):
+                members.append(int(name))
+        except (OSError,ValueError,IndexError):
+            pass
+    return members
+
+
 def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
     """Stop a launch and the nodes it started, and nothing else.
 
@@ -132,6 +158,7 @@ def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
     if pid <= 1 or pid == os.getpid():
         return False
     targets = [pid] + _children_of(pid)
+    supervised_group = None
     # The engine is started under `setsid`, so it leads its own process group
     # and signalling that group reaches the launch's own children without
     # reaching anything else. Only take that route when the group really is
@@ -140,6 +167,7 @@ def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
     try:
         pgid = os.getpgid(pid)
         if pgid > 1 and pgid != os.getpgid(0):
+            supervised_group = pgid
             targets.append(-pgid)
     except (ProcessLookupError, PermissionError):
         pass
@@ -159,10 +187,13 @@ def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
                 if t < 0:
                     continue        # a group has no liveness of its own
                 try:
-                    os.kill(t, 0)
+                    if not _running(t):
+                        continue
                     alive.append(t)
                 except ProcessLookupError:
                     pass
+            if supervised_group is not None:
+                alive = list(set(alive + _group_members(supervised_group)))
             if not alive:
                 return True
             targets = alive
@@ -173,19 +204,26 @@ def _stop_process(pid: int, timeout_s: float = 12.0) -> bool:
 def _call_service(node, srv_type, name: str, request, timeout_s: float):
     """Call a ROS service, returning (ok, response_or_detail). Kept local so
     this module does not import map_ops (which imports this one)."""
+    client = None
     try:
         client = node.create_client(srv_type, name)
         if not client.wait_for_service(timeout_sec=min(timeout_s, 10.0)):
             return False, f"service {name} unavailable"
         future = client.call_async(request)
-        deadline = time.monotonic() + timeout_s
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not future.done():
+        completed = threading.Event()
+        future.add_done_callback(lambda _: completed.set())
+        if not completed.wait(timeout_s):
+            future.cancel()
             return False, f"service {name} timed out after {timeout_s:.0f}s"
         return True, future.result()
     except Exception as e:  # noqa: BLE001
         return False, f"service {name} raised {e}"
+    finally:
+        if client is not None:
+            try:
+                node.destroy_client(client)
+            except Exception:
+                log.debug("service client was already destroyed during shutdown", exc_info=True)
 
 
 def _saved_bounds(map_dir: str):
@@ -359,14 +397,18 @@ class SlamToolboxOps:
         missing = [f for f in self.graph_files if not os.path.isfile(os.path.join(map_dir, f))]
         if missing:
             return False, f"missing {', '.join(missing)} in {map_dir}"
-        size = sum(os.path.getsize(os.path.join(map_dir, f)) for f in self.graph_files)
-        if size <= 0:
+        sizes = [os.path.getsize(os.path.join(map_dir, f)) for f in self.graph_files]
+        size = sum(sizes)
+        if any(s <= 0 for s in sizes):
             return False, f"empty pose graph in {map_dir}"
         return True, f"pose graph ok ({size} bytes)"
 
     def snapshot(self, node, staging_dir: str, timeout_s: float) -> tuple[bool, str]:
-        """Ask slam_toolbox to serialize into the staging directory and wait for
-        both files to appear (the service returns before the write completes)."""
+        """Serialize a consistent pair under the engine's graph mutex.
+
+        No pause toggle: scans continue around the short serialization lock.
+        In 2.6.10 both writes finish before the service returns.
+        """
         try:
             from slam_toolbox.srv import SerializePoseGraph
         except Exception as e:  # noqa: BLE001
@@ -377,6 +419,8 @@ class SlamToolboxOps:
         ok, resp = _call_service(node, SerializePoseGraph, self._srv("serialize_map"), req, timeout_s)
         if not ok:
             return False, str(resp)
+        if resp.result != resp.RESULT_SUCCESS:
+            return False, f"serialize_map failed with result {resp.result}"
         deadline = time.monotonic() + max(5.0, timeout_s / 4.0)
         while time.monotonic() < deadline:
             ready, detail = self.graph_ready(staging_dir)
@@ -389,16 +433,10 @@ class SlamToolboxOps:
                  pose: Optional[tuple[float, float, float]] = None) -> tuple[bool, str]:
         """Put the saved graph back and stand the robot in it at `pose`.
 
-        A saved map is loaded into a fresh localization node, never into the
-        running mapping node. `deserialize_map` on the asynchronous mapping
-        node merges the saved graph with the session in memory, clears any
-        pause, and folds new scans in from wherever the match type placed the
-        robot (the graph's first node when no pose is given), so the grid it
-        publishes grows past the saved one within a second or two, and whether
-        a reader saw the saved grid or the grown one was a race. The
-        localization node holds only the saved graph, does not add to it, and
-        is the only publisher of `/map` and `map -> odom` while it runs, which
-        is what `load_map` promises.
+        A read-only load uses the localization executable. In 2.6.10,
+        deserialization replaces Mapper and Dataset; an asynchronous mapping
+        executable immediately continues adding scans afterwards. Continued
+        mapping therefore uses the separate verified scan-gate workflow.
         """
         ready, detail = self.graph_ready(map_dir)
         if not ready:
@@ -492,29 +530,17 @@ class SlamToolboxOps:
                     timeout_s: float, pose=None) -> tuple[bool, str]:
         """Swap slam_toolbox between its mapping node and its localization node.
 
-        Which of the two slam_toolbox executables runs is decided when the
-        process starts, so this is a process swap rather than a service call.
-        Everything that made the earlier attempts misbehave follows from that
-        one fact. The asynchronous mapping node folds every scan into whatever
-        graph it holds, so a saved map loaded into it is merged with the session
-        already in memory and then edited further as the robot drives -- which
-        is why a loaded map came back bigger than the one that was saved and
-        kept moving. Pausing it stops the editing but not its `map -> odom`, so
-        a filter publishing a corrected transform fights the frozen one and the
-        robot jumps between the two answers.
-
-        A fresh localization node has neither problem: it holds only the saved
-        graph, it does not add to it, and it is the sole publisher of `/map` and
-        of `map -> odom` for as long as it runs. Going back to mapping restarts
-        the node this deployment booted with, from the command line it booted
-        with.
+        The executable determines the mode. map_ops preserves the current
+        graph before localization and runs verified initialization before
+        continued mapping. A nonempty mapping graph requires an odom anchor
+        and must enter through _start_mapping_node's verified workflow.
         """
         mode = (mode or "").strip().lower()
         if mode not in ("mapping", "localization"):
             return False, f"mode={mode!r} invalid (mapping|localization)"
         if mode == "localization":
             return self._start_localization_node(map_dir, map_id, pose)
-        return self._start_mapping_node()
+        return self._start_mapping_node(map_dir, pose)
 
     ENGINE_REQUEST = "/tmp/mapping_engine_request"
     ENGINE_ARGS = "/tmp/mapping_engine_args"
@@ -627,13 +653,37 @@ class SlamToolboxOps:
                       f"({float(x):.2f}, {float(y):.2f}, {float(yaw):.2f}); "
                       f"the saved map is not modified")
 
-    def _start_mapping_node(self) -> tuple[bool, str]:
-        """Ask the supervisor for the deployment's own mapping node back."""
-        ok, detail = self._request_engine("mapping", [])
+    def _start_mapping_node(self, map_dir="", pose=None, anchor_odom=None) -> tuple[bool, str]:
+        """One mapping executable, initialized from an empty or saved graph."""
+        args = []
+        if map_dir:
+            ready, detail = self.graph_ready(map_dir)
+            if not ready:
+                return False, detail
+            if pose is None or anchor_odom is None:
+                return False, "continuing a graph requires a verified pose and odometry anchor"
+            if not all(math.isfinite(float(v)) for v in (*pose, *anchor_odom)):
+                return False, "mapping pose and odometry must be finite"
+            args = [f"map_file_name:={os.path.join(map_dir, SLAM_TOOLBOX_STEM)}"]
+            import yaml
+            with open(os.path.join(map_dir,"occupancy.yaml"),encoding="utf-8") as f:
+                resolution = float(yaml.safe_load(f)["resolution"])
+            if not math.isfinite(resolution) or resolution <= 0:
+                return False, "invalid saved grid resolution"
+            args.append(f"resolution:={resolution}")
+            sensor_path = os.path.join(map_dir,"sensor.json")
+            if os.path.isfile(sensor_path):
+                with open(sensor_path,"rb") as f:
+                    signature = base64.b64encode(f.read()).decode("ascii")
+                args.append(f"sensor_signature:={signature}")
+            args += [f"{key}:={float(value)}" for key, value in zip(
+                ("start_x", "start_y", "start_yaw", "anchor_odom_x", "anchor_odom_y", "anchor_odom_yaw"),
+                (*pose, *anchor_odom))]
+        ok, detail = self._request_engine("mapping", args)
         if not ok:
             return False, detail
         self._paused = False
-        return True, "slam_toolbox mapping again"
+        return True, "slam_toolbox continuing saved graph" if map_dir else "slam_toolbox building a new graph"
 
     def _request_engine(self, mode: str, args: list[str]) -> tuple[bool, str]:
         """Write the request and stop the current launch so it is picked up.
@@ -683,9 +733,7 @@ class SlamToolboxOps:
             pid = int(open(self.ENGINE_PID, encoding="utf-8").read().strip())
         except (OSError, ValueError):
             return None
-        try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
+        if not _running(pid):
             return None
         return pid
 

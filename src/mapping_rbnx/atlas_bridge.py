@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -136,6 +137,12 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
             f"map_mode={mode!r} invalid — must be one of {list(_VALID_MODES)}"
         )
     reset = _truthy(cfg.get("reset_map", False))
+    base_id = str(cfg.get("mapping_base_map_id") or "").strip()
+    if algo == "slam_toolbox" and mode == "mapping" and base_id:
+        if reset or base_id in {".", ".."} or _sanitize_map_id(base_id) != base_id:
+            raise RuntimeError("mapping_base_map_id requires a valid saved map and reset_map=false")
+        result = _resolve_persistence({**cfg, "mapping_base_map_id": "", "map_mode": "localization", "map_id": base_id})
+        return {**result, "resume_mapping": "true"}
     if mode == "localization":
         if not map_id:
             raise RuntimeError("map_mode=localization requires a saved map_id")
@@ -197,7 +204,7 @@ def _resolve_persistence(cfg: dict) -> dict[str, str]:
 _STARTUP_LOAD_THREAD: Optional[threading.Thread] = None
 
 
-def _begin_startup_localization(map_id: str) -> None:
+def _begin_startup_localization(map_id: str, target_mode="localization") -> None:
     """Restore a validated non-RTABMap artifact after CMD_INIT returns.
 
     RTAB-Map consumes its runtime database directly from launch arguments.
@@ -212,7 +219,7 @@ def _begin_startup_localization(map_id: str) -> None:
 
     def restore() -> None:
         try:
-            out = map_ops.load_map_impl(map_id, "localization")
+            out = map_ops.load_map_impl(map_id, target_mode)
             if out.get("ok"):
                 log.info("startup localization: %s", out.get("detail", "started"))
             else:
@@ -701,6 +708,16 @@ def init(cfg: dict):
             map_frame=cfg.get("map_frame") or "map",
             use_sim_time=sim_time)
     if algo == "slam_toolbox":
+        for key, default in (("checkpoint_area_m2",20.), ("checkpoint_min_interval_s",15.),
+                             ("checkpoint_max_interval_s",60.), ("checkpoint_keep",20)):
+            try:
+                value = float(cfg.get(key, default))
+                if not math.isfinite(value) or value <= 0 or (key == "checkpoint_keep" and not value.is_integer()):
+                    raise ValueError(key)
+            except (TypeError,ValueError):
+                return Err(f"{key} must be a finite positive number")
+            environment = "MAPPING_" + key.upper()
+            os.environ[environment] = str(int(value) if key == "checkpoint_keep" else value)
         # Scan-matching knobs, the slam_toolbox counterpart of rtabmap_params.
         # They reach the launch through the resolved file like every other
         # setting; unset keys keep the launch defaults.
@@ -783,13 +800,18 @@ def init(cfg: dict):
     # Independent of the page: nothing else notices a pose that has drifted off
     # the map, and a robot acting on one is the failure this guards against.
     webui.start_supervisor()
+    if algo == "slam_toolbox" and active_mode == "mapping":
+        map_ops._slam_session().begin(metadata={"generation": lifecycle.current()["generation"]})
     # RTAB-Map opens its resolved runtime DB in start_engine.sh. Engines with
     # typed artifacts require load_map's safe handover instead. The launcher is
     # initialized to `idle` for this mode, so no empty mapping node can claim
     # map -> odom while global localization is in progress.
     if active_mode == "localization" and algo != "rtabmap":
         try:
-            _begin_startup_localization(persist["map_id"])
+            if persist.get("resume_mapping") == "true":
+                _begin_startup_localization(persist["map_id"], "mapping")
+            else:
+                _begin_startup_localization(persist["map_id"])
         except RuntimeError as e:
             return Err(str(e))
     return Ok()
@@ -983,11 +1005,10 @@ def get_pose_candidates(req: McpGetPoseCandidatesReq) -> McpGetPoseCandidatesRes
 def load_map(req: McpLoadMapReq) -> McpLoadMapResp:
     """Switch SLAM onto a previously-saved map and relocalize against it, so the
     map frame is the saved one. Set has_initial_pose + x/y/theta when you
-    roughly know where the robot is, for fast convergence. mode is accepted for
-    compatibility but a load always enters localization: RTAB-Map only restores
-    the saved occupancy grid when the database is opened that way. To extend a
-    map, load it and then switch_mode('mapping') — and read that capability's
-    caveat first."""
+    roughly know where the robot is, for fast convergence. For slam_toolbox,
+    mode='mapping' starts verified initialization followed by continued mapping;
+    query get_mode/candidates for asynchronous progress. RTAB-Map retains its
+    read-only load and separate switch_mode behavior."""
     out = map_ops.load_map_impl(req.map_id, req.mode, req.has_initial_pose,
                                 req.x, req.y, req.theta)
     if not out["ok"]:
@@ -1010,8 +1031,10 @@ def pose_estimate(req: McpPoseReq) -> McpPoseResp:
 @mapping.mcp("robonix/service/map/switch_mode")
 def switch_mode(req: McpSwitchReq) -> McpSwitchResp:
     """Flip SLAM between 'mapping' (build/extend the current map) and
-    'localization' (relocalize read-only against it) at runtime — no map load,
-    no restart. The config's map_mode is only the startup default.
+    'localization' (relocalize read-only against it) at runtime. slam_toolbox
+    snapshots its live graph and swaps executables; returning to mapping
+    verifies localization and restores that graph. The config's map_mode is
+    the startup default.
 
     Caveat on localization -> mapping: entering localization opened a new
     RTAB-Map session, and RTAB-Map only links consecutive nodes sharing a

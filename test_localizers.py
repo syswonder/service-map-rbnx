@@ -279,11 +279,16 @@ class LaunchFileTests(unittest.TestCase):
         self.assertIn("printf '%s\\n' idle > \"$ENGINE_REQUEST\"", src)
 
     def test_non_rtabmap_localization_runs_the_staged_startup_load(self):
-        with open(os.path.join(os.path.dirname(__file__), "src", "mapping_rbnx",
-                               "atlas_bridge.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn('active_mode == "localization" and algo != "rtabmap"', src)
-        self.assertIn('map_ops.load_map_impl(map_id, "localization")', src)
+        from mapping_rbnx import atlas_bridge
+        for target in ("localization", "mapping"):
+            with (mock.patch.object(atlas_bridge, "_STARTUP_LOAD_THREAD", None),
+                  mock.patch.object(atlas_bridge.map_ops, "load_map_impl", return_value={"ok": True}) as load):
+                if target == "localization":
+                    atlas_bridge._begin_startup_localization("saved")
+                else:
+                    atlas_bridge._begin_startup_localization("saved", target)
+                atlas_bridge._STARTUP_LOAD_THREAD.join(2)
+                load.assert_called_once_with("saved", target)
 
 
 

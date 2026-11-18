@@ -1,0 +1,1 @@
+House187 partial-map reentry regression, 2026-11-08. Grid: same 89-node native first-map graph, reconstructed with endpoint padding. Scan: MuJoCo MID360 planar rays at a physically clear covered-room placement. The truth array is test-only; production localization receives no truth. Tests exercise the unchanged scoring rule with a wider candidate budget for incremental startup.

@@ -27,6 +27,8 @@ import glob
 import sqlite3
 import threading
 import time
+import functools
+from pathlib import Path
 
 import logging
 
@@ -167,6 +169,297 @@ def _call_service(node, srv_type, name: str, request, timeout_s: float = 5.0):
 
 # One owner for startup, operator selection and Relocalize.
 _LOCALIZATION = LocalizationFlow()
+
+# Only slam_toolbox enters these locks. Commands serialize cancellation before
+# taking the engine lock, so cancelling a handover cannot deadlock its worker.
+_SLAM_COMMAND = threading.RLock()
+_SLAM_OPERATION = threading.RLock()
+_SLAM_SESSION = None
+_SLAM_SUBSCRIPTION = None
+_SLAM_REENTRY = None
+
+
+def _slam_command(function):
+    @functools.wraps(function)
+    def call(*args, **kwargs):
+        if active_algo() != "slam_toolbox":
+            return function(*args, **kwargs)
+        with _SLAM_COMMAND:
+            return function(*args, **kwargs)
+    return call
+
+
+def _slam_session():
+    global _SLAM_SESSION, _SLAM_SUBSCRIPTION
+    if active_algo() != "slam_toolbox":
+        raise ValueError("mapping checkpoints are supported only by slam_toolbox")
+    with _SLAM_OPERATION:
+        if _SLAM_SESSION is None:
+            from .slam_checkpoints import MappingSession
+            def capture(directory):
+                node, ops = _get_node(), _engine()
+                if node is None or ops is None:
+                    raise RuntimeError("mapping engine unavailable")
+                if lifecycle.current().get("mode") != "mapping":
+                    raise RuntimeError("mapping is not active")
+                metadata = {"frames": {"base": ops._base_frame, "odom": ops._odom_frame, "map": ops._map_frame},
+                            "scan_topic": ops._scan_topic, "use_sim_time": ops._use_sim_time}
+                from .slam_checkpoints import atomic_json
+                metadata["sensor"] = _SLAM_SESSION.guard.sensor_metadata()
+                atomic_json(Path(directory)/"sensor.json",metadata["sensor"])
+                # Store the ACTUAL engine parameters, not just launch defaults.
+                from rcl_interfaces.srv import GetParameters
+                from rclpy.parameter import parameter_value_to_python
+                names = ["resolution", "max_laser_range", "minimum_travel_distance", "minimum_travel_heading",
+                         "scan_buffer_size", "loop_search_maximum_distance", "do_loop_closing",
+                         "loop_match_minimum_response_fine", "loop_match_minimum_response_coarse",
+                         "ceres_loss_function", "mode"]
+                ok, response = engines._call_service(node, GetParameters, ops._srv("get_parameters"),
+                    GetParameters.Request(names=names), 5.)
+                if not ok:
+                    raise RuntimeError(str(response))
+                metadata["engine_parameters"] = dict(zip(names, [parameter_value_to_python(p) for p in response.values]))
+                started = time.monotonic()
+                metadata["serialize_started_at"] = time.time()
+                ok, detail = ops.snapshot(node, str(directory), 60.)
+                if not ok:
+                    raise RuntimeError(detail)
+                metadata["serialize_ms"] = (time.monotonic()-started)*1000
+                metadata["serialize_completed_at"] = time.time()
+                import importlib.metadata
+                metadata["slam_toolbox_version"] = importlib.metadata.version("slam-toolbox")
+                return metadata
+            _SLAM_SESSION = MappingSession(
+                os.environ.get("MAPPING_CHECKPOINT_DIR", str(Path(MAPS_DIR).parent/"slam-checkpoints")),
+                capture, _SLAM_OPERATION,
+                area_m2=float(os.environ.get("MAPPING_CHECKPOINT_AREA_M2", "20")),
+                min_interval_s=float(os.environ.get("MAPPING_CHECKPOINT_MIN_INTERVAL_S", "15")),
+                keep=int(os.environ.get("MAPPING_CHECKPOINT_KEEP", "20")),
+                max_interval_s=float(os.environ.get("MAPPING_CHECKPOINT_MAX_INTERVAL_S", "60")))
+        if _SLAM_SUBSCRIPTION is None and _get_node() is not None:
+            from nav_msgs.msg import OccupancyGrid
+            from rclpy.qos import QoSProfile, DurabilityPolicy
+            _SLAM_SUBSCRIPTION = _get_node().create_subscription(OccupancyGrid, "/slam_toolbox/map",
+                _SLAM_SESSION.observe, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            from .slam_guard import RuntimeGuard
+            _SLAM_SESSION.guard = RuntimeGuard(_get_node(), _SLAM_SESSION, _engine())
+            def withdraw(detail):
+                log.error("mapping withdrawn for review: %s", detail)
+                _engine().stop_engine()
+                lifecycle.set_state("", "localization", bump=True)
+            _SLAM_SESSION.on_suspect = withdraw
+        return _SLAM_SESSION
+
+
+def mapping_status_impl():
+    if active_algo() != "slam_toolbox":
+        return {"supported": False}
+    return {"supported": True, **_slam_session().status()}
+
+
+def checkpoint_impl():
+    if active_algo() != "slam_toolbox":
+        return {"ok": False, "detail": "checkpoints require slam_toolbox"}
+    return _slam_session().request()
+
+
+def list_checkpoints_impl():
+    if active_algo() != "slam_toolbox":
+        return {"ok": False, "detail": "checkpoints require slam_toolbox", "checkpoints": []}
+    return {"ok": True, "checkpoints": _slam_session().store.list()}
+
+
+def localization_map_directory():
+    """A read-only runtime snapshot can differ from its immutable named base."""
+    if active_algo()=="slam_toolbox" and _SLAM_REENTRY:
+        return _SLAM_REENTRY["source"]
+    map_id=lifecycle.current().get("map_id", "")
+    return os.path.join(MAPS_DIR,map_id) if map_id else ""
+
+
+def _saved_grid(map_dir):
+    from types import SimpleNamespace as NS
+    import numpy as np
+    import yaml
+    from PIL import Image
+    directory = Path(map_dir)
+    cfg = yaml.safe_load((directory/"occupancy.yaml").read_text())
+    with Image.open(directory/cfg["image"]) as img:
+        pixels = np.asarray(img.convert("L"))
+    probability = pixels/255. if cfg.get("negate", 0) else (255.-pixels)/255.
+    values = np.flipud(np.where(probability>cfg["occupied_thresh"], 100,
+                               np.where(probability<cfg["free_thresh"], 0, -1))).astype(np.int8)
+    x,y,yaw = cfg["origin"]
+    return NS(header=NS(frame_id=_engine()._map_frame if active_algo()=="slam_toolbox" else os.environ.get("MAPPING_MAP_FRAME", "map")),
+              data=values.ravel(), info=NS(width=values.shape[1], height=values.shape[0],
+              resolution=cfg["resolution"], origin=NS(position=NS(x=x,y=y),
+              orientation=NS(x=0.,y=0.,z=math.sin(yaw/2),w=math.cos(yaw/2)))))
+
+
+@_slam_command
+def start_mapping_impl(base_map_id="", has_initial_pose=False, x=0., y=0., theta=0., *, _source=None, _parent=None):
+    """Fresh and resumed mapping share the same executable and session owner."""
+    global _SLAM_REENTRY
+    if active_algo() != "slam_toolbox":
+        return {"ok": False, "detail": "unified mapping requires slam_toolbox"}
+    try:
+        session = _slam_session()
+        from .slam_checkpoints import graph_tool, inspect_graph
+        if not os.access(graph_tool(), os.X_OK):
+            return {"ok": False, "detail": "build the graph verifier with scripts/build_slam_graph_tool.sh first"}
+        source = str(_source) if _source else ""
+        if base_map_id:
+            if base_map_id in {".", ".."} or _sanitize_map_id(base_map_id) != base_map_id:
+                return {"ok": False, "detail": "invalid base map id"}
+            source = source or os.path.join(MAPS_DIR, base_map_id)
+        if has_initial_pose and not all(math.isfinite(float(v)) for v in (x,y,theta)):
+            return {"ok": False, "detail": "initial pose must be finite"}
+        # Validate BEFORE stopping a usable live mapping/localization session.
+        if source:
+            saved_engine = map_engine(source)
+            if saved_engine and saved_engine != "slam_toolbox":
+                return {"ok": False, "detail": "base map belongs to another engine"}
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="slam-validate-") as tmp:
+                for name in engines.SlamToolboxOps.graph_files:
+                    shutil.copy2(os.path.join(source,name), os.path.join(tmp,name))
+                graph = inspect_graph(tmp)
+                reference = [json.loads(s) for s in Path(tmp,"nodes.jsonl").read_text().splitlines()]
+                graph["node_ids"] = [n["id"] for n in reference]
+                graph["reference_nodes"] = {str(n["id"]): n["pose"] for n in reference}
+            baseline = _saved_grid(source)
+        else:
+            graph, baseline = None, None
+        _LOCALIZATION.cancel()
+        session.suspend()
+        node, ops = _get_node(), _engine()
+        if node is None or ops is None:
+            return {"ok": False, "detail": "ROS engine unavailable"}
+        if source:
+            _SLAM_REENTRY = {"source": source, "mode": "mapping", "graph": graph,
+                             "baseline": baseline, "parent": _parent}
+            lifecycle.set_state(base_map_id, "localization", bump=True)
+            backend = _LocalizationBackend(node, ops, source, base_map_id, target_mode="mapping",
+                graph_info=graph, baseline_grid=baseline, restored_from=_parent)
+            seed = (float(x),float(y),float(theta)) if has_initial_pose else None
+            run_id = _LOCALIZATION.start(backend, base_map_id, lifecycle.current()["generation"], seed)
+            return {"ok": True, "detail": "verifying initial localization before continuing the saved graph",
+                    "run_id": run_id, "mode": "localization", "relocalizing": True}
+        with _SLAM_OPERATION:
+            _SLAM_REENTRY = None
+            ok, detail = ops._start_mapping_node()
+            if not ok:
+                return {"ok": False, "detail": detail}
+            lifecycle.set_state("", "mapping", bump=True)
+            session.begin(metadata={"generation": lifecycle.current()["generation"]})
+        return {"ok": True, "detail": "new mapping session started; area checkpoints enabled"}
+    except Exception as exc:
+        log.exception("start mapping failed")
+        return {"ok": False, "detail": str(exc)}
+
+
+@_slam_command
+def restore_checkpoint_impl(session_id, checkpoint_id):
+    if active_algo() != "slam_toolbox":
+        return {"ok": False, "detail": "checkpoints require slam_toolbox"}
+    try:
+        directory, manifest = _slam_session().store.validate(session_id, checkpoint_id)
+        ops = _engine()
+        frames = manifest["metadata"].get("frames", {})
+        if frames and frames != {"base": ops._base_frame, "odom": ops._odom_frame, "map": ops._map_frame}:
+            raise ValueError("checkpoint frame configuration differs from this deployment")
+        # Copy the checkpoint into a private, immutable load artifact. A new
+        # session can then prune its rolling history without removing this base.
+        import tempfile
+        source = tempfile.mkdtemp(prefix="slam-restore-", dir=RUNTIME_DB_DIR if os.path.isdir(RUNTIME_DB_DIR) else None)
+        shutil.copytree(directory, source, dirs_exist_ok=True)
+        _write_meta_fields(source, {"engine": "slam_toolbox"})
+        return start_mapping_impl("", _source=source, _parent={"session_id": session_id, "checkpoint_id": checkpoint_id})
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+
+def _localize_current_slam_graph():
+    """Preserve ALL current mapping work before changing to read-only mode."""
+    global _SLAM_REENTRY
+    try:
+        import tempfile
+        session = _slam_session()
+        _LOCALIZATION.cancel()
+        pose = live_pose(_get_node())
+        if pose is None:
+            return {"ok": False, "detail": "cannot capture the current mapping pose"}
+        with _SLAM_OPERATION:
+            saved = session.store.create(session.status()["session_id"], session.capture,
+                metadata={**session._metadata,"base_map_id": lifecycle.current().get("map_id", "")},
+                reason="switch_to_localization",before_commit=session.check_health)
+            session.suspend()
+            directory = session.store.path(saved["session_id"], saved["checkpoint_id"])
+            source = tempfile.mkdtemp(prefix="slam-localization-")
+            shutil.copytree(directory, source, dirs_exist_ok=True)
+            _write_meta_fields(source, {"engine": "slam_toolbox"})
+            _SLAM_REENTRY = {"source": source, "mode": "localization", "graph": saved["graph"],
+                             "baseline": _saved_grid(source), "parent": None}
+            # This graph includes NEW observations. It must not retain the
+            # old library map id: navigation's grid relay would otherwise
+            # select that old saved occupancy and hide the newly mapped area.
+            lifecycle.set_state("", "localization", bump=True)
+            started, detail = _begin_relocalization(_get_node(), _engine(), source,
+                lifecycle.current().get("map_id", ""), pose)
+        return {"ok": started, "detail": detail}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+
+def _save_slam_map(map_id, map_dir, note):
+    """Publish the same mutex-consistent graph used by automatic checkpoints."""
+    from .slam_checkpoints import inspect_graph,validate_reference
+    staging = ""
+    try:
+        with _SLAM_COMMAND, _SLAM_OPERATION:
+            if os.path.exists(map_dir):
+                return {"ok": False, "detail": "saved maps are immutable; choose a new map id"}
+            staging = _staging_dir(map_id)
+            if lifecycle.current().get("mode") == "mapping":
+                captured = _slam_session().capture(staging)
+                resolution = captured["engine_parameters"]["resolution"]
+            else:
+                source = (_SLAM_REENTRY["source"] if _SLAM_REENTRY else
+                          os.path.join(MAPS_DIR, lifecycle.current().get("map_id", "")))
+                for name in engines.SlamToolboxOps.graph_files:
+                    shutil.copy2(os.path.join(source, name), os.path.join(staging, name))
+                if os.path.isfile(os.path.join(source,"sensor.json")):
+                    shutil.copy2(os.path.join(source,"sensor.json"),os.path.join(staging,"sensor.json"))
+                import yaml
+                with open(os.path.join(source,"occupancy.yaml")) as stream:
+                    resolution = yaml.safe_load(stream)["resolution"]
+            graph = inspect_graph(staging, resolution)
+            graph.update(validate_reference(staging,_slam_session()._metadata if lifecycle.current().get("mode")=="mapping" else {}))
+            _write_meta_fields(staging, {"map_id": map_id, "engine": "slam_toolbox", "note": note,
+                                        "session_id": _slam_session().status()["session_id"], "nodes": graph["nodes"]})
+            base_id = _slam_session().status().get("base_map_id")
+            if isinstance(base_id, str) and base_id:
+                source_dir = Path(MAPS_DIR)/_sanitize_map_id(base_id)
+                preparation = source_dir/"local-update.json"
+                history = source_dir/"local-update-history.json"
+                if preparation.is_file():
+                    (Path(staging)/"local-update-history.json").write_text(json.dumps({
+                        "preparation": json.loads(preparation.read_text()),
+                        "saved_from": base_id, "saved_at": time.time()}, indent=2))
+                elif history.is_file():
+                    shutil.copy2(history, Path(staging)/history.name)
+            if lifecycle.current().get("mode") == "mapping":
+                _slam_session().check_health()
+            _atomic_publish_map_dir(staging, map_dir)
+            staging = ""
+            _mark_finalized()
+            return {"ok": True, "map_id": map_id, "artifact_path": map_dir,
+                    "detail": f"saved consistent graph ({graph['nodes']} nodes); mapping was not paused"}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 # ── pose_estimate ─────────────────────────────────────────────────────────────
@@ -476,14 +769,21 @@ def _confirm_against_map(node, grid, pose, require_scan: bool = False) -> tuple[
 
 class _LocalizationBackend:
     """ROS operations for LocalizationFlow; no UI/session state lives here."""
-    def __init__(self, node, ops, map_dir, map_id):
+    def __init__(self, node, ops, map_dir, map_id, *, target_mode="localization", graph_info=None,
+                 baseline_grid=None, restored_from=None):
         self.node, self.ops = node, ops
         self.map_dir, self.map_id = map_dir, map_id
         self.grid = None
         self.engine_started = False
+        self.target_mode, self.graph_info = target_mode, graph_info
+        self.baseline_grid, self.restored_from = baseline_grid, restored_from
+        self.odom_anchor = None
+        self.recovered_odom = None
+        self.filter_message = None
 
     def prepare(self, run):
-        ok, detail = self.ops.stop_engine()
+        with _SLAM_OPERATION:
+            ok, detail = self.ops.stop_engine()
         if not ok:
             raise RuntimeError(detail)
         run.check()
@@ -491,14 +791,59 @@ class _LocalizationBackend:
         # Pin occupancy inputs for this initialization run. The original map_dir
         # remains the source of the SLAM graph during handover.
         self.grid_dir = effective_directory(self.map_dir)
+        tracking_source = self.map_dir
+        if self.target_mode == "mapping" and active_algo() == "slam_toolbox":
+            # Old exports may have clipped Karto's outermost endpoint cells.
+            # Rebuild a PRIVATE view of the immutable graph for initialization;
+            # retain explicit grid edits as the user's localization surface.
+            import tempfile
+            from .slam_checkpoints import inspect_graph
+            self.reentry_grid = tempfile.TemporaryDirectory(prefix="slam-reentry-grid-")
+            tracking_source = self.reentry_grid.name
+            for name in engines.SlamToolboxOps.graph_files:
+                shutil.copy2(os.path.join(self.map_dir,name),os.path.join(tracking_source,name))
+            inspect_graph(tracking_source)
+            if self.grid_dir == self.map_dir:
+                self.grid_dir = tracking_source
         self.grid = localizers.load_grid(self.grid_dir)
-        self.tracking_grid = (self.grid if self.grid_dir == self.map_dir
-                              else localizers.load_grid(self.map_dir))
+        self.tracking_grid = (self.grid if self.grid_dir == tracking_source
+                              else localizers.load_grid(tracking_source))
         if self.grid is None or self.tracking_grid is None:
             raise RuntimeError("saved occupancy grid unavailable")
+        if self.target_mode == "mapping":
+            from collections import OrderedDict, deque
+            import tf2_ros
+            from rclpy.duration import Duration
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            from sensor_msgs.msg import LaserScan
+            from rclpy.qos import qos_profile_sensor_data
+            self.odom_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=60))
+            self.odom_listener = tf2_ros.TransformListener(self.odom_buffer, self.node, spin_thread=False)
+            self.first_poses = deque(maxlen=20)
+            self.scans = OrderedDict()
+            def scan_sample(msg):
+                self.scans[(msg.header.stamp.sec,msg.header.stamp.nanosec)] = msg
+                while len(self.scans)>300:
+                    self.scans.popitem(last=False)
+            self.scan_subscription = self.node.create_subscription(LaserScan, self.ops._scan_topic,
+                scan_sample, qos_profile_sensor_data)
+            self.pose_subscription = self.node.create_subscription(PoseWithCovarianceStamped, "/pose", self.first_poses.append, 20)
+            self.filter_subscription = self.node.create_subscription(PoseWithCovarianceStamped,
+                localizers.POSE_TOPIC, lambda msg: setattr(self, "filter_message", msg), 20)
 
     def match(self, run):
-        return localizers.match_statically(self.node, self.grid)
+        # A saved partial graph needs wider hypothesis retention. Do not alter
+        # the mature ordinary-localization or any RTAB path.
+        search = ({"fine_candidate_budget": 256}
+                  if self.target_mode == "mapping" and active_algo() == "slam_toolbox" else {})
+        result = localizers.match_statically(self.node, self.grid, **search)
+        if self.target_mode == "mapping" and result[0] is not None and hasattr(result[0], "scan_stamp"):
+            from rclpy.time import Time
+            from rclpy.duration import Duration
+            from .slam_motion import tuple_from_transform
+            self.recovered_odom = tuple_from_transform(self.odom_buffer.lookup_transform(
+                self.ops._odom_frame,self.ops._base_frame,Time.from_msg(result[0].scan_stamp),Duration(seconds=.5)))
+        return result
 
     @staticmethod
     def conclusive(match):
@@ -529,6 +874,16 @@ class _LocalizationBackend:
             run.check()
             if not ok:
                 return None, detail
+            if self.target_mode == "mapping" and self.filter_message is not None:
+                from rclpy.time import Time
+                from rclpy.duration import Duration
+                from .slam_motion import tuple_from_transform
+                message = self.filter_message
+                self.recovered_odom = tuple_from_transform(self.odom_buffer.lookup_transform(
+                    self.ops._odom_frame,self.ops._base_frame,Time.from_msg(message.header.stamp),Duration(seconds=.5)))
+                p,q=message.pose.pose.position,message.pose.pose.orientation
+                pose=(p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
+                return pose, f"Recovered by {localizers.name()}: {detail}"
             return localizers.current_pose(self.node) or pose, f"Recovered by {localizers.name()}: {detail}"
         finally:
             localizers.stop()
@@ -538,11 +893,49 @@ class _LocalizationBackend:
         localizers.stop()
 
     def verify(self, run, pose):
+        if self.target_mode == "mapping":
+            from .slam_motion import advance, tuple_from_transform
+            from rclpy.time import Time
+            from rclpy.duration import Duration
+            # Require three independent live scans. Transport the seed using
+            # odom so manual movement during verification does not stale it.
+            deadline = time.monotonic()+5.
+            while not self.odom_buffer.can_transform(self.ops._odom_frame, self.ops._base_frame, Time()):
+                run.check()
+                if time.monotonic() >= deadline:
+                    return False, "odometry TF unavailable for mapping initialization"
+                time.sleep(.02)
+            self.odom_anchor = (self.recovered_odom if run.seed is None and self.recovered_odom is not None else
+                tuple_from_transform(self.odom_buffer.lookup_transform(self.ops._odom_frame, self.ops._base_frame, Time())))
+            for _ in range(3):
+                run.check()
+                scan = localizers._next_scan(self.node, 6.)
+                if scan is None:
+                    return False, "no live laser for mapping initialization"
+                odom = tuple_from_transform(self.odom_buffer.lookup_transform(
+                    self.ops._odom_frame, self.ops._base_frame, Time.from_msg(scan.header.stamp), Duration(seconds=.5)))
+                current = advance(pose, self.odom_anchor, odom)
+                from .slam_regions import retained_start
+                reason = retained_start(self.map_dir, current, self.tracking_grid)
+                if reason:
+                    return False, reason
+                offset = localizers.sensor_offset_xy(self.node, scan.header.frame_id)
+                for grid in (self.grid, self.tracking_grid):
+                    fit, detail = localizers.scan_fit_of(grid, scan, current, offset)
+                    if fit < localizers.SCAN_FIT_MIN:
+                        return False, f"initial pose rejected by live laser ({fit:.0%}): {detail}"
+            self.handover_seed, self.odom_anchor = current, odom
+            return True, "three live scans verified; odometry anchored for moving handover"
         return _confirm_against_map(self.node, self.grid, pose, require_scan=True)
 
     def handover(self, run, pose):
         self.engine_started = True
-        ok, detail = self.ops.switch_mode(self.node, "localization", self.map_dir, self.map_id, 30.0, pose)
+        with _SLAM_OPERATION:
+            if self.target_mode == "mapping":
+                pose = self.handover_seed
+                ok, detail = self.ops._start_mapping_node(self.map_dir, pose, self.odom_anchor)
+            else:
+                ok, detail = self.ops.switch_mode(self.node, "localization", self.map_dir, self.map_id, 30.0, pose)
         run.check()
         if not ok:
             return False, detail
@@ -550,15 +943,113 @@ class _LocalizationBackend:
         run.check()
         if not ok:
             return False, ready
-        if run.cancelled.wait(3.0):
-            run.check()
-        ok, verified = _confirm_engine_pose(self.node, self.tracking_grid)
+        if self.target_mode == "mapping":
+            ok, verified = self._verify_mapping_handover(run, pose)
+        else:
+            if run.cancelled.wait(3.0):
+                run.check()
+            ok, verified = _confirm_engine_pose(self.node, self.tracking_grid)
+        if ok and self.target_mode == "mapping":
+            import tempfile
+            from .slam_checkpoints import inspect_graph,validate_reference
+            with _SLAM_OPERATION, tempfile.TemporaryDirectory(prefix="slam-handover-") as tmp:
+                run.check()
+                saved, why = self.ops.snapshot(self.node, tmp, 30.)
+                if not saved:
+                    return False, why
+                graph = inspect_graph(tmp)
+                graph.update(validate_reference(tmp,{"reference_nodes":self.graph_info.get("reference_nodes",{}) if self.graph_info else {}}))
+                ids = {json.loads(s)["id"] for s in Path(tmp,"nodes.jsonl").read_text().splitlines()}
+                if self.graph_info and not set(self.graph_info.get("node_ids", [])).issubset(ids):
+                    return False, "loaded graph is missing baseline nodes"
+                run.check()
+                from std_srvs.srv import Trigger
+                released,response = engines._call_service(self.node,Trigger,"/slam_scan_gate/release_frame",Trigger.Request(),5.)
+                if not released or not response.success:
+                    return False, f"verified map frame could not be released: {response}"
+                lifecycle.set_mode("mapping")
+                _slam_session().begin(base_map_id=self.map_id, baseline_grid=self.baseline_grid,
+                    parent=self.restored_from, metadata={"generation": lifecycle.current()["generation"],
+                    "baseline_nodes": self.graph_info["nodes"] if self.graph_info else 0,
+                    "reference_nodes": self.graph_info.get("reference_nodes", {}) if self.graph_info else {},
+                    "guard_anchor": self.guard_anchor})
+                # Every continued session starts with a verifiable checkpoint,
+                # even when the robot remains within the old known area.
+                _slam_session().request("session_start")
+                verified += f"; {graph['nodes']} nodes, old graph retained"
         return ok, f"{detail}; {verified}"
+
+    def _verify_mapping_handover(self, run, seed):
+        from .slam_motion import advance, tuple_from_transform
+        from rclpy.time import Time
+        from rclpy.duration import Duration
+        deadline = time.monotonic()+20.
+        while not self.first_poses:
+            run.check()
+            from rcl_interfaces.srv import GetParameters
+            ok, response = engines._call_service(self.node,GetParameters,"/slam_scan_gate/get_parameters",
+                GetParameters.Request(names=["bootstrap_state"]),1.)
+            if ok and response.values and response.values[0].string_value.startswith("failed:"):
+                return False,response.values[0].string_value
+            if time.monotonic() >= deadline:
+                return False, "mapping engine did not produce an initial pose"
+            time.sleep(.02)
+        # A stationary robot legitimately adds just one node. Do not require
+        # motion merely to obtain three native outputs: three input scans were
+        # already verified before loading. Check any immediately available
+        # native corrections, including the mandatory first one.
+        run.cancelled.wait(.2)
+        run.check()
+        # Verify the INITIAL scan timestamps, rather than the robot's later
+        # position after it may already have entered previously unknown space.
+        fits = []
+        for number, message in enumerate(list(self.first_poses)[:3]):
+            scan = self.scans.get((message.header.stamp.sec,message.header.stamp.nanosec))
+            if scan is None:
+                return False, "initial mapping scan was not retained for verification"
+            odom = tuple_from_transform(self.odom_buffer.lookup_transform(self.ops._odom_frame,
+                self.ops._base_frame, Time.from_msg(message.header.stamp), Duration(seconds=.5)))
+            expected = advance(seed,self.odom_anchor,odom)
+            p,q = message.pose.pose.position,message.pose.pose.orientation
+            actual = (p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
+            distance = math.hypot(actual[0]-expected[0],actual[1]-expected[1])
+            angle = abs(math.atan2(math.sin(actual[2]-expected[2]),math.cos(actual[2]-expected[2])))
+            travel = math.hypot(expected[0]-seed[0],expected[1]-seed[1])
+            if number == 0 and travel>1.:
+                return False, "robot moved more than 1 m before graph handover; initialize closer to a known area"
+            if distance>.1 or angle>math.radians(3):
+                return False, f"mapping handover departed from verified odometry ({distance:.2f} m, {math.degrees(angle):.1f} deg)"
+            fit, detail = localizers.scan_fit_of(self.tracking_grid,scan,actual,
+                localizers.sensor_offset_xy(self.node,scan.header.frame_id))
+            fits.append(fit)
+            # A new viewpoint can expose previously unseen surfaces. Initial
+            # localization was already laser-verified on THREE scans; after
+            # motion, use short-baseline odometry and graph identity to verify
+            # transport, rather than demanding the old grid explain new space.
+            if travel<.1 and fit<localizers.SCAN_FIT_MIN:
+                return False, f"initial mapping scan rejected ({fit:.0%}): {detail}"
+            self.guard_anchor = {"stamp": Time.from_msg(message.header.stamp).nanoseconds,
+                                 "pose": actual, "odom": odom}
+        return True, f"initial mapping poses match verified seed and odometry; old-grid laser fits {fits}"
 
     def cleanup(self, run, completed):
         localizers.stop()
         if self.engine_started and not completed:
-            self.ops.stop_engine()
+            with _SLAM_OPERATION:
+                self.ops.stop_engine()
+                if self.target_mode == "mapping":
+                    _slam_session().suspend()
+                    lifecycle.set_mode("localization")
+        listener = getattr(self, "odom_listener", None)
+        if listener is not None:
+            listener.unregister()
+        for name in ("scan_subscription", "pose_subscription", "filter_subscription"):
+            subscription = getattr(self, name, None)
+            if subscription is not None:
+                self.node.destroy_subscription(subscription)
+        private_grid = getattr(self, "reentry_grid", None)
+        if private_grid is not None:
+            private_grid.cleanup()
 
 
 def _begin_relocalization(node, ops, map_dir: str, map_id: str, seed) -> tuple[bool, str]:
@@ -567,7 +1058,13 @@ def _begin_relocalization(node, ops, map_dir: str, map_id: str, seed) -> tuple[b
     if ops is None:
         return False, "no engine to hand a recovered pose to"
     live = lifecycle.current()
-    run_id = _LOCALIZATION.start(_LocalizationBackend(node, ops, map_dir, map_id),
+    target = _SLAM_REENTRY
+    if target:
+        _slam_session().suspend()
+    backend = (_LocalizationBackend(node, ops, target["source"], map_id, target_mode=target["mode"],
+                graph_info=target["graph"], baseline_grid=target["baseline"], restored_from=target["parent"])
+               if target else _LocalizationBackend(node, ops, map_dir, map_id))
+    run_id = _LOCALIZATION.start(backend,
                                 map_id, int(live.get("generation") or 0), seed)
     return True, f"initial localization run {run_id} started; searching the saved map"
 
@@ -622,6 +1119,7 @@ def _finish_target_map_wait(node, barrier: dict, timeout_s: float) -> tuple[bool
     )
 
 
+@_slam_command
 def load_map_impl(map_id: str, mode: str = "localization",
                   has_initial_pose: bool = False,
                   x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> dict:
@@ -632,6 +1130,9 @@ def load_map_impl(map_id: str, mode: str = "localization",
     localization mode, then forces a full optimized map publish so /map reflects
     the saved artifact instead of the previous live mapping session.
     """
+    global _SLAM_REENTRY
+    if active_algo() == "slam_toolbox" and mode == "mapping":
+        return start_mapping_impl(map_id, has_initial_pose, x, y, theta)
     map_id = _sanitize_map_id(map_id)
     requested_mode = (mode or "localization").strip().lower()
     if requested_mode not in ("localization", "mapping"):
@@ -663,6 +1164,10 @@ def load_map_impl(map_id: str, mode: str = "localization",
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
 
     try:
+        if algo == "slam_toolbox":
+            _LOCALIZATION.cancel()
+            _slam_session().suspend()
+            _SLAM_REENTRY = None
         started = time.monotonic()
         log.info("load_map[%s] stage=prepare source=%s requested_mode=%s", map_id,
                  source_path, requested_mode)
@@ -1012,7 +1517,7 @@ def relocalize_impl() -> dict:
         return {"ok": False, "detail": "initial localization is only supported by slam_toolbox"}
     live = lifecycle.current()
     map_id = live.get("map_id") or ""
-    if (live.get("mode") or "") != "localization" or not map_id:
+    if (live.get("mode") or "") != "localization" or (not map_id and not _SLAM_REENTRY):
         return {"ok": False, "detail": "not localizing on a saved map; load one first"}
     node = _get_node()
     if node is None:
@@ -1029,6 +1534,7 @@ def relocalize_impl() -> dict:
             "detail": detail}
 
 
+@_slam_command
 def switch_mode_impl(mode: str) -> dict:
     """Flip the running engine between mapping and localization on the map it
     already has — no map load, no restart. Returns {ok, detail}.
@@ -1046,10 +1552,23 @@ def switch_mode_impl(mode: str) -> dict:
     if node is None:
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
     algo = active_algo()
+    if algo == "slam_toolbox":
+        if mode == get_mode_impl().get("mode"):
+            return {"ok": True, "detail": f"already in {mode} mode"}
+        if mode == "mapping":
+            current = _LOCALIZATION.snapshot()
+            if current["phase"] != "ready":
+                return {"ok": False, "detail": "finish initial localization before continuing mapping"}
+            pose = live_pose(node)
+            if pose is None:
+                return {"ok": False, "detail": "no current localized pose"}
+            source = _SLAM_REENTRY["source"] if _SLAM_REENTRY else None
+            return start_mapping_impl(lifecycle.current().get("map_id", ""), True, *pose, _source=source)
+        return _localize_current_slam_graph()
     ops = engines.engine_for(algo)
     if ops is None:
         return {"ok": False, "detail": f"{algo} does not implement map persistence"}
-    live = get_mode_impl()
+    live = lifecycle.current()
     map_id = live.get("map_id", "")
     map_dir = os.path.join(MAPS_DIR, map_id) if map_id else ""
     try:
@@ -1067,6 +1586,7 @@ def switch_mode_impl(mode: str) -> dict:
 
 
 # ── reset_map ─────────────────────────────────────────────────────────────────
+@_slam_command
 def reset_map_impl() -> dict:
     """Wipe the running rtabmap's map (working memory + live database) and
     restart SLAM from scratch — for when mapping has diverged and you want a
@@ -1077,6 +1597,8 @@ def reset_map_impl() -> dict:
     so the rebuilt map's frame will NOT align with the pre-reset one (origin
     drift). Saved maps on disk are untouched. Returns {ok, detail}.
     """
+    if active_algo() == "slam_toolbox":
+        return start_mapping_impl()
     node = _get_node()
     if node is None:
         return {"ok": False, "detail": "rclpy node unavailable (ROS not running?)"}
@@ -1252,6 +1774,8 @@ def _save_map_via_engine(map_id: str, map_dir: str, algo: str, note: str = "") -
     metadata (including which engine wrote it) and publish atomically. Consumers
     and the web UI see one directory layout regardless of engine.
     """
+    if algo == "slam_toolbox":
+        return _save_slam_map(map_id, map_dir, note)
     ops = engines.engine_for(algo)
     if ops is None:
         return {"ok": False, "map_id": map_id, "artifact_path": "",

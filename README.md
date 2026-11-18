@@ -12,6 +12,7 @@ up by `rbnx boot`. Consumers (`scene`, `nav`) bind the contracts, not the
 SLAM engine.
 
 - **[Occupancy grid editor](docs/grid-editor.md)**: edit saved grids as reversible deltas; keep the SLAM pose graph unchanged.
+- **[slam_toolbox unified mapping and checkpoints](docs/UNIFIED-MAPPING.zh-CN.md)**: fresh/continued mapping, verified moving handover, area-triggered graph checkpoints and recovery; [replay experiments](experiments/unified_mapping/README.zh-CN.md).
 - Capability surface, config schema, and persistence layout: **[CAPABILITY.md](CAPABILITY.md)**.
 - Provider instance configuration reference: **[config.spec](config.spec)**.
 - Offline global-localization benchmark, dataset setup, and results: **[BENCHMARK.md](BENCHMARK.md)**.
@@ -206,6 +207,12 @@ from the target's ROS 2 Humble installation, preserving its support libraries
 and CMake exports for consumers such as `cv_bridge`.
 
 ## Maps, modes and session state
+
+For **slam_toolbox**, fresh and continued mapping share the same engine path.
+Set `mapping_base_map_id` to resume a saved graph after verified initial
+localization, or use the web UI's continue/restore controls. Checkpoints run
+without pausing mapping; see the implementation guide linked above. The
+database and mode-switch details below describe **RTAB-Map**.
 
 ### Three databases, kept apart
 
@@ -434,9 +441,13 @@ mapping_rbnx/
   lists the paths it tried. A service that has been running and mapping always
   has one; if this appears right after a load, the deployment predates the
   shared live-database record and should be updated.
-- **The map "disappeared" after switching to mapping mode** — expected, see
+- **RTAB-Map's map "disappeared" after switching to mapping mode** — see
   *Why the loaded map disappears*. It returns on a loop closure with the loaded
   session; the saved map on disk is intact either way. Build new maps from a
   restart instead of a runtime switch.
 
 License: MulanPSL-2.0
+
+## SLAM Toolbox 局部重建
+
+选定区域的原生扫描清退、增量补扫操作和 scene_207 实验边界见 [局部重建说明](docs/LOCAL-REBUILD.zh-CN.md)。区域自主探索由独立的 `skill-explore-rbnx` 包提供。

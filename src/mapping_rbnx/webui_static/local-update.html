@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Robonix 局部重建</title>
+<style>
+body{margin:0;background:#f3f5f7;color:#182b35;font:16px system-ui,sans-serif}header,main{max-width:1200px;margin:auto;padding:20px}header{display:flex;justify-content:space-between;align-items:center}h1{font-size:24px;margin:0}main{display:grid;grid-template-columns:300px 1fr;gap:20px}aside,section{background:white;border:1px solid #d9e0e5;border-radius:12px;padding:18px}p{line-height:1.6}label{display:block;margin:16px 0 8px}input[type=text]{box-sizing:border-box;width:100%;padding:9px}button{padding:10px 14px;margin:8px 0;cursor:pointer}button:disabled{cursor:default;opacity:.5}canvas{display:block;width:100%;height:auto;touch-action:none;cursor:crosshair}#status{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#536b78}@media(max-width:760px){main{grid-template-columns:1fr}}
+</style>
+<header><h1>局部重建</h1><a href="/">返回地图服务</a></header>
+<main><aside>
+<p id="source">正在载入地图…</p>
+<p>在地图上拖出需要重建的区域。系统将清理相关历史观测，原图保留为独立版本。</p>
+<p id="bounds">尚未选择区域</p>
+<label for="new-id">新地图名称</label><input id="new-id" type="text" maxlength="120">
+<button id="prepare" disabled>创建局部重建分支</button>
+<p id="status" role="status"></p>
+<label><input id="ready" type="checkbox">机器人已位于选区外、仍有有效地图观测的位置</label>
+<button id="start" disabled>在新分支开始增量建图</button>
+<p><small>定位通过后，再操控机器人进入选区巡检。需要选择初始定位候选点时，请返回地图服务主界面。</small></p>
+</aside><section><canvas id="map" aria-label="在已保存地图上选择局部重建区域"></canvas></section></main>
+<script src="/static/local-update.js"></script>
+</html>

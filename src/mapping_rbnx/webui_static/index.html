@@ -59,6 +59,7 @@
     <button class="btn" id="tool-log" onclick="togglePanel('logpanel')" title="Activity log">
       <svg><use href="#i-log" /></svg><span class="lbl">Log</span>
     </button>
+    <button class="btn" id="tool-checkpoints" hidden onclick="togglePanel('checkpointpanel')">Checkpoints</button>
     <span class="sep"></span>
     <button class="btn" id="btn-pose" onclick="togglePose()" title="Seed the robot's pose by hand">
       <svg><use href="#i-pose" /></svg><span class="lbl">Pose</span>
@@ -99,6 +100,7 @@
     <span class="chip" id="rangebadge">lidar —</span>
     <span class="chip" id="posechip">map — pose —</span>
     <span class="chip" id="status">connecting…</span>
+    <span class="chip" id="checkpoint-status" hidden></span>
   </div>
 
   <div id="modewarn">
@@ -134,6 +136,7 @@
     <button class="tab" id="tab-libpanel" onclick="togglePanel('libpanel')">Maps</button>
     <button class="tab" id="tab-candidatepanel" onclick="togglePanel('candidatepanel')">Candidates</button>
     <button class="tab" id="tab-logpanel" onclick="togglePanel('logpanel')">Log</button>
+    <button class="tab" id="tab-checkpointpanel" hidden onclick="togglePanel('checkpointpanel')">Checkpoints</button>
     <button class="tab" id="dockclose" onclick="closeDock()" title="Close">
       <svg style="width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 2">
         <use href="#i-close" />
@@ -153,6 +156,7 @@
   </div>
 
   <div class="pane" id="libpanel">
+    <button class="btn" id="new-mapping" hidden onclick="doNewMapping()">New mapping session</button>
     <div id="lib" style="display: flex; flex-direction: column; gap: 6px"></div>
   </div>
 
@@ -165,6 +169,11 @@
 
   <div class="pane" id="logpanel">
     <div id="logbox"></div>
+  </div>
+  <div class="pane" id="checkpointpanel">
+    <div class="row"><b>Mapping checkpoints</b><button class="btn sm" onclick="doCheckpoint()">Save checkpoint now</button></div>
+    <p class="hint" id="checkpoint-policy">Automatic graph checkpoints are saved as the known area grows. The robot can keep moving.</p>
+    <div id="checkpoint-list"></div>
   </div>
 </div>
 

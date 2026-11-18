@@ -454,6 +454,7 @@ async function poll() {
     if (candidateTool) candidateTool.hidden = s.engine !== "slam_toolbox";
     syncCandidates(s);
     applyMode();
+    renderCheckpointState(s.mapping_session);
     applyTrust();
     setPose(
       s.has_map
@@ -491,6 +492,72 @@ async function poll() {
 }
 setInterval(poll, 1000);
 poll();
+
+function renderCheckpointState(session) {
+  const supported = !!session?.supported;
+  for (const id of ["tool-checkpoints", "tab-checkpointpanel", "new-mapping", "checkpoint-status"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = !supported;
+  }
+  if (!supported) return;
+  const last = session.last_checkpoint;
+  const text = session.error ? "Checkpoint error: " + session.error
+    : session.state === "saving" ? "Saving checkpoint · mapping continues"
+    : `${(session.new_area_m2 || 0).toFixed(1)} / ${session.area_threshold_m2} m² new · ${last ? "checkpoint " + new Date(last.created_at * 1000).toLocaleTimeString() : "no checkpoint yet"}`;
+  document.getElementById("checkpoint-status").textContent = text;
+  document.getElementById("checkpoint-policy").textContent = `Auto-save after ${session.area_threshold_m2} m² newly known area, at least ${session.min_interval_s}s between saves. Saving does not pause mapping.`;
+}
+
+async function mappingPost(path, body) {
+  const out = await (await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+  setStatus(out.detail || (out.ok ? "accepted" : "failed"));
+  await poll();
+  return out;
+}
+
+async function doContinueMapping(mapId) {
+  await runExclusive("Preparing continued mapping", "Checking the saved graph; initial localization must pass before mapping starts.",
+    () => mappingPost("/api/mapping/start", {base_map_id: mapId}));
+}
+
+async function doNewMapping() {
+  if (!(await askConfirm("Start a new mapping session?", "The live graph is replaced. Saved maps and checkpoints are kept.", {danger: true, yes: "New session"}))) return;
+  await runExclusive("Starting mapping", "Starting from an empty graph with automatic checkpoints.",
+    () => mappingPost("/api/mapping/start", {}));
+}
+
+async function doCheckpoint() {
+  await mappingPost("/api/checkpoints/create", {});
+}
+
+async function loadCheckpoints() {
+  const out = await (await fetch("/api/checkpoints")).json();
+  const list = document.getElementById("checkpoint-list");
+  list.replaceChildren();
+  for (const checkpoint of out.checkpoints || []) {
+    const card = document.createElement("div");
+    card.className = "mapitem";
+    const preview = document.createElement("img");
+    preview.alt = "Checkpoint map";
+    preview.src = "/api/checkpoints/preview.png?" + new URLSearchParams({session_id: checkpoint.session_id, checkpoint_id: checkpoint.checkpoint_id});
+    const info = document.createElement("div");
+    info.className = "mi";
+    info.textContent = `${new Date(checkpoint.created_at * 1000).toLocaleString()} · ${checkpoint.reason} · ${checkpoint.graph.nodes} nodes · capture ${checkpoint.capture_ms.toFixed(0)} ms`;
+    const restore = document.createElement("button");
+    restore.className = "btn sm";
+    restore.textContent = "Restore & continue";
+    restore.onclick = async () => {
+      if (!(await askConfirm("Restore this checkpoint?", "The current live graph is replaced. The robot will localize again before mapping continues.", {danger: true, yes: "Restore"}))) return;
+      await runExclusive("Restoring checkpoint", "Checking the saved files and preparing initial localization.",
+        () => mappingPost("/api/checkpoints/restore", {session_id: checkpoint.session_id, checkpoint_id: checkpoint.checkpoint_id}));
+    };
+    card.append(preview, info, restore);
+    list.appendChild(card);
+  }
+  if (!list.children.length) list.textContent = out.detail || "No checkpoints yet. They appear automatically as mapping progresses.";
+}
+setInterval(() => { if (paneOpen("checkpointpanel")) loadCheckpoints(); }, 5000);
+
 async function loadLib() {
   let m = await (await fetch("/api/maps")).json();
   let el = document.getElementById("lib");
@@ -512,6 +579,18 @@ async function loadLib() {
       edit.href = "/editor?map_id=" + encodeURIComponent(x.map_id);
       edit.textContent = "Edit grid";
       d.querySelector(".acts").appendChild(edit);
+    }
+    if (CURENGINE === "slam_toolbox" && x.loadable_here) {
+      const resume = document.createElement("button");
+      resume.className = "btn sm";
+      resume.textContent = "Continue mapping";
+      resume.onclick = () => doContinueMapping(x.map_id);
+      d.querySelector(".acts").appendChild(resume);
+      const local = document.createElement("a");
+      local.className = "btn sm";
+      local.href = "/local-update?map_id=" + encodeURIComponent(x.map_id);
+      local.textContent = "Local rebuild";
+      d.querySelector(".acts").appendChild(local);
     }
     el.appendChild(d);
   }
@@ -585,7 +664,7 @@ function togglePanel(id) {
   const already = pane.classList.contains("on") && dock.classList.contains("on");
   for (const p of document.querySelectorAll(".pane")) p.classList.remove("on");
   for (const t of document.querySelectorAll(".tab")) t.classList.remove("on");
-  for (const b of ["tool-save", "tool-library", "tool-candidates", "tool-log"]) {
+  for (const b of ["tool-save", "tool-library", "tool-candidates", "tool-log", "tool-checkpoints"]) {
     const el = document.getElementById(b);
     if (el) el.classList.remove("active");
   }
@@ -597,10 +676,11 @@ function togglePanel(id) {
   pane.classList.add("on");
   const tab = document.getElementById("tab-" + id);
   if (tab) tab.classList.add("on");
-  const tool = { savepanel: "tool-save", libpanel: "tool-library", candidatepanel: "tool-candidates", logpanel: "tool-log" }[id];
+  const tool = { savepanel: "tool-save", libpanel: "tool-library", candidatepanel: "tool-candidates", logpanel: "tool-log", checkpointpanel: "tool-checkpoints" }[id];
   if (tool) document.getElementById(tool).classList.add("active");
   if (id == "libpanel") loadLib();
   if (id == "logpanel") loadLog();
+  if (id == "checkpointpanel") loadCheckpoints();
   if (id == "savepanel") document.getElementById("saveid").focus();
 }
 
@@ -707,7 +787,7 @@ async function doLoad(id) {
     return;
   let r = await runExclusive(
     "Loading map “" + id + "”…",
-    "The saved database is copied to a runtime file, RTAB-Map switches onto it, and the map is republished. Watch the green scan afterwards to see whether it relocalized.",
+    CURENGINE === "slam_toolbox" ? "The robot will initialize its position on this saved map. Choose Continue mapping to extend it." : "The saved database is copied to a runtime file, RTAB-Map switches onto it, and the map is republished. Watch the green scan afterwards to see whether it relocalized.",
     async () =>
       await (
         await fetch("/api/load", {
@@ -727,7 +807,7 @@ async function doSwitch(mode) {
   // transition that can destroy work: it resumes building from wherever the
   // robot currently believes it is, so if relocalization has not converged on
   // the loaded map it opens a new session instead of extending the old one.
-  if (mode == "mapping" && CURMODE == "localization") {
+  if (CURENGINE !== "slam_toolbox" && mode == "mapping" && CURMODE == "localization") {
     let what = CURMAP ? 'map "' + CURMAP + '"' : "the loaded map";
     if (
       !(await askConfirm(
@@ -752,7 +832,7 @@ async function doSwitch(mode) {
   }
   let r = await runExclusive(
     "Switching to " + mode + "…",
-    "Asking RTAB-Map to change mode. The map itself is not touched.",
+    CURENGINE === "slam_toolbox" ? "Preserving the graph and verifying the transition." : "Asking RTAB-Map to change mode. The map itself is not touched.",
     async () =>
       await (
         await fetch("/api/switch_mode", {
@@ -762,7 +842,7 @@ async function doSwitch(mode) {
         })
       ).json(),
   );
-  if (r && r.ok) CURMODE = mode;
+  if (r && r.ok && CURENGINE !== "slam_toolbox") CURMODE = mode;
   applyMode();
   if (r) setStatus(r.detail || "mode " + mode);
 } // poll() re-reads the real mode a second later
@@ -779,7 +859,7 @@ async function doReset() {
     return;
   let r = await runExclusive(
     "Clearing the live map…",
-    "RTAB-Map is resetting and resumes mapping from the current pose. Everything recorded against the old frame is now stale.",
+    CURENGINE === "slam_toolbox" ? "A new graph starts at the current robot position. Saved maps and checkpoints are kept." : "RTAB-Map is resetting and resumes mapping from the current pose. Everything recorded against the old frame is now stale.",
     async () =>
       await (
         await fetch("/api/reset", {
@@ -953,8 +1033,8 @@ function applyMode() {
   }
   let w = document.getElementById("modewarn");
   if (!w) return;
-  w.classList.toggle("on", CURMODE == "localization");
-  if (CURMODE == "localization") {
+  w.classList.toggle("on", CURENGINE !== "slam_toolbox" && CURMODE == "localization");
+  if (CURENGINE !== "slam_toolbox" && CURMODE == "localization") {
     document.getElementById("modewarntext").textContent =
       "Localized on " +
       (CURMAP ? '"' + CURMAP + '"' : "a loaded map") +

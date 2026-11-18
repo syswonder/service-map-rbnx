@@ -577,11 +577,12 @@ def _localization_trust() -> dict:
     if (live.get("mode") or "") != "localization":
         return {}
     map_id = live.get("map_id") or ""
-    if not map_id:
+    map_dir = os.path.join(MAPS_DIR,map_id) if map_id else map_ops.localization_map_directory()
+    if not map_dir:
         return {}
-    map_dir = os.path.join(MAPS_DIR, map_id)
-    if _trust["grid_for"] != map_id:
-        _trust.update(grid_for=map_id, grid=localizers.load_grid(map_dir),
+    cache_key = map_id or map_dir
+    if _trust["grid_for"] != cache_key:
+        _trust.update(grid_for=cache_key, grid=localizers.load_grid(map_dir),
                       fit=None, at=0.0, detail="")
     run_id = (map_ops._LOCALIZATION.snapshot()["run_id"]
               if map_ops.active_algo() == "slam_toolbox" else None)
@@ -747,7 +748,8 @@ def _static(name: str) -> tuple[int, str, bytes]:
     attack and neither deserves a file.
     """
     if name not in {"index.html", "app.js", "style.css",
-                    "vendor/bootstrap.min.css", "editor.html", "editor.js", "editor.css"}:
+                    "vendor/bootstrap.min.css", "editor.html", "editor.js", "editor.css",
+                    "local-update.html", "local-update.js"}:
         return 404, "text/plain", b"not found"
     path = STATIC_DIR / name
     try:
@@ -824,12 +826,24 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if p == "/editor":
                 return self._send(*_static("editor.html"))
+            if p == "/local-update":
+                return self._send(*_static("local-update.html"))
             if p.startswith("/api/editor/"):
                 return self._editor_get(p)
             if p == "/" or p == "/index.html":
                 return self._send(*_static("index.html"))
             if p.startswith("/static/"):
                 return self._send(*_static(p[len("/static/"):]))
+            if p == "/api/checkpoints":
+                return self._json(map_ops.list_checkpoints_impl())
+            if p == "/api/mapping/status":
+                return self._json(map_ops.mapping_status_impl())
+            if p == "/api/checkpoints/preview.png":
+                if map_ops.active_algo() != "slam_toolbox":
+                    return self._send(404, "text/plain", b"unsupported")
+                query = parse_qs(urlparse(self.path).query)
+                directory = map_ops._slam_session().store.path(query["session_id"][0], query["checkpoint_id"][0])
+                return self._send(200, "image/png", (directory/"occupancy.png").read_bytes())
             if p == "/api/map.png":
                 _ensure_subscriptions()
                 g = _latest["grid"]
@@ -857,6 +871,8 @@ class _Handler(BaseHTTPRequestHandler):
                       "trust": _localization_trust(),
                       "map_id": live.get("map_id", ""),
                       "generation": live.get("generation", 0)}
+                if map_ops.active_algo() == "slam_toolbox":
+                    st["mapping_session"] = map_ops.mapping_status_impl()
                 relay = getattr(_webui_node, "_grid_relay", None)
                 if relay is not None:
                     st["navigation_grid"] = dict(relay.status)
@@ -918,6 +934,30 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._editor_post(p)
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
+            if p == "/api/mapping/local_update":
+                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                    return self._json({"ok": False, "detail": "expected application/json"}, 400)
+                try:
+                    from .slam_regions import prepare
+                    with map_ops._SLAM_COMMAND:
+                        out = prepare(MAPS_DIR, body.get("base_map_id", ""),
+                            body.get("map_id", ""), body.get("bounds"))
+                    _log_add("mapping", out["detail"])
+                    return self._json(out)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    return self._json({"ok": False, "detail": str(exc)}, 400)
+            if p in {"/api/mapping/start", "/api/checkpoints/create", "/api/checkpoints/restore"}:
+                if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                    return self._json({"ok": False, "detail": "expected application/json"}, 400)
+                if p == "/api/mapping/start":
+                    out = map_ops.start_mapping_impl(body.get("base_map_id", ""), bool(body.get("has_initial_pose", False)),
+                        float(body.get("x", 0.)), float(body.get("y", 0.)), float(body.get("theta", 0.)))
+                elif p == "/api/checkpoints/create":
+                    out = map_ops.checkpoint_impl()
+                else:
+                    out = map_ops.restore_checkpoint_impl(body.get("session_id"), body.get("checkpoint_id"))
+                _log_add("mapping", out.get("detail", ""))
+                return self._json(out)
             if p == "/api/save":
                 mid = body.get("map_id", "")
                 out = map_ops.save_map_impl(mid, body.get("note", ""))

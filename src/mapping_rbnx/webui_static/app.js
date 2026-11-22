@@ -28,8 +28,8 @@ function localizationProgress() {
     searching: ["Searching the map for the initial pose", "Keep the robot still during the initial scan match. A clear match is accepted automatically; otherwise up to five candidates will appear."],
     choosing: ["Confirm the robot position", "Choose a numbered position and heading, or move the robot manually to help the particle filter converge."],
     verifying: ["Initial pose found · verifying", "Checking the live laser against the map before activating localization."],
-    starting: ["Activating localization", "Starting the map engine at the verified pose and checking its live output."],
-    ready: ["Localization ready", "The red marker shows the robot position. See laser verification for live confidence."],
+    starting: ["Activating localization", "Starting the map engine at the initial pose and checking its live output."],
+    ready: ["Localization ready", "The red marker shows the estimated pose. The laser panel shows how closely the scan matches the map."],
     failed: ["Localization failed", "Review the details and restart localization, or supply an initial pose on the map."],
   };
   const phase = loc.phase || "idle";
@@ -60,9 +60,7 @@ function renderLocalizationProgress() {
 }
 setInterval(renderLocalizationProgress, 1000);
 
-// The trust line answers "is my localization right?" from the map rather than
-// from the filter's own confidence, which is why it can disagree with the
-// spread shown beside it — and when it does, it is the one to believe.
+// Similar poses along a corridor can give the same wall fit.
 function applyTrust() {
   const el = document.getElementById("trust");
   if (!el) return;
@@ -82,8 +80,8 @@ function applyTrust() {
   const text = document.getElementById("trusttext");
   if (t.verdict == "ok") {
     icon.textContent = "\u2713";
-    text.innerHTML = "<b>Localization checks out</b> — " + pct +
-      " of the laser lands on mapped walls (needs " + gate + ")";
+    text.innerHTML = "<b>Laser matches mapped walls</b> · " + pct +
+      " of scored returns hit walls (recent median, threshold " + gate + "). Several poses can match in a corridor.";
   } else if (t.verdict == "stale") {
     icon.textContent = "!";
     text.textContent = "The pose has not passed live verification. See localization progress below.";
@@ -91,10 +89,10 @@ function applyTrust() {
     icon.textContent = "!";
     text.innerHTML = t.withdrawn
       ? "<b>Map frame withdrawn</b> — only " + pct +
-        " of the laser lands on mapped walls. Navigation and recording are " +
+        " of scored returns hit mapped walls. Navigation and recording are " +
         "stopped until this is settled; relocalizing."
-      : "<b>Localization does not match the map</b> — only " + pct +
-        " of the laser lands on mapped walls (needs " + gate +
+      : "<b>Low laser agreement with mapped walls</b> — only " + pct +
+        " of scored returns hit walls (needs " + gate +
         "). The map frame is withdrawn if this holds.";
   } else {
     icon.textContent = "?";
@@ -234,11 +232,12 @@ function draw() {
     cx.fill();
     cx.stroke();
     cx.restore();
-    cx.fillStyle = "#10151d";
-    cx.fillRect(p[0] + 16, p[1] - 11, 46, 17);
-    cx.fillStyle = hue;
+    const label = `#${candidate.rank} ${Math.round(candidate.score * 100)}/100`;
     cx.font = "bold 11px system-ui";
-    cx.fillText("#" + candidate.rank + " " + Math.round(candidate.score * 100) + "%", p[0] + 19, p[1] + 1);
+    cx.fillStyle = "#10151d";
+    cx.fillRect(p[0] + 16, p[1] - 11, cx.measureText(label).width + 6, 17);
+    cx.fillStyle = hue;
+    cx.fillText(label, p[0] + 19, p[1] + 1);
   }
   // pose-estimate arrow being dragged. Long enough to be unambiguous is drawn
   // in amber; too short is drawn in grey with the reason, because releasing
@@ -540,7 +539,7 @@ function syncCandidates(state) {
       const item = document.createElement("div");
       item.className = "candidate-item";
       const label = document.createElement("span");
-      label.textContent = `#${pose.rank} · ${Math.round(pose.score * 100)}% · (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) · ${(pose.theta * 180 / Math.PI).toFixed(0)}°`;
+      label.textContent = `#${pose.rank} · scan match ${Math.round(pose.score * 100)}/100 · (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) · ${(pose.theta * 180 / Math.PI).toFixed(0)}°`;
       const button = document.createElement("button");
       button.className = "btn sm";
       button.textContent = "Choose this pose";
@@ -560,7 +559,7 @@ async function chooseCandidate(pose) {
   const expected = {...CANDIDATE_MAP};
   const confirmed = await askConfirm(
     "Use pose candidate #" + pose.rank + "?",
-    `Check that the robot is near (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) facing ${(pose.theta * 180 / Math.PI).toFixed(0)}°. The live laser will verify this pose.`,
+    `Check that the robot is near (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) facing ${(pose.theta * 180 / Math.PI).toFixed(0)}°. The live scan will be checked against the map.`,
     {yes: "Use initial pose"},
   );
   if (!confirmed) return;
@@ -936,7 +935,7 @@ function applyMode() {
       lb.title = (CURLOC || {}).detail || "The localizer could not find the robot on this map.";
     } else if (st == "converged") {
       lb.textContent = "Localized";
-      lb.title = "The pose is confirmed. See laser verification for live localization confidence.";
+      lb.title = "The localizer has converged. Check how the live scan aligns with the map.";
     }
   }
   let eb = document.getElementById("enginebadge");

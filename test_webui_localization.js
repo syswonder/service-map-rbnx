@@ -5,6 +5,7 @@ const assert = require('assert');
 const source = fs.readFileSync(__dirname + '/src/mapping_rbnx/webui_static/app.js', 'utf8');
 const progress = source.slice(source.indexOf('function localizationProgress('), source.indexOf('setInterval(renderLocalizationProgress'));
 const candidates = source.slice(source.indexOf('function syncCandidates('), source.indexOf('function togglePanel('));
+const trust = source.slice(source.indexOf('function applyTrust('), source.indexOf('function setPose('));
 const elements = {};
 let opens = 0, requests = 0;
 const element = () => ({dataset: {}, children: [], append(...items) {this.children.push(...items);},
@@ -16,12 +17,19 @@ const ctx = vm.createContext({STALE: false, CURLOC: {}, CURMODE: 'localization',
   fetch: async (_, options) => { requests++; assert.equal(JSON.parse(options.body).run_id, 3); return {json: async () => ({ok:true})}; },
   poll: async () => {}, setStatus: () => {},
 });
-vm.runInContext(progress + candidates, ctx);
+vm.runInContext(progress + candidates + trust, ctx);
+elements.trust = {classList: {add() {}, remove() {}}};
+ctx.CURTRUST = {verdict:'ok', fit:1, threshold:.6, detail:'27/27 scored returns hit walls'};
+ctx.applyTrust();
+assert.match(elements.trusttext.innerHTML, /100% of scored returns/);
+assert.match(elements.trusttext.innerHTML, /Several poses can match/);
+assert.equal(elements.trust.title, ctx.CURTRUST.detail);
 const pose = {rank:1, x:1, y:2, theta:0, score:.8};
 const state = (phase, run_id=3) => ({engine:'slam_toolbox',map_id:'lab',generation:2,localization:{map_id:'lab',generation:2,
   phase,run_id,candidates:[pose],detail:'current run',filter_state:'running',phase_started_at:(Date.now()-25000)/1000}});
 ctx.syncCandidates(state('choosing'));
 assert.equal(ctx.CANDIDATES.length, 1);
+assert.match(elements['candidate-list'].children[0].children[0].textContent, /scan match 80\/100/);
 assert.equal(opens, 1);
 ctx.syncCandidates(state('choosing'));
 assert.equal(opens, 1, 'polling must not reopen a panel the user closed');
